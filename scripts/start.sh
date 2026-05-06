@@ -13,7 +13,7 @@
 #   ./scripts/start.sh logs         - View logs
 #   ./scripts/start.sh update       - Pull latest image and restart (preserves data)
 #   ./scripts/start.sh build        - Build from this checkout and restart
-#   ./scripts/start.sh backup       - Backup your data
+#   ./scripts/start.sh backup       - Backup Docker volumes
 #   ./scripts/start.sh status       - Show running containers
 
 set -e
@@ -74,6 +74,18 @@ verify_gepa_optimizer_runtime() {
 
 verify_gepa_optimizer_runtime_async() {
     (verify_gepa_optimizer_runtime >/dev/null 2>&1 || true) &
+}
+
+backup_volume() {
+    local volume="$1"
+    local archive="$2"
+    local backup_dir="$3"
+
+    echo -e "  ${CYAN}${volume}${NC} -> ${archive}"
+    docker run --rm \
+        -v "${volume}:/data:ro" \
+        -v "$(pwd)/${backup_dir}:/backup" \
+        alpine tar czf "/backup/${archive}" -C /data .
 }
 
 case "${1:-start}" in
@@ -172,10 +184,13 @@ case "${1:-start}" in
     backup)
         BACKUP_DIR="./backups/$(date +%Y%m%d_%H%M%S)"
         mkdir -p "$BACKUP_DIR"
-        echo -e "${YELLOW}Backing up data to $BACKUP_DIR...${NC}"
-        docker run --rm -v agentark-data:/data -v "$(pwd)/$BACKUP_DIR":/backup alpine tar czf /backup/agentark-data.tar.gz -C /data .
-        docker run --rm -v agentark-config:/data -v "$(pwd)/$BACKUP_DIR":/backup alpine tar czf /backup/agentark-config.tar.gz -C /data .
+        echo -e "${YELLOW}Backing up AgentArk volumes to $BACKUP_DIR...${NC}"
+        backup_volume agentark-data agentark-data.tar.gz "$BACKUP_DIR"
+        backup_volume agentark-config agentark-config.tar.gz "$BACKUP_DIR"
+        backup_volume agentark-postgres-data agentark-postgres-data.tar.gz "$BACKUP_DIR"
+        backup_volume agentark-secrets agentark-secrets.tar.gz "$BACKUP_DIR"
         echo -e "${GREEN}Backup complete!${NC}"
+        echo -e "${YELLOW}Keep agentark-secrets.tar.gz with the Postgres/config backups; it is required to unlock install-managed encrypted data.${NC}"
         ;;
     status)
         echo -e "${BOLD}AgentArk Status:${NC}"
@@ -199,7 +214,7 @@ case "${1:-start}" in
         echo "  logs           View logs"
         echo "  update         Pull latest image and restart (preserves data)"
         echo "  build          Build from this checkout and restart"
-        echo "  backup         Backup your data"
+        echo "  backup         Backup Docker volumes"
         echo "  status         Show running containers"
         echo "  chat           Interactive CLI chat with the agent"
         echo "  pulse          Run ArkPulse health check"

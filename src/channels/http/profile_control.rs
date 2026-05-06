@@ -144,6 +144,14 @@ pub(super) async fn update_profile_onboarding(
             }
         }
     };
+    {
+        std::env::set_var("AGENTARK_LOG_TIMEZONE", timezone);
+        let mut agent = state.agent.write().await;
+        agent.llm.set_runtime_timezone(Some(timezone));
+        for (_, client) in agent.model_pool.values_mut() {
+            client.set_runtime_timezone(Some(timezone));
+        }
+    }
     if let Err(error) = encrypted_storage
         .set_encrypted("user_profile", &profile_bytes)
         .await

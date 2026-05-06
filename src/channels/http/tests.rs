@@ -1,7 +1,7 @@
 use super::*;
 use crate::core::autonomy::{RecommendedAction, RiskEnvelope};
 use axum::body::{to_bytes, Body};
-use axum::http::{header, HeaderValue, Request};
+use axum::http::{header, HeaderName, HeaderValue, Request};
 use axum::routing::{get, post};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tempfile::TempDir;
@@ -113,6 +113,127 @@ fn clarification_choices_from_operational_payload_keeps_real_clarifications() {
         choices[0].submit_text,
         "Only build the files in the workspace."
     );
+}
+
+#[test]
+fn internet_facing_control_plane_rejects_plain_non_loopback_http() {
+    let error = validate_control_plane_listener_posture(
+        DeploymentMode::InternetFacing,
+        "0.0.0.0:8990",
+        false,
+    )
+    .expect_err("plain public control-plane HTTP should be blocked");
+
+    assert!(error.to_string().contains("blocked an unsafe public"));
+}
+
+#[test]
+fn internet_facing_control_plane_allows_loopback_http_for_remote_access_proxy() {
+    validate_control_plane_listener_posture(
+        DeploymentMode::InternetFacing,
+        "127.0.0.1:8990",
+        false,
+    )
+    .expect("loopback HTTP is allowed behind AgentArk remote access");
+}
+
+#[test]
+fn internet_facing_control_plane_allows_direct_https_non_loopback_listener() {
+    validate_control_plane_listener_posture(DeploymentMode::InternetFacing, "0.0.0.0:8990", true)
+        .expect("direct public control plane requires HTTPS");
+}
+
+#[test]
+fn tunnel_host_matching_requires_exact_active_tunnel_host() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::HOST,
+        HeaderValue::from_static("attacker.trycloudflare.com"),
+    );
+
+    assert!(!request_matches_active_tunnel(
+        &headers,
+        Some("https://agentark.trycloudflare.com")
+    ));
+
+    headers.insert(
+        header::HOST,
+        HeaderValue::from_static("agentark.trycloudflare.com"),
+    );
+    assert!(request_matches_active_tunnel(
+        &headers,
+        Some("https://agentark.trycloudflare.com")
+    ));
+}
+
+#[test]
+fn app_proxy_response_headers_strip_cookie_and_browser_policy_headers() {
+    let mut headers = HeaderMap::new();
+    let access_control_allow_origin = HeaderName::from_static("access-control-allow-origin");
+    let content_security_policy = HeaderName::from_static("content-security-policy");
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+    headers.insert(header::SET_COOKIE, HeaderValue::from_static("sid=unsafe"));
+    headers.insert(
+        access_control_allow_origin.clone(),
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        content_security_policy.clone(),
+        HeaderValue::from_static("default-src *"),
+    );
+    headers.insert(
+        header::LOCATION,
+        HeaderValue::from_static("/login?next=%2F"),
+    );
+
+    let response = apply_app_proxy_response_headers(
+        axum::http::Response::builder().status(StatusCode::FOUND),
+        &headers,
+        "demo",
+    )
+    .body(Body::empty())
+    .unwrap();
+
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("text/html"))
+    );
+    assert_eq!(
+        response.headers().get(header::LOCATION),
+        Some(&HeaderValue::from_static("/apps/demo/login?next=%2F"))
+    );
+    assert!(response.headers().get(header::SET_COOKIE).is_none());
+    assert!(response
+        .headers()
+        .get(access_control_allow_origin)
+        .is_none());
+    assert!(response.headers().get(content_security_policy).is_none());
+}
+
+#[tokio::test]
+async fn app_guard_page_uses_post_form() {
+    let response = app_access_denied_page("guarded");
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(body.contains(r#"<form method="POST" action="/apps/guarded/">"#));
+    assert!(!body.contains(r#"<form method="GET""#));
+}
+
+#[test]
+fn app_guard_sanitizes_legacy_secret_query_params_without_authing_from_them() {
+    let clean_query = strip_query_params(
+        Some("grant=abc&password=secret&key=legacy&next=%2Fdashboard"),
+        &["grant", "password", "key"],
+    )
+    .expect("non-secret query parameter should remain");
+
+    assert_eq!(clean_query, "next=%2Fdashboard");
 }
 
 async fn add_test_task(state: &AppState, task: crate::core::Task) {
@@ -316,6 +437,21 @@ fn summarize_daily_brief_result_reports_in_app_only_when_push_fails() {
     assert!(
         summary.contains("Push delivery failed: No connected notification integrations available.")
     );
+}
+
+#[test]
+fn summarize_watch_result_reports_saved_watcher() {
+    let action = test_recommended_action("watch", "Monitor public updates");
+    let summary = summarize_autonomy_action_result(
+        &action,
+        &serde_json::json!({
+            "status": "executed",
+            "kind": "watch",
+            "watcher_id": "watch-123"
+        }),
+    );
+
+    assert_eq!(summary, "Created watcher watch-123.");
 }
 
 #[tokio::test]
@@ -1091,6 +1227,58 @@ fn normalize_stream_event_for_sse_preserves_structured_tool_result_fields() {
     assert_eq!(
         payload.get("content").and_then(|v| v.as_str()),
         Some("Matched app and loaded metadata for Demo App.")
+    );
+}
+
+#[test]
+fn summarize_stream_tool_activity_content_counts_structured_result_buckets() {
+    let content = serde_json::json!({
+        "query": "user first name",
+        "retrieval": {
+            "mode": "bounded_local_memory"
+        },
+        "results": {
+            "semantic_facts": [
+                {
+                    "content": "user_first_name: User's first name is Debanka",
+                    "confidence": 0.95
+                }
+            ],
+            "preferences": [],
+            "procedures": []
+        }
+    })
+    .to_string();
+
+    assert_eq!(
+        summarize_stream_tool_activity_content(&content),
+        "Found 1 result in 1 semantic fact for \"user first name\"."
+    );
+}
+
+#[test]
+fn summarize_stream_tool_activity_content_unwraps_nested_raw_payloads() {
+    let raw_content = serde_json::json!({
+        "query": "user first name",
+        "results": {
+            "semantic_facts": [
+                {
+                    "content": "user_first_name: User's first name is Debanka"
+                }
+            ]
+        }
+    })
+    .to_string();
+    let content = serde_json::json!({
+        "name": "memory_lookup",
+        "content": "A summarized tool result.",
+        "raw_content": raw_content
+    })
+    .to_string();
+
+    assert_eq!(
+        summarize_stream_tool_activity_content(&content),
+        "Found 1 result in 1 semantic fact for \"user first name\"."
     );
 }
 
@@ -2683,6 +2871,104 @@ fn test_operational_log(
         prompt_version: Some(prompt_version.to_string()),
         model_slot: None,
     }
+}
+
+#[test]
+fn aggregate_policy_version_metrics_uses_current_policy_for_unversioned_logs() {
+    let rows = vec![
+        crate::storage::OperationalLogVersionMetricRow {
+            success: true,
+            latency_ms: Some(120),
+            policy_version: None,
+            strategy_version: None,
+        },
+        crate::storage::OperationalLogVersionMetricRow {
+            success: false,
+            latency_ms: Some(240),
+            policy_version: None,
+            strategy_version: None,
+        },
+    ];
+
+    let metrics = aggregate_policy_version_metrics(&rows, "routing-policy-default-v1");
+
+    assert_eq!(metrics.len(), 1);
+    let row = &metrics[0];
+    assert_eq!(row.version, "routing-policy-default-v1");
+    assert_eq!(row.samples, 2);
+    assert_eq!(row.success_rate, 0.5);
+    assert_eq!(row.error_rate, 0.5);
+    assert_eq!(row.p95_latency_ms, Some(240));
+}
+
+#[test]
+fn aggregate_policy_version_metrics_preserves_explicit_policy_versions() {
+    let rows = vec![
+        crate::storage::OperationalLogVersionMetricRow {
+            success: true,
+            latency_ms: Some(80),
+            policy_version: Some("routing-candidate-a".to_string()),
+            strategy_version: None,
+        },
+        crate::storage::OperationalLogVersionMetricRow {
+            success: true,
+            latency_ms: Some(160),
+            policy_version: None,
+            strategy_version: None,
+        },
+    ];
+
+    let metrics = aggregate_policy_version_metrics(&rows, "routing-policy-default-v1");
+
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].version, "routing-candidate-a");
+    assert_eq!(metrics[0].samples, 1);
+}
+
+#[test]
+fn aggregate_trace_policy_metrics_fills_policy_card_when_operational_logs_are_missing() {
+    let traces = vec![
+        crate::storage::ExecutionTraceSummaryRow {
+            id: "trace-1".to_string(),
+            message: "build a widget".to_string(),
+            channel: "chat".to_string(),
+            started_at: Some("2026-01-01T00:00:00Z".to_string()),
+            completed_at: Some("2026-01-01T00:00:01Z".to_string()),
+            duration_ms: Some(1000),
+            step_count: 2,
+            steps_json: "[]".to_string(),
+            model: Some("agent_turn_loop".to_string()),
+            total_tokens: 120,
+            cost_usd: 0.01,
+            complexity: Some("agent_turn_loop".to_string()),
+            created_at: "2026-01-01T00:00:01Z".to_string(),
+        },
+        crate::storage::ExecutionTraceSummaryRow {
+            id: "trace-2".to_string(),
+            message: "summarize this".to_string(),
+            channel: "chat".to_string(),
+            started_at: Some("2026-01-01T00:00:02Z".to_string()),
+            completed_at: None,
+            duration_ms: Some(2000),
+            step_count: 1,
+            steps_json: "[]".to_string(),
+            model: Some("agent_turn_loop".to_string()),
+            total_tokens: 80,
+            cost_usd: 0.005,
+            complexity: Some("agent_turn_loop".to_string()),
+            created_at: "2026-01-01T00:00:02Z".to_string(),
+        },
+    ];
+
+    let metrics = aggregate_trace_policy_metrics(&traces, "routing-policy-default-v1");
+
+    assert_eq!(metrics.len(), 1);
+    let row = &metrics[0];
+    assert_eq!(row.version, "routing-policy-default-v1");
+    assert_eq!(row.samples, 2);
+    assert_eq!(row.success_rate, 0.5);
+    assert_eq!(row.error_rate, 0.5);
+    assert_eq!(row.p95_latency_ms, Some(2000));
 }
 
 #[test]

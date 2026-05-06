@@ -26,12 +26,20 @@ services:
         INSTALL_DOCKER_CLI: ${AGENTARK_INSTALL_DOCKER_CLI:-true}
         INSTALL_WHATSAPP_BRIDGE: ${AGENTARK_INSTALL_WHATSAPP_BRIDGE:-true}
     image: ${AGENTARK_IMAGE:-agentark:dev}
+    environment:
+      RUST_LOG: ${AGENTARK_DEV_RUST_LOG:-warn,agentark=debug,agentark.turn_timing=debug,sqlx::query=warn,sea_orm=info,hyper=warn,reqwest=warn,bollard=info,tower=warn,h2=warn,rustls=warn}
 
   agentark-embeddings:
     image: ${AGENTARK_IMAGE:-agentark:dev}
+    environment:
+      RUST_LOG: ${AGENTARK_DEV_EMBEDDINGS_RUST_LOG:-warn,agentark=debug,agentark.turn_timing=debug,hyper=warn,reqwest=warn}
 
   agentark-executor:
     image: ${AGENTARK_IMAGE:-agentark:dev}
+    environment:
+      RUST_LOG: ${AGENTARK_DEV_RUST_LOG:-warn,agentark=debug,agentark.turn_timing=debug,sqlx::query=warn,sea_orm=info,hyper=warn,reqwest=warn,bollard=info,tower=warn,h2=warn,rustls=warn}
 
   agentark-workspace:
     image: ${AGENTARK_IMAGE:-agentark:dev}
+    environment:
+      RUST_LOG: ${AGENTARK_DEV_RUST_LOG:-warn,agentark=debug,agentark.turn_timing=debug,sqlx::query=warn,sea_orm=info,hyper=warn,reqwest=warn,bollard=info,tower=warn,h2=warn,rustls=warn}

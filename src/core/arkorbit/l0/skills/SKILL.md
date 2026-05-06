@@ -18,12 +18,13 @@ Security policy:
 
 Available firmware modules:
 
+- `app-shell/index.js`: renders generic declarative mini-app specs from a widget registry entry's `spec` object. Prefer this for simple app/dashboard/card widgets only when the spec contains enough app-specific summary/content, metrics, sections, rows/items, actions, source/fetch bindings, and visual direction to produce a useful first screen. Use custom JavaScript for richer interaction, custom layout, parsing, simulation, or app behavior that the declarative shell cannot express.
 - `markdown/index.js`: renders default orbit introduction content.
 - `iframe-html/index.js`: renders a self-contained HTML fragment.
 - `chart/index.js`: exports `barChart(el, values, options)`.
 - `table/index.js`: exports `table(el, columns, rows)`.
 - `todo/index.js`: renders a small local todo list.
-- Public HTTPS data can be fetched from widgets through the render context: `ctx.fetchText(url)`, `ctx.fetchJson(url)`, or `ctx.fetchPublic(url)`. Prefer these helpers over direct browser `fetch()` for news, RSS, pricing, weather, or other public feeds because the Orbit host routes them through AgentArk and avoids common CORS failures. Do not use them for private hosts, authenticated APIs, or secrets.
+- Public HTTPS data can be fetched from widgets through the render context: `ctx.fetchText(url)`, `ctx.fetchJson(url)`, or `ctx.fetchPublic(url)`. Prefer these helpers over direct browser `fetch()` for news, RSS, pricing, market data, or other public feeds because the Orbit host routes them through AgentArk and avoids common CORS failures. Do not use them for private hosts, authenticated APIs, or secrets.
 - For general latest-news widgets, do not default to Reddit, X/Twitter, forum posts, or social-media search unless the user explicitly asks for that source. Prefer public news/RSS/search feeds from news providers or aggregators, label the source in the UI, and show a clear error if a public source is unavailable. Do not use JSONP or script-tag injection for news data.
 
 For ordinary widget requests, do not rewrite `index.html`. Apply only the JavaScript module write or surgical edit needed for the widget unless the user explicitly asks for supporting assets or data files.

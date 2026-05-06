@@ -28,6 +28,7 @@ const AGENT_TURN_LOOP_DIRECT_ACTION_SCORE_THRESHOLD: f32 = 0.03;
 const AGENT_TURN_LOOP_DIRECT_ACTION_CODE_COMPETITIVE_RATIO: f32 = 0.65;
 const AGENT_TURN_LOOP_APP_CONTEXT_SCORE_THRESHOLD: f32 = 0.55;
 const AGENT_TURN_LOOP_APP_DELIVERY_FAST_PATH_SCORE: f32 = 0.60;
+const AGENT_TURN_LOOP_APP_DELIVERY_FAST_PATH_MARGIN: f32 = 0.15;
 const AGENT_TURN_LOOP_READ_ONLY_FAST_PATH_SCORE: f32 = 0.80;
 const AGENT_TURN_LOOP_READ_ONLY_FAST_PATH_MARGIN: f32 = 0.18;
 const AGENT_TURN_LOOP_READ_ONLY_FAST_PATH_BLOCKING_SCORE: f32 = 0.70;
@@ -38,8 +39,200 @@ const AGENT_TURN_LOOP_DIRECT_ANSWER_MAX_ITERATIONS: usize = 1;
 const AGENT_TURN_LOOP_QUICK_DURABLE_MAX_ITERATIONS: usize = 2;
 const AGENT_TURN_LOOP_DIRECT_ANSWER_TIMEOUT_MS: u64 = 75_000;
 const AGENT_TURN_LOOP_QUICK_DURABLE_TIMEOUT_MS: u64 = 120_000;
+const AGENT_TURN_LOOP_APP_DELIVERY_CONTINUATION_TIMEOUT_MS_DEFAULT: u64 = 180_000;
+const AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS: u64 = 1_000;
+const AGENT_LOOP_TIMING_ADVISORY_WARN_MS: u64 = 5_000;
 
 type AgentLoopProgressRecorder = Arc<Mutex<Vec<crate::core::ExecutionStep>>>;
+
+#[derive(Clone, Copy)]
+pub(super) struct AgentLoopTimingContext<'a> {
+    pub turn_timing_id: &'a str,
+    pub conversation_id: &'a str,
+    pub channel: &'a str,
+}
+
+fn agent_loop_elapsed_ms(started: std::time::Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn log_agent_loop_timing_stage(
+    timing: AgentLoopTimingContext<'_>,
+    stage: &str,
+    duration_ms: u64,
+    success: bool,
+    warn_after_ms: u64,
+) {
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        turn_timing_id = %timing.turn_timing_id,
+        conversation_id = %timing.conversation_id,
+        channel = %timing.channel,
+        stage = %stage,
+        duration_ms,
+        success,
+        "agent loop timing stage"
+    );
+    if duration_ms >= warn_after_ms {
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            turn_timing_id = %timing.turn_timing_id,
+            conversation_id = %timing.conversation_id,
+            channel = %timing.channel,
+            stage = %stage,
+            duration_ms,
+            warn_after_ms,
+            "slow agent loop timing stage"
+        );
+    }
+}
+
+fn log_agent_loop_timing_instant(
+    timing: AgentLoopTimingContext<'_>,
+    stage: &str,
+    started: std::time::Instant,
+    success: bool,
+    warn_after_ms: u64,
+) {
+    log_agent_loop_timing_stage(
+        timing,
+        stage,
+        agent_loop_elapsed_ms(started),
+        success,
+        warn_after_ms,
+    );
+}
+
+#[derive(Debug, Default, Clone)]
+struct AgentLoopDraftFileCapture {
+    content: String,
+    done: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AgentLoopStreamCapture {
+    token_text: String,
+    reasoning_text: String,
+    draft_files: std::collections::BTreeMap<String, AgentLoopDraftFileCapture>,
+    delete_paths: Vec<String>,
+    delete_orphans: bool,
+}
+
+impl AgentLoopStreamCapture {
+    fn record_event(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::Token(content) => {
+                self.token_text.push_str(content);
+            }
+            StreamEvent::ReasoningDelta {
+                content_delta,
+                done: false,
+                ..
+            } => {
+                self.reasoning_text.push_str(content_delta);
+            }
+            StreamEvent::ToolProgress {
+                name,
+                payload: Some(payload),
+                ..
+            } if name == "app_deploy" => self.record_app_deploy_progress_payload(payload),
+            _ => {}
+        }
+    }
+
+    fn record_app_deploy_progress_payload(&mut self, payload: &serde_json::Value) {
+        let Some(kind) = payload.get("kind").and_then(|value| value.as_str()) else {
+            return;
+        };
+        match kind {
+            "draft_file" => {
+                let Some(path) = payload
+                    .get("file")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    return;
+                };
+                let entry = self.draft_files.entry(path.to_string()).or_default();
+                if let Some(snapshot) = payload.get("content_snapshot").and_then(|v| v.as_str()) {
+                    entry.content = snapshot.to_string();
+                } else if let Some(delta) = payload.get("content_delta").and_then(|v| v.as_str()) {
+                    entry.content.push_str(delta);
+                }
+                if payload
+                    .get("done")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    entry.done = true;
+                }
+            }
+            "delete_file" => {
+                let Some(path) = payload
+                    .get("path")
+                    .or_else(|| payload.get("file"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    return;
+                };
+                if path == "*" {
+                    self.delete_orphans = true;
+                } else if !self.delete_paths.iter().any(|existing| existing == path) {
+                    self.delete_paths.push(path.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn has_incomplete_draft_files(&self) -> bool {
+        self.draft_files.values().any(|file| !file.done)
+    }
+
+    fn incomplete_draft_paths(&self) -> Vec<String> {
+        self.draft_files
+            .iter()
+            .filter(|(_, file)| !file.done)
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    fn completed_stream_blocks(&self) -> crate::core::llm::stream_blocks::ParsedStreamBlocks {
+        let mut blocks = crate::core::llm::stream_blocks::ParsedStreamBlocks::default();
+        for (path, file) in &self.draft_files {
+            if file.done {
+                blocks.files.insert(path.clone(), file.content.clone());
+            }
+        }
+        blocks.delete_paths = self.delete_paths.clone();
+        blocks.delete_orphans = self.delete_orphans;
+        blocks
+    }
+
+    fn generated_output_chars_for_usage(&self) -> usize {
+        let token_text_chars = self.token_text.chars().count();
+        let draft_file_chars = self
+            .draft_files
+            .iter()
+            .map(|(path, file)| {
+                path.chars()
+                    .count()
+                    .saturating_add(file.content.chars().count())
+                    .saturating_add(24)
+            })
+            .sum::<usize>();
+        let delete_chars = self
+            .delete_paths
+            .iter()
+            .map(|path| path.chars().count().saturating_add(16))
+            .sum::<usize>()
+            .saturating_add(if self.delete_orphans { 16 } else { 0 });
+        token_text_chars.max(draft_file_chars.saturating_add(delete_chars))
+    }
+}
 
 #[derive(Debug)]
 struct AgentLoopToolCallParse {
@@ -81,6 +274,18 @@ impl AgentLoopReadOnlyFastPath {
 }
 
 #[derive(Debug, Clone)]
+struct AgentLoopAppDeliveryFastPath {
+    score: f32,
+    runner_up_score: f32,
+}
+
+#[derive(Debug, Clone)]
+struct AgentLoopVisualAttachmentAnalysis {
+    action: crate::actions::ActionDef,
+    upload_id: String,
+}
+
+#[derive(Debug, Clone)]
 struct AgentLoopGoalState {
     id: String,
     intent_summary: String,
@@ -119,6 +324,14 @@ fn agent_loop_timeout_ms(
     } else {
         base.clamp(180_000, 420_000)
     }
+}
+
+fn agent_loop_app_delivery_continuation_timeout_ms() -> u64 {
+    std::env::var("AGENTARK_APP_DELIVERY_CONTINUATION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(30_000, 300_000))
+        .unwrap_or(AGENT_TURN_LOOP_APP_DELIVERY_CONTINUATION_TIMEOUT_MS_DEFAULT)
 }
 
 fn format_agent_loop_timeout_budget(timeout_ms: Option<u64>) -> Option<String> {
@@ -270,9 +483,10 @@ fn agent_loop_model_call_detail(
 
     if app_delivery_pending && has_action("app_deploy") {
         return if iteration == 1 {
-            "Planning the app fix and preparing the app delivery action.".to_string()
+            "Preparing the app file bundle for deployment.".to_string()
         } else {
-            "Preparing the app build and deployment payload for app_deploy. Waiting for the model to finish the generated files.".to_string()
+            "Generating app files for deployment. Waiting for the model to finish the file bundle."
+                .to_string()
         };
     }
     if has_action("ark_inspect") && action_names.len() == 1 {
@@ -657,6 +871,243 @@ fn emit_agent_loop_model_prose(
     }
 }
 
+fn persist_agent_loop_reasoning_step(
+    progress_recorder: &Option<AgentLoopProgressRecorder>,
+    phase: &str,
+    reasoning_text: &str,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    complete: bool,
+) {
+    let detail = reasoning_text.trim();
+    if detail.is_empty() {
+        return;
+    }
+    let Some(recorder) = progress_recorder.as_ref() else {
+        return;
+    };
+    if let Ok(mut steps) = recorder.lock() {
+        steps.push(crate::core::ExecutionStep {
+            icon: "[model]".to_string(),
+            title: "Model Reasoning".to_string(),
+            detail: safe_tail_chars(detail, 8_000),
+            step_type: "reasoning_delta".to_string(),
+            data: Some(
+                serde_json::json!({
+                    "kind": "reasoning_delta",
+                    "phase": phase.trim(),
+                    "persisted": true,
+                    "complete": complete,
+                })
+                .to_string(),
+            ),
+            timestamp: started_at.unwrap_or_else(chrono::Utc::now),
+            duration_ms: None,
+        });
+    }
+}
+
+fn capture_agent_loop_stream_tokens(
+    stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    progress_recorder: Option<AgentLoopProgressRecorder>,
+    persist_reasoning: bool,
+) -> (
+    Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    Arc<Mutex<AgentLoopStreamCapture>>,
+) {
+    let captured = Arc::new(Mutex::new(AgentLoopStreamCapture::default()));
+    let Some(parent_tx) = stream_tx else {
+        return (None, captured);
+    };
+    let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
+    let captured_for_task = captured.clone();
+    tokio::spawn(async move {
+        let mut reasoning_buffer = String::new();
+        let mut reasoning_phase = String::new();
+        let mut reasoning_step_started: Option<chrono::DateTime<chrono::Utc>> = None;
+        while let Some(event) = capture_rx.recv().await {
+            if let Ok(mut capture) = captured_for_task.lock() {
+                capture.record_event(&event);
+            }
+            if persist_reasoning {
+                if let StreamEvent::ReasoningDelta {
+                    phase,
+                    content_delta,
+                    done,
+                } = &event
+                {
+                    if !phase.trim().is_empty() {
+                        reasoning_phase = phase.trim().to_string();
+                    }
+                    if !content_delta.is_empty() {
+                        if reasoning_step_started.is_none() {
+                            reasoning_step_started = Some(chrono::Utc::now());
+                        }
+                        reasoning_buffer.push_str(content_delta);
+                    }
+                    if *done && !reasoning_buffer.trim().is_empty() {
+                        persist_agent_loop_reasoning_step(
+                            &progress_recorder,
+                            &reasoning_phase,
+                            &reasoning_buffer,
+                            reasoning_step_started,
+                            true,
+                        );
+                        reasoning_buffer.clear();
+                        reasoning_phase.clear();
+                        reasoning_step_started = None;
+                    }
+                }
+            }
+            let _ = parent_tx.send(event).await;
+        }
+        if persist_reasoning {
+            persist_agent_loop_reasoning_step(
+                &progress_recorder,
+                &reasoning_phase,
+                &reasoning_buffer,
+                reasoning_step_started,
+                false,
+            );
+        }
+    });
+    (Some(capture_tx), captured)
+}
+
+fn captured_agent_loop_stream_capture(
+    captured: &Arc<Mutex<AgentLoopStreamCapture>>,
+) -> AgentLoopStreamCapture {
+    captured
+        .lock()
+        .map(|capture| capture.clone())
+        .unwrap_or_default()
+}
+
+fn json_prompt_section_chars(value: &serde_json::Value) -> usize {
+    serde_json::to_string(value)
+        .map(|rendered| rendered.chars().count())
+        .unwrap_or_default()
+}
+
+fn agent_loop_prompt_telemetry_payload(
+    usage_label: &str,
+    iteration: usize,
+    system_prompt: &str,
+    user_prompt: &str,
+    model_actions: &[crate::actions::ActionDef],
+    native_tool_calling_available: bool,
+) -> serde_json::Value {
+    let mut sections = serde_json::Map::new();
+    let mut prompt_fragment_version: Option<String> = None;
+    let system_prompt_chars = system_prompt.chars().count();
+    sections.insert(
+        "agent_loop_system_prompt".to_string(),
+        serde_json::json!(system_prompt_chars),
+    );
+
+    if let Ok(serde_json::Value::Object(map)) =
+        serde_json::from_str::<serde_json::Value>(user_prompt)
+    {
+        for (key, value) in map {
+            let chars = json_prompt_section_chars(&value);
+            if key == "active_guidance" {
+                prompt_fragment_version = value
+                    .get("bundle_version")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(crate::core::prompt_fragments::compose_prompt_fragment_version);
+            }
+            sections.insert(key.clone(), serde_json::json!(chars));
+            if key == "authorized_actions" {
+                sections.insert("action_catalog".to_string(), serde_json::json!(chars));
+            }
+        }
+    } else {
+        sections.insert(
+            "user_prompt".to_string(),
+            serde_json::json!(user_prompt.chars().count()),
+        );
+    }
+
+    let serialized_action_schema_chars = if native_tool_calling_available {
+        serde_json::to_string(model_actions)
+            .map(|rendered| rendered.chars().count())
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    if !sections.contains_key("action_catalog") && serialized_action_schema_chars > 0 {
+        sections.insert(
+            "action_catalog".to_string(),
+            serde_json::json!(serialized_action_schema_chars),
+        );
+    }
+
+    let section_sum_chars = sections
+        .values()
+        .filter_map(|value| value.as_u64())
+        .sum::<u64>() as usize;
+    let estimated_total_request_chars = system_prompt_chars
+        .saturating_add(user_prompt.chars().count())
+        .saturating_add(serialized_action_schema_chars);
+
+    serde_json::json!({
+        "trace_kind": "prompt_telemetry",
+        "request_mode": usage_label,
+        "loop_version": AGENT_TURN_LOOP_VERSION,
+        "prompt_fragment_version": prompt_fragment_version,
+        "attempt": iteration,
+        "assembled_system_prompt_chars": system_prompt_chars,
+        "final_system_prompt_chars": system_prompt_chars,
+        "user_message_chars": user_prompt.chars().count(),
+        "prompt_chars": user_prompt.chars().count(),
+        "tool_count": model_actions.len(),
+        "tool_schema_chars": serialized_action_schema_chars,
+        "tool_schema_format": if model_actions.is_empty() {
+            "none"
+        } else if native_tool_calling_available {
+            "native_tools"
+        } else {
+            "text_json_fallback"
+        },
+        "estimated_total_request_chars": estimated_total_request_chars,
+        "estimated_total_request_tokens": crate::core::context_budget::estimate_tokens_from_text(system_prompt)
+            .saturating_add(crate::core::context_budget::estimate_tokens_from_text(user_prompt))
+            .saturating_add((serialized_action_schema_chars.saturating_add(3)) / 4),
+        "section_sum_chars": section_sum_chars,
+        "untracked_chars": estimated_total_request_chars.saturating_sub(section_sum_chars),
+        "sections": serde_json::Value::Object(sections),
+    })
+}
+
+fn record_agent_loop_prompt_telemetry(
+    progress_recorder: &AgentLoopProgressRecorder,
+    payload: serde_json::Value,
+) {
+    let estimated_total_request_chars = payload
+        .get("estimated_total_request_chars")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let tool_count = payload
+        .get("tool_count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    if let Ok(mut steps) = progress_recorder.lock() {
+        steps.push(crate::core::ExecutionStep {
+            icon: "[prompt]".to_string(),
+            title: "Prompt Telemetry".to_string(),
+            detail: format!(
+                "Estimated model request size: {} chars across {} tool schema(s).",
+                estimated_total_request_chars, tool_count
+            ),
+            step_type: "info".to_string(),
+            data: Some(payload.to_string()),
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+}
+
 fn agent_loop_system_prompt() -> String {
     let mut prompt = String::from(concat!(
         "You are AgentArk's authoritative agent turn loop.\n",
@@ -664,21 +1115,15 @@ fn agent_loop_system_prompt() -> String {
         "You receive the user's message, current conversation state, current durable work objects, and the authorized action schemas for this turn.\n",
         "Select behavior from the user's underlying intent and the action descriptions/schemas, not from exact wording, phrase templates, casing, punctuation, or keyword bundles.\n",
         "Resolve semantically dependent follow-ups from the recent conversation: if the current message is an elaboration, correction, refinement, continuation, or clarification whose subject is clear from prior user/assistant turns, answer or act on that prior subject directly. If the current message is self-contained or introduces a different requested outcome, follow the new intent instead of carrying over the old topic.\n",
-        "When the turn concerns the product identity, runtime identity, capabilities, pages, or what this running system is, treat the supplied product facts, bundled product help, and live action catalog as authoritative. Do not answer those local product questions from public web search unless the user is specifically asking about external public material such as a paper, repository, website, or source outside this running product.\n",
+        "When the turn concerns the product identity, runtime identity, capabilities, pages, or what this running system is, treat the supplied product facts and live AgentArk capability registry as authoritative. Curated AgentArk manual text is supplemental explanation, not capability truth. Do not answer those local product questions from public web search unless the user is specifically asking about external public material such as a paper, repository, website, or source outside this running product.\n",
         "If an authorized action can fulfill the request, use sparse user-facing prose at logical phase boundaries, then call the action(s). Do not write a new prose preamble before every individual tool call; tool progress is displayed separately in the UI. Group several related tool calls under one concise sentence when they belong to the same phase. Do not claim a capability is unavailable when the action catalog includes a matching capability.\n",
         "Treat recurring scheduled work, background sessions, future reminders, watchers, app builds/deployments, integrations, browser automation, research, and ordinary chat as capabilities described by the supplied actions.\n",
         "When a turn_plan is present, treat it as the typed contract for the turn: complete each pending goal, including plain answer/research goals that require no durable object.\n",
         "When an advisory_intent_plan contains multiple intents, complete each user-visible outcome before finalizing. You may call multiple authorized actions in one step when the outcomes are independent. If one outcome succeeds and another fails or needs input, report the partial result honestly.\n",
-        "For durable actions that expose an `items` batch schema, use it to preserve multiple independent scheduled tasks, reminders, watchers, targets, timing/cadence, conditions, and notification routes in a single action call when they share the same action type. If any required item-specific field is genuinely unclear, ask for that missing field instead of dropping or merging the item.\n",
-        "A cadence belongs to the object it modifies. If timing or recurrence describes how a generated app, dashboard, page, or tool refreshes, polls, or updates its own displayed data, implement that behavior inside the delivered artifact. Use scheduler/watch actions only when AgentArk itself must run later, monitor independently of the artifact, or notify/report outside the artifact UI.\n",
-        "If the user's intended outcome is durable work, commit the durable object first with the appropriate write/orchestration action. Do not perform exploratory reads merely to build a baseline before creating scheduled work, watchers, reminders, deployments, or sessions; those durable objects can perform their own later reads.\n",
         "When a direct authorized durable action matches the goal's object class through its metadata, use that action rather than a code, shell, extension-management, or sandbox surrogate. Reserve code execution for computation, validation, or when no direct durable action exists.\n",
-        "For user-visible app/site/dashboard/tool delivery, writing files is staging; the goal is not complete until an app-hosting action returns the runnable app result or asks for missing required inputs.\n",
+        "Request-scoped active_guidance is supplied in the user prompt. Follow those fragments when their internal capability tags are active, and do not apply inactive flow guidance just because it exists elsewhere in AgentArk.\n",
     ));
-    prompt.push_str(crate::core::inline_artifacts::inline_visualization_guidance());
-    prompt.push('\n');
     prompt.push_str(concat!(
-        "When delivering a generated app/site/dashboard, prefer emitting one or more `<file path=\"...\">...</file>` blocks inline as plain text in your reply, one block per file, instead of placing the file contents inside an app_deploy tool-call envelope. Use `<delete path=\"*\"/>` once at the start of the reply to wipe prior contents when you intend a full replacement; otherwise unmentioned files are kept (patch behaviour). Each block's body is the literal verbatim file content. The platform parses these blocks, persists each file atomically as it streams, and runs the deploy automatically when your reply ends — you do not need to also call app_deploy as a tool unless you only intend to update app metadata (title, runtime config) without rewriting any files. Keep short user-visible prose in between the blocks describing what each file does.\n",
         "Use data-source actions before a durable action only when current information is the user's requested answer, or when a required argument for the durable action cannot be inferred without a read.\n",
         "Keep tool use minimal. If you have already performed read-only actions and a durable action is still needed, call the durable action next instead of fetching more context.\n",
         "Use native tool calls whenever the provider supports them. Never use XML-style tool-call text such as `<function_calls>`, `<invoke>`, or `<parameter>`; that is not AgentArk's fallback protocol. If native tool calls are not available, return JSON only with this exact protocol: ",
@@ -700,10 +1145,10 @@ fn agent_loop_read_only_system_prompt(final_synthesis: bool) -> String {
                 "You are AgentArk's bounded read-only final-answer synthesizer.\n",
                 "Answer the current user request from the supplied compact tool history only.\n",
                 "Do not call tools, request action-scope expansion, invent missing objects, paste raw JSON, or expose internal routing/prompt mechanics.\n",
-                "If the intended answer is an in-chat analytical or visual report, satisfy it inside the chat response with prose, tables, and fenced `agentark-chart` JSON blocks using observed numeric data. Do not substitute an app/dashboard/link unless the requested final object is a managed app, existing app inventory, public link, or deployed dashboard.\n",
+                "Use request-scoped active_guidance for read-only report, visualization, or app-boundary instructions supplied in the user prompt.\n",
                 "If the tool result is incomplete, chart the reliable observed rows when useful, then say what is known and what is missing. Keep the answer concise, concrete, and user-facing.\n"
             ),
-            crate::core::inline_artifacts::inline_visualization_guidance(),
+            "",
             "\n"
         );
     }
@@ -713,11 +1158,12 @@ fn agent_loop_read_only_system_prompt(final_synthesis: bool) -> String {
             "You are AgentArk's bounded read-only agent turn loop.\n",
             "Use the supplied read-only inspection/data actions to answer the user's current request from live or local evidence.\n",
             "Select behavior from semantic intent and action schemas, not exact wording. Use prior context only to resolve clear references.\n",
+            "Use request-scoped active_guidance for local inspection, attachment, report, or visualization policy supplied in the user prompt.\n",
             "Do not create, update, delete, deploy, schedule, notify, or request action-scope expansion in this bounded mode.\n",
             "Call the minimum needed read-only action, then answer from observed results. If the request is still ambiguous, ask one concise clarification.\n",
             "Do not invent tool results, IDs, links, schedules, notification channels, or created objects. Keep user-facing prose concise.\n"
         ),
-        crate::core::inline_artifacts::inline_visualization_guidance(),
+        "",
         "\n"
     )
 }
@@ -1428,17 +1874,157 @@ fn should_use_app_delivery_fast_path(
     if routing_allows_read_only_fast_path(Some(signal)) {
         return false;
     }
-    let app_score = semantic_scores
-        .get("app_deploy")
-        .copied()
+    let app_score = authorized_actions
+        .iter()
+        .filter(|action| action_is_app_delivery_candidate(action))
+        .filter_map(|action| semantic_scores.get(&action.name).copied())
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or_default();
     if app_score < AGENT_TURN_LOOP_APP_DELIVERY_FAST_PATH_SCORE {
         return false;
     }
     authorized_actions
         .iter()
-        .any(|action| action.name == "app_deploy" && action_is_app_delivery_candidate(action))
+        .any(|action| action_is_app_delivery_candidate(action))
         && app_delivery_pending_for_plan_with_scores(turn_plan, authorized_actions, semantic_scores)
+}
+
+fn semantic_app_delivery_fast_path_allowed_for_plan(
+    turn_plan: Option<&AgentLoopTurnPlanState>,
+    authorized_actions: &[crate::actions::ActionDef],
+    semantic_scores: &HashMap<String, f32>,
+) -> bool {
+    turn_plan
+        .map(|plan| {
+            app_delivery_pending_for_plan_with_scores(
+                Some(plan),
+                authorized_actions,
+                semantic_scores,
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn select_semantic_app_delivery_fast_path(
+    routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
+    authorized_actions: &[crate::actions::ActionDef],
+    semantic_scores: &HashMap<String, f32>,
+) -> Option<AgentLoopAppDeliveryFastPath> {
+    if routing_allows_read_only_fast_path(routing) {
+        return None;
+    }
+    let app_score = authorized_actions
+        .iter()
+        .filter(|action| action_is_app_delivery_candidate(action))
+        .filter_map(|action| semantic_scores.get(&action.name).copied())
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))?;
+    if app_score < AGENT_TURN_LOOP_APP_DELIVERY_FAST_PATH_SCORE {
+        return None;
+    }
+    let runner_up_score = authorized_actions
+        .iter()
+        .filter(|action| !action_is_app_delivery_candidate(action))
+        .filter_map(|action| semantic_scores.get(&action.name).copied())
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or_default();
+    if app_score < runner_up_score + AGENT_TURN_LOOP_APP_DELIVERY_FAST_PATH_MARGIN {
+        return None;
+    }
+    Some(AgentLoopAppDeliveryFastPath {
+        score: app_score,
+        runner_up_score,
+    })
+}
+
+fn should_use_app_delivery_stream_blocks_mode(
+    app_delivery_fast_path: bool,
+    suppress_app_delivery_for_turn: bool,
+    turn_plan: Option<&AgentLoopTurnPlanState>,
+    scoped_actions: &[crate::actions::ActionDef],
+    authorized_actions: &[crate::actions::ActionDef],
+    semantic_scores: &HashMap<String, f32>,
+) -> bool {
+    if suppress_app_delivery_for_turn {
+        return false;
+    }
+    let scoped_app_delivery_names = scoped_actions
+        .iter()
+        .filter(|action| action_is_app_delivery_candidate(action))
+        .map(|action| action.name.as_str())
+        .collect::<HashSet<_>>();
+    if scoped_app_delivery_names.is_empty() {
+        return false;
+    }
+    let explicit_pending_app_actions = turn_plan
+        .map(|plan| {
+            plan.goals
+                .iter()
+                .filter(|goal| {
+                    matches!(
+                        goal.status,
+                        crate::core::planner::PlanStepStatus::Pending
+                            | crate::core::planner::PlanStepStatus::Running
+                    )
+                })
+                .filter_map(|goal| goal.action_name.as_deref())
+                .filter_map(|name| authorized_actions.iter().find(|action| action.name == name))
+                .filter(|action| action_is_app_write_candidate(action))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !explicit_pending_app_actions.is_empty()
+        && !explicit_pending_app_actions
+            .iter()
+            .any(|action| action_is_app_delivery_candidate(action))
+    {
+        return false;
+    }
+    let explicit_pending_non_app_writes = turn_plan
+        .map(|plan| {
+            plan.goals
+                .iter()
+                .filter(|goal| {
+                    matches!(
+                        goal.status,
+                        crate::core::planner::PlanStepStatus::Pending
+                            | crate::core::planner::PlanStepStatus::Running
+                    )
+                })
+                .filter_map(|goal| goal.action_name.as_deref())
+                .filter_map(|name| authorized_actions.iter().find(|action| action.name == name))
+                .any(|action| {
+                    action_is_direct_write_candidate(action)
+                        && !action_is_app_write_candidate(action)
+                })
+        })
+        .unwrap_or(false);
+    if explicit_pending_non_app_writes {
+        return false;
+    }
+    let app_delivery_pending =
+        app_delivery_pending_for_plan_with_scores(turn_plan, authorized_actions, semantic_scores);
+    if turn_plan.is_some() && !app_delivery_pending {
+        return false;
+    }
+    if !app_delivery_fast_path && !app_delivery_pending {
+        return false;
+    }
+    let scoped_app_write_names = scoped_actions
+        .iter()
+        .filter(|action| action_is_app_write_candidate(action))
+        .map(|action| action.name.as_str())
+        .collect::<HashSet<_>>();
+    let pending_required_names = pending_required_direct_action_names_with_scores(
+        turn_plan,
+        authorized_actions,
+        semantic_scores,
+    );
+    if pending_required_names.is_empty() {
+        return app_delivery_fast_path;
+    }
+    pending_required_names
+        .into_iter()
+        .all(|name| scoped_app_write_names.contains(name.as_str()))
 }
 
 fn routing_allows_read_only_fast_path(
@@ -1467,7 +2053,8 @@ fn routing_should_suppress_app_delivery_candidates(
         || routing_allows_read_only_fast_path(Some(signal))
         || signal.current_answer_expected
         || signal.saved_user_facts_expected
-        || signal.product_help_expected
+        || signal.agentark_capabilities_expected
+        || signal.agentark_manual_expected
         || signal.live_state_expected
         || signal.external_info_expected
     {
@@ -1533,14 +2120,18 @@ fn action_has_capability_id(action: &crate::actions::ActionDef, capability: &str
         .any(|candidate| normalize_action_capability_id(candidate) == expected)
 }
 
-fn action_is_product_help_lookup(action: &crate::actions::ActionDef) -> bool {
-    action_has_capability_id(action, "product_help")
+fn action_is_agentark_knowledge_lookup(action: &crate::actions::ActionDef) -> bool {
+    action_has_capability_id(action, "agentark_capabilities")
+        || action_has_capability_id(action, "agentark_manual")
 }
 
 fn routing_has_specific_read_only_grounding(
     routing: &crate::security::intent_classifier::InboundRoutingSignal,
 ) -> bool {
-    routing.product_help_expected || routing.live_state_expected || routing.external_info_expected
+    routing.agentark_capabilities_expected
+        || routing.agentark_manual_expected
+        || routing.live_state_expected
+        || routing.external_info_expected
 }
 
 fn action_matches_routed_read_only_grounding(
@@ -1551,11 +2142,13 @@ fn action_matches_routed_read_only_grounding(
         return true;
     }
     let metadata = action.planner_metadata();
-    if routing.product_help_expected && action_is_product_help_lookup(action) {
+    if (routing.agentark_capabilities_expected || routing.agentark_manual_expected)
+        && action_is_agentark_knowledge_lookup(action)
+    {
         return true;
     }
     if routing.live_state_expected
-        && !action_is_product_help_lookup(action)
+        && !action_is_agentark_knowledge_lookup(action)
         && matches!(
             metadata.integration_class,
             crate::actions::PlannerIntegrationClass::Internal
@@ -1579,11 +2172,13 @@ fn read_only_fast_path_action_preference(
 ) -> u8 {
     let metadata = action.planner_metadata();
     if let Some(signal) = routing {
-        if signal.product_help_expected && action_is_product_help_lookup(action) {
+        if (signal.agentark_capabilities_expected || signal.agentark_manual_expected)
+            && action_is_agentark_knowledge_lookup(action)
+        {
             return 0;
         }
         if signal.live_state_expected
-            && !action_is_product_help_lookup(action)
+            && !action_is_agentark_knowledge_lookup(action)
             && matches!(
                 metadata.integration_class,
                 crate::actions::PlannerIntegrationClass::Internal
@@ -1730,6 +2325,131 @@ fn select_read_only_fast_path_action(
     })
 }
 
+fn action_is_vision_attachment_candidate(action: &crate::actions::ActionDef) -> bool {
+    if !action_has_capability_id(action, "vision_ocr") {
+        return false;
+    }
+    let metadata = action.planner_metadata();
+    matches!(
+        metadata.side_effect_level,
+        crate::actions::PlannerSideEffectLevel::None
+    ) && matches!(
+        metadata.delivery_mode,
+        crate::actions::PlannerDeliveryMode::Immediate
+            | crate::actions::PlannerDeliveryMode::Either
+    )
+}
+
+fn visual_attachment_analysis_allows_final_answer(
+    routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
+    turn_plan: Option<&AgentLoopTurnPlanState>,
+) -> bool {
+    if !turn_plan_allows_read_only_fast_path(turn_plan) {
+        return false;
+    }
+    !routing.is_some_and(|signal| {
+        signal.has_durable_goal()
+            || signal.has_multiple_goals()
+            || signal.goals.iter().any(|goal| goal.has_side_effect())
+    })
+}
+
+fn select_visual_attachment_analysis_action(
+    authorized_actions: &[crate::actions::ActionDef],
+    request_hints: &RequestExecutionHints,
+) -> Option<AgentLoopVisualAttachmentAnalysis> {
+    let upload_id = first_visual_attachment_upload_id(request_hints)?;
+    let action = authorized_actions
+        .iter()
+        .find(|action| action_is_vision_attachment_candidate(action))?
+        .clone();
+
+    Some(AgentLoopVisualAttachmentAnalysis { action, upload_id })
+}
+
+fn visual_attachment_analysis_call(
+    analysis: &AgentLoopVisualAttachmentAnalysis,
+    message: &str,
+) -> crate::core::llm::ToolCall {
+    let question = message.trim();
+    let mut arguments = serde_json::json!({
+        "upload_id": analysis.upload_id.clone(),
+        "task": if question.is_empty() { "describe" } else { "answer_question" },
+        "detail": "auto",
+    });
+    if !question.is_empty() {
+        arguments["question"] = serde_json::Value::String(question.to_string());
+    }
+    crate::core::llm::ToolCall {
+        id: "visual-attachment-analysis".to_string(),
+        name: analysis.action.name.clone(),
+        arguments,
+    }
+}
+
+fn remove_visual_attachment_action_from_scope(
+    actions: &mut Vec<crate::actions::ActionDef>,
+    analysis: Option<&AgentLoopVisualAttachmentAnalysis>,
+) -> bool {
+    let Some(analysis) = analysis else {
+        return false;
+    };
+    let before = actions.len();
+    actions.retain(|action| action.name != analysis.action.name);
+    actions.len() != before
+}
+
+fn ensure_visual_attachment_action_for_scope(
+    actions: &mut Vec<crate::actions::ActionDef>,
+    authorized_action_map: &HashMap<String, crate::actions::ActionDef>,
+    request_hints: &RequestExecutionHints,
+) -> bool {
+    if !request_hints_have_visual_attachment_context(request_hints) {
+        return false;
+    }
+    if actions.iter().any(action_is_vision_attachment_candidate) {
+        return false;
+    }
+    let Some(action) = authorized_action_map
+        .values()
+        .find(|action| action_is_vision_attachment_candidate(action))
+    else {
+        return false;
+    };
+    actions.push(action.clone());
+    true
+}
+
+fn setup_resolution_action_rank(action: &crate::actions::ActionDef) -> (u8, &str) {
+    let cost_rank = match action.planner_metadata().cost {
+        crate::actions::PlannerCostTier::Low => 0,
+        crate::actions::PlannerCostTier::Medium => 1,
+        crate::actions::PlannerCostTier::High => 2,
+    };
+    (cost_rank, action.name.as_str())
+}
+
+fn ensure_setup_resolution_action_for_scope(
+    actions: &mut Vec<crate::actions::ActionDef>,
+    authorized_action_map: &HashMap<String, crate::actions::ActionDef>,
+) -> bool {
+    if !actions.iter().any(action_is_setup_delivery_candidate) {
+        return false;
+    }
+    if actions.iter().any(action_is_setup_resolution_candidate) {
+        return false;
+    }
+    let Some(action) = authorized_action_map
+        .values()
+        .filter(|action| action_is_setup_resolution_candidate(action))
+        .min_by_key(|action| setup_resolution_action_rank(action))
+    else {
+        return false;
+    };
+    actions.push(action.clone());
+    true
+}
+
 fn action_schema_accepts_direct_query_argument(action: &crate::actions::ActionDef) -> bool {
     let properties = action
         .input_schema
@@ -1806,7 +2526,7 @@ fn synthetic_read_only_fast_path_call(
     }
     let query = direct_query_for_read_only_fast_path(message, routing)?;
     let mut arguments = serde_json::json!({ "query": query });
-    if action_is_product_help_lookup(action) {
+    if action_is_agentark_knowledge_lookup(action) {
         if let Some(doc_ids) = routing
             .map(|signal| signal.grounding_doc_ids.clone())
             .filter(|doc_ids| !doc_ids.is_empty())
@@ -1864,6 +2584,210 @@ fn turn_plan_for_prompt(plan: Option<&AgentLoopTurnPlanState>) -> serde_json::Va
 fn turn_plan_to_execution_plan(
     plan: Option<&AgentLoopTurnPlanState>,
 ) -> Option<crate::core::ExecutionPlan> {
+    turn_plan_to_execution_plan_with_actions(plan, None)
+}
+
+fn app_delivery_plan_substep(
+    id: usize,
+    phase: &str,
+    title: &str,
+    description: &str,
+    status: crate::core::planner::PlanStepStatus,
+) -> crate::core::PlanSubstep {
+    crate::core::PlanSubstep {
+        id,
+        title: title.to_string(),
+        description: description.to_string(),
+        tool_hint: Some(format!("app_delivery:{}", phase)),
+        status: Some(status),
+    }
+}
+
+fn app_delivery_plan_substeps(
+    status: crate::core::planner::PlanStepStatus,
+) -> Vec<crate::core::PlanSubstep> {
+    let substep_status = match status {
+        crate::core::planner::PlanStepStatus::Completed => {
+            crate::core::planner::PlanStepStatus::Completed
+        }
+        crate::core::planner::PlanStepStatus::Failed => {
+            crate::core::planner::PlanStepStatus::Failed
+        }
+        crate::core::planner::PlanStepStatus::Skipped => {
+            crate::core::planner::PlanStepStatus::Skipped
+        }
+        _ => crate::core::planner::PlanStepStatus::Pending,
+    };
+    vec![
+        app_delivery_plan_substep(
+            1,
+            "planning",
+            "Plan app bundle",
+            "Choose the smallest deployable shape, runtime mode, file graph, and validation path.",
+            substep_status,
+        ),
+        app_delivery_plan_substep(
+            2,
+            "deploying",
+            "Prepare deployment",
+            "Create or update the local app target and deployment metadata.",
+            substep_status,
+        ),
+        app_delivery_plan_substep(
+            3,
+            "generating_files",
+            "Write app files",
+            "Stage the generated source bundle and referenced assets.",
+            substep_status,
+        ),
+        app_delivery_plan_substep(
+            4,
+            "preparing_runtime",
+            "Prepare runtime",
+            "Resolve static or dynamic serving mode, metadata, environment, and an open local port when needed.",
+            substep_status,
+        ),
+        app_delivery_plan_substep(
+            5,
+            "installing",
+            "Install dependencies",
+            "Run the dependency install path when the app bundle requires one.",
+            substep_status,
+        ),
+        app_delivery_plan_substep(
+            6,
+            "starting_runtime",
+            "Start runtime",
+            "Start the local runtime or register the static app for local serving.",
+            substep_status,
+        ),
+        app_delivery_plan_substep(
+            7,
+            "waiting_for_inputs",
+            "Resolve required inputs",
+            "Pause with a precise missing-input report when deployment needs user-provided configuration.",
+            substep_status,
+        ),
+        app_delivery_plan_substep(
+            8,
+            "completed",
+            "Validate and report",
+            "Confirm the local app target and return the Apps page controls hint.",
+            substep_status,
+        ),
+    ]
+}
+
+fn setup_plan_substep(
+    id: usize,
+    phase: &str,
+    title: &str,
+    description: &str,
+    status: crate::core::planner::PlanStepStatus,
+) -> crate::core::PlanSubstep {
+    crate::core::PlanSubstep {
+        id,
+        title: title.to_string(),
+        description: description.to_string(),
+        tool_hint: Some(format!("capability_setup:{}", phase)),
+        status: Some(status),
+    }
+}
+
+fn setup_plan_substeps(
+    status: crate::core::planner::PlanStepStatus,
+) -> Vec<crate::core::PlanSubstep> {
+    let substep_status = match status {
+        crate::core::planner::PlanStepStatus::Completed => {
+            crate::core::planner::PlanStepStatus::Completed
+        }
+        crate::core::planner::PlanStepStatus::Failed => {
+            crate::core::planner::PlanStepStatus::Failed
+        }
+        crate::core::planner::PlanStepStatus::Skipped => {
+            crate::core::planner::PlanStepStatus::Skipped
+        }
+        _ => crate::core::planner::PlanStepStatus::Pending,
+    };
+    vec![
+        setup_plan_substep(
+            1,
+            "resolve_target",
+            "Resolve requested capability",
+            "Identify the integration, messaging channel, connector, or custom capability the turn needs.",
+            substep_status,
+        ),
+        setup_plan_substep(
+            2,
+            "inspect_local_catalog",
+            "Inspect local catalog",
+            "Check installed packs, bundled catalog entries, existing channels, and connected credentials first.",
+            substep_status,
+        ),
+        setup_plan_substep(
+            3,
+            "resolve_ambiguity",
+            "Resolve setup ambiguity",
+            "Use catalog metadata and, when local metadata is insufficient, read-only web/docs lookup before choosing an install path.",
+            substep_status,
+        ),
+        setup_plan_substep(
+            4,
+            "install_or_scaffold",
+            "Install or scaffold",
+            "Install the selected pack or create the reviewable connector/channel scaffold.",
+            substep_status,
+        ),
+        setup_plan_substep(
+            5,
+            "configure_auth",
+            "Prepare credentials",
+            "Declare required secrets, OAuth steps, or secure input requirements without exposing credentials in chat.",
+            substep_status,
+        ),
+        setup_plan_substep(
+            6,
+            "verify_registration",
+            "Verify registration",
+            "Confirm the action, integration, or channel is registered and visible to AgentArk routing.",
+            substep_status,
+        ),
+        setup_plan_substep(
+            7,
+            "report_controls",
+            "Report next controls",
+            "Return the installed capability, remaining setup requirements, and where to manage it.",
+            substep_status,
+        ),
+    ]
+}
+
+fn turn_plan_goal_is_app_delivery_candidate(
+    goal: &AgentLoopGoalState,
+    actions: Option<&HashMap<String, crate::actions::ActionDef>>,
+) -> bool {
+    goal.action_name
+        .as_ref()
+        .and_then(|name| actions.and_then(|actions| actions.get(name)))
+        .map(action_is_app_delivery_candidate)
+        .unwrap_or(false)
+}
+
+fn turn_plan_goal_is_setup_delivery_candidate(
+    goal: &AgentLoopGoalState,
+    actions: Option<&HashMap<String, crate::actions::ActionDef>>,
+) -> bool {
+    goal.action_name
+        .as_ref()
+        .and_then(|name| actions.and_then(|actions| actions.get(name)))
+        .map(action_is_setup_delivery_candidate)
+        .unwrap_or(false)
+}
+
+fn turn_plan_to_execution_plan_with_actions(
+    plan: Option<&AgentLoopTurnPlanState>,
+    actions: Option<&HashMap<String, crate::actions::ActionDef>>,
+) -> Option<crate::core::ExecutionPlan> {
     let plan = plan?;
     Some(crate::core::ExecutionPlan {
         plan_id: plan.plan_id.clone(),
@@ -1888,10 +2812,119 @@ fn turn_plan_to_execution_plan(
                 })),
                 tool_hint: Some(goal.capability_query.clone()),
                 status: Some(goal.status),
-                substeps: Vec::new(),
+                substeps: if turn_plan_goal_is_app_delivery_candidate(goal, actions) {
+                    app_delivery_plan_substeps(goal.status)
+                } else if turn_plan_goal_is_setup_delivery_candidate(goal, actions) {
+                    setup_plan_substeps(goal.status)
+                } else {
+                    Vec::new()
+                },
             })
             .collect(),
     })
+}
+
+fn setup_delivery_execution_plan_from_scoped_actions(
+    plan_id: String,
+    scoped_actions: &[crate::actions::ActionDef],
+) -> Option<crate::core::ExecutionPlan> {
+    let action = scoped_actions
+        .iter()
+        .find(|action| action_is_setup_delivery_candidate(action))?;
+    Some(crate::core::ExecutionPlan {
+        plan_id,
+        revision: 1,
+        summary: "Set up the requested integration or messaging capability.".to_string(),
+        steps: vec![crate::core::PlanStep {
+            id: 1,
+            title: "Set up integration or channel".to_string(),
+            description:
+                "Resolve the target, inspect local catalog state, handle ambiguity, install or scaffold, and report remaining controls."
+                    .to_string(),
+            action: Some(action.name.clone()),
+            arguments: None,
+            tool_hint: Some("capability_setup".to_string()),
+            status: Some(crate::core::planner::PlanStepStatus::Pending),
+            substeps: setup_plan_substeps(crate::core::planner::PlanStepStatus::Pending),
+        }],
+    })
+}
+
+fn app_delivery_execution_plan_from_scoped_actions(
+    plan_id: String,
+    scoped_actions: &[crate::actions::ActionDef],
+) -> Option<crate::core::ExecutionPlan> {
+    let action = scoped_actions
+        .iter()
+        .find(|action| action_is_app_delivery_candidate(action))?;
+    Some(crate::core::ExecutionPlan {
+        plan_id,
+        revision: 1,
+        summary: "Build and deploy the app locally.".to_string(),
+        steps: vec![crate::core::PlanStep {
+            id: 1,
+            title: "Build and deploy app".to_string(),
+            description:
+                "Create the app bundle, prepare the runtime, deploy locally, validate, and report controls."
+                    .to_string(),
+            action: Some(action.name.clone()),
+            arguments: None,
+            tool_hint: Some("app_delivery".to_string()),
+            status: Some(crate::core::planner::PlanStepStatus::Pending),
+            substeps: app_delivery_plan_substeps(crate::core::planner::PlanStepStatus::Pending),
+        }],
+    })
+}
+
+fn execution_plan_has_setup_substeps(plan: &crate::core::ExecutionPlan) -> bool {
+    plan.steps.iter().any(|step| {
+        step.substeps.iter().any(|substep| {
+            substep
+                .tool_hint
+                .as_deref()
+                .is_some_and(|hint| hint.starts_with("capability_setup:"))
+        })
+    })
+}
+
+fn execution_plan_has_app_delivery_substeps(plan: &crate::core::ExecutionPlan) -> bool {
+    plan.steps.iter().any(|step| {
+        step.substeps.iter().any(|substep| {
+            substep
+                .tool_hint
+                .as_deref()
+                .is_some_and(|hint| hint.starts_with("app_delivery:"))
+        })
+    })
+}
+
+fn emit_execution_plan_generated(
+    stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    progress_recorder: Option<&AgentLoopProgressRecorder>,
+    plan: crate::core::ExecutionPlan,
+) {
+    if let Some(recorder) = progress_recorder {
+        if let Ok(mut steps) = recorder.lock() {
+            steps.push(crate::core::ExecutionStep {
+                icon: "[plan]".to_string(),
+                title: "Execution Plan".to_string(),
+                detail: format!("{} steps planned", plan.steps.len()),
+                step_type: "plan_generated".to_string(),
+                data: Some(
+                    serde_json::json!({
+                        "step_type": "plan_generated",
+                        "plan": plan.clone(),
+                    })
+                    .to_string(),
+                ),
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        }
+    }
+    if let Some(tx) = stream_tx {
+        queue_stream_event(tx, StreamEvent::PlanGenerated { plan });
+    }
 }
 
 fn product_identity_context_for_prompt() -> serde_json::Value {
@@ -1901,7 +2934,7 @@ fn product_identity_context_for_prompt() -> serde_json::Value {
             "{} is a self-hosted personal AI Agent OS for private chat, durable memory, tasks, watchers, goals, apps, integrations, companion devices, approvals, smart model routing, learning/evolution, and traceable actions.",
             crate::branding::PRODUCT_NAME
         ),
-        "authority": "Use these supplied facts, bundled product help, and the live action catalog as authoritative answer material for questions about this running product and what it can do. Do not mention this object, field names, or internal sourcing in the user-facing answer unless the user asks for provenance.",
+        "authority": "Use these supplied facts and live AgentArk capabilities as authoritative answer material for questions about this running product and what it can do. Curated AgentArk manual text is supplemental explanation, not capability truth. Do not mention this object, field names, or internal sourcing in the user-facing answer unless the user asks for provenance.",
         "external_lookup_boundary": "Use public web or research only when the user is asking about external public material outside this running product, such as a paper, repository, website, or third-party source."
     })
 }
@@ -1973,47 +3006,201 @@ fn read_only_prompt_needs_prior_conversation_context(
     })
 }
 
+fn prompt_fragment_actions_for_turn<'a>(
+    actions: &'a [crate::actions::ActionDef],
+    request_hints: &RequestExecutionHints,
+    turn_plan: Option<&AgentLoopTurnPlanState>,
+) -> Vec<&'a crate::actions::ActionDef> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(plan) = turn_plan {
+        for goal in &plan.goals {
+            if let Some(name) = goal.action_name.as_deref().map(str::trim) {
+                if !name.is_empty() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    if let Some(plan) = request_hints.intent_plan.as_ref() {
+        names.extend(plan.likely_action_names());
+    }
+
+    let selected = if names.is_empty() && actions.len() == 1 {
+        actions.iter().collect::<Vec<_>>()
+    } else if names.is_empty() {
+        Vec::new()
+    } else {
+        actions
+            .iter()
+            .filter(|action| names.contains(action.name.as_str()))
+            .collect::<Vec<_>>()
+    };
+
+    selected
+}
+
+#[cfg(test)]
+fn agent_loop_prompt_fragment_selection(
+    actions: &[crate::actions::ActionDef],
+    request_hints: &RequestExecutionHints,
+    turn_plan: Option<&AgentLoopTurnPlanState>,
+    app_delivery_stream_blocks: bool,
+    read_only_bounded_mode: bool,
+    can_request_scope_expansion: bool,
+) -> crate::core::prompt_fragments::PromptFragmentSelection {
+    let bundle = crate::core::prompt_fragments::default_prompt_fragment_bundle();
+    agent_loop_prompt_fragment_selection_with_bundle(
+        &bundle,
+        actions,
+        request_hints,
+        turn_plan,
+        app_delivery_stream_blocks,
+        read_only_bounded_mode,
+        can_request_scope_expansion,
+    )
+}
+
+fn agent_loop_prompt_fragment_selection_with_bundle(
+    bundle: &crate::core::prompt_fragments::PromptFragmentBundleProfile,
+    actions: &[crate::actions::ActionDef],
+    request_hints: &RequestExecutionHints,
+    turn_plan: Option<&AgentLoopTurnPlanState>,
+    app_delivery_stream_blocks: bool,
+    read_only_bounded_mode: bool,
+    can_request_scope_expansion: bool,
+) -> crate::core::prompt_fragments::PromptFragmentSelection {
+    let mut tags = std::collections::BTreeSet::new();
+    if request_hints.secret_offered.is_some() {
+        crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "secret");
+    }
+    if !request_hints.attachments.is_empty() {
+        crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "attachment");
+        for attachment in &request_hints.attachments {
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, &attachment.kind);
+        }
+    }
+    if request_hints.arkorbit_context.is_some() {
+        crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "arkorbit");
+    }
+    if read_only_bounded_mode {
+        crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "read_only");
+    }
+    if app_delivery_stream_blocks {
+        crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "app_delivery");
+        crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "app_hosting");
+    }
+    if can_request_scope_expansion {
+        crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "scope_expansion");
+    }
+    if let Some(routing) = request_hints.routing.as_ref() {
+        if routing.agentark_capabilities_expected {
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "agentark_capabilities");
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "capability_inventory");
+        }
+        if routing.agentark_manual_expected {
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "agentark_manual");
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "documentation");
+        }
+        if routing.live_state_expected {
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "platform_observability");
+        }
+        if routing.external_info_expected {
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "external_info");
+        }
+        if routing.saved_user_facts_expected
+            || routing.agentark_capabilities_expected
+            || routing.agentark_manual_expected
+            || routing.live_state_expected
+            || routing.external_info_expected
+            || routing.has_transient_read_only_lookup()
+        {
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "read_only");
+        }
+        if routing.has_durable_goal() {
+            crate::core::prompt_fragments::insert_prompt_tag(&mut tags, "durable_work");
+        }
+    }
+
+    for action in prompt_fragment_actions_for_turn(actions, request_hints, turn_plan) {
+        crate::core::prompt_fragments::add_action_prompt_tags(&mut tags, action);
+    }
+
+    crate::core::prompt_fragments::select_prompt_fragments(&bundle, "agent_loop", &tags, 2_400)
+}
+
+fn packed_history_budget(
+    packed_context: &super::conversation_context::PackedConversationContext,
+) -> crate::core::context_budget::HistoryTokenBudget {
+    crate::core::context_budget::HistoryTokenBudget {
+        history_tokens: packed_context
+            .history_token_budget
+            .max(MIN_CHAT_HISTORY_TOKEN_BUDGET),
+        summary_tokens: packed_context.summary_token_budget.max(256),
+    }
+}
+
 fn recent_conversation_for_prompt(
     packed_context: &super::conversation_context::PackedConversationContext,
-    limit: usize,
+    max_tokens: usize,
 ) -> Vec<serde_json::Value> {
-    packed_context
-        .history
-        .iter()
-        .rev()
-        .take(limit)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|turn| {
-            serde_json::json!({
-                "role": turn.role.clone(),
-                "content": safe_truncate(
-                    &crate::security::redact_secret_input(&turn.content).text,
-                    900,
-                ),
-                "timestamp": turn._timestamp,
-            })
-        })
-        .collect::<Vec<_>>()
+    let message_token_budget = packed_context
+        .message_token_budget
+        .clamp(MIN_CHAT_MESSAGE_TOKEN_BUDGET, MAX_CHAT_MESSAGE_TOKEN_BUDGET);
+    let mut selected = Vec::new();
+    let mut used_tokens = 0usize;
+    for turn in packed_context.history.iter().rev() {
+        let redacted = crate::security::redact_secret_input(&turn.content).text;
+        let content =
+            crate::core::context_budget::truncate_to_token_budget(&redacted, message_token_budget);
+        let turn_tokens =
+            crate::core::context_budget::estimate_role_message_tokens(&turn.role, &content)
+                .saturating_add(8);
+        if !selected.is_empty() && used_tokens.saturating_add(turn_tokens) > max_tokens {
+            break;
+        }
+        used_tokens = used_tokens.saturating_add(turn_tokens);
+        selected.push(serde_json::json!({
+            "role": turn.role.clone(),
+            "content": content,
+            "timestamp": turn._timestamp,
+        }));
+        if used_tokens >= max_tokens {
+            break;
+        }
+    }
+    selected.reverse();
+    selected
 }
 
 fn conversation_context_for_prompt(
     packed_context: &super::conversation_context::PackedConversationContext,
     include_prior_conversation: bool,
 ) -> serde_json::Value {
+    let earlier_recap = if include_prior_conversation {
+        packed_context.digest.as_ref().map(|value| {
+            crate::core::context_budget::truncate_to_token_budget(
+                value,
+                packed_context.summary_token_budget.max(256),
+            )
+        })
+    } else {
+        None
+    };
+    let recent_messages = if include_prior_conversation {
+        let recent_budget = Agent::prompt_recent_token_budget(
+            packed_history_budget(packed_context),
+            "AGENTARK_CHAT_PROMPT_RECENT_TOKENS",
+            PROMPT_RECENT_HISTORY_RATIO_PERCENT,
+        );
+        recent_conversation_for_prompt(packed_context, recent_budget)
+    } else {
+        Vec::new()
+    };
+
     serde_json::json!({
         "resolution_policy": "Use earlier_recap and recent_messages to resolve semantically dependent follow-ups, refinements, clarifications, approvals, corrections, and continuation requests. Do not inherit the prior topic when the current user_message is self-contained or requests a different outcome.",
-        "earlier_recap": if include_prior_conversation {
-            packed_context.digest.as_ref().map(|value| safe_truncate(value, 2000))
-        } else {
-            None
-        },
-        "recent_messages": if include_prior_conversation {
-            recent_conversation_for_prompt(packed_context, 8)
-        } else {
-            Vec::new()
-        },
+        "earlier_recap": earlier_recap,
+        "recent_messages": recent_messages,
         "loaded_messages": packed_context.total_loaded,
         "used_digest": packed_context.used_digest,
         "prior_context_included": include_prior_conversation,
@@ -2029,12 +3216,21 @@ fn read_only_conversation_context_for_prompt(
             "prior_context_included": false,
         });
     }
+    let earlier_recap = packed_context.digest.as_ref().map(|value| {
+        crate::core::context_budget::truncate_to_token_budget(
+            value,
+            packed_context.summary_token_budget.max(256).min(512),
+        )
+    });
+    let recent_budget = Agent::prompt_recent_token_budget(
+        packed_history_budget(packed_context),
+        "AGENTARK_CHAT_READ_ONLY_PROMPT_RECENT_TOKENS",
+        READ_ONLY_PROMPT_RECENT_HISTORY_RATIO_PERCENT,
+    );
+    let recent_messages = recent_conversation_for_prompt(packed_context, recent_budget);
     serde_json::json!({
-        "earlier_recap": packed_context
-            .digest
-            .as_ref()
-            .map(|value| safe_truncate(value, 500)),
-        "recent_messages": recent_conversation_for_prompt(packed_context, 3),
+        "earlier_recap": earlier_recap,
+        "recent_messages": recent_messages,
         "loaded_messages": packed_context.total_loaded,
         "used_digest": packed_context.used_digest,
         "prior_context_included": true,
@@ -2093,6 +3289,67 @@ fn should_include_saved_user_facts_context(request_hints: &RequestExecutionHints
         .unwrap_or(false)
 }
 
+fn attachment_hint_visual_context(attachment: &ChatAttachmentHint) -> bool {
+    let content_type = attachment
+        .content_type
+        .as_deref()
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if content_type.starts_with("image/") {
+        return true;
+    }
+
+    attachment
+        .kind
+        .trim()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| {
+            let part = part.to_ascii_lowercase();
+            part == "visual" || part == "image"
+        })
+}
+
+fn attachment_hint_document_context(attachment: &ChatAttachmentHint) -> bool {
+    let content_type = attachment
+        .content_type
+        .as_deref()
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if content_type == "application/pdf" || content_type.starts_with("text/") {
+        return true;
+    }
+
+    attachment
+        .kind
+        .trim()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case("document"))
+}
+
+fn first_visual_attachment_upload_id(request_hints: &RequestExecutionHints) -> Option<String> {
+    request_hints
+        .attachments
+        .iter()
+        .filter(|attachment| attachment_hint_visual_context(attachment))
+        .filter_map(|attachment| {
+            let upload_id = attachment.upload_id.trim();
+            (!upload_id.is_empty()).then(|| upload_id.to_string())
+        })
+        .next()
+}
+
+fn request_hints_have_visual_attachment_context(request_hints: &RequestExecutionHints) -> bool {
+    first_visual_attachment_upload_id(request_hints).is_some()
+}
+
 fn agent_loop_action_scope_query(message: &str, request_hints: &RequestExecutionHints) -> String {
     let mut parts = vec![message.trim().to_string()];
     if !request_hints.attachments.is_empty() {
@@ -2102,14 +3359,14 @@ fn agent_loop_action_scope_query(message: &str, request_hints: &RequestExecution
         if request_hints
             .attachments
             .iter()
-            .any(|attachment| attachment.kind == "visual")
+            .any(attachment_hint_visual_context)
         {
             parts.push("uploaded visual attachment requires vision OCR or screenshot understanding when the answer depends on image contents".to_string());
         }
         if request_hints
             .attachments
             .iter()
-            .any(|attachment| attachment.kind == "document")
+            .any(attachment_hint_document_context)
         {
             parts.push("uploaded document attachment requires document lookup when the answer depends on file contents".to_string());
         }
@@ -2136,6 +3393,25 @@ fn agent_loop_action_scope_query(message: &str, request_hints: &RequestExecution
     }
     if let Some(plan) = request_hints.intent_plan.as_ref() {
         parts.extend(plan.scope_query_lines());
+    }
+    if let Some(context) = request_hints.accepted_suggestion_context.as_ref() {
+        parts.push("user-approved structured launch packet".to_string());
+        for key in [
+            "accepted_kind",
+            "title",
+            "detail",
+            "goal_title",
+            "goal_detail",
+        ] {
+            if let Some(value) = context
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                parts.push(value.to_string());
+            }
+        }
     }
     parts
         .into_iter()
@@ -2198,6 +3474,7 @@ fn build_agent_loop_read_only_user_prompt(
     packed_context: &super::conversation_context::PackedConversationContext,
     recent_artifacts: &[ConversationArtifactContext],
     actions: &[crate::actions::ActionDef],
+    prompt_fragment_bundle: &crate::core::prompt_fragments::PromptFragmentBundleProfile,
     request_hints: &RequestExecutionHints,
     turn_plan: Option<&AgentLoopTurnPlanState>,
     include_action_schemas: bool,
@@ -2206,6 +3483,15 @@ fn build_agent_loop_read_only_user_prompt(
         .iter()
         .map(|action| action_prompt_summary(action, include_action_schemas))
         .collect::<Vec<_>>();
+    let active_guidance = agent_loop_prompt_fragment_selection_with_bundle(
+        prompt_fragment_bundle,
+        actions,
+        request_hints,
+        turn_plan,
+        false,
+        true,
+        false,
+    );
     let include_memory_context = should_include_saved_user_facts_context(request_hints);
     let include_prior_conversation =
         read_only_prompt_needs_prior_conversation_context(request_hints, turn_plan);
@@ -2230,6 +3516,7 @@ fn build_agent_loop_read_only_user_prompt(
             "routing_signal": routing_signal_for_prompt(request_hints.routing.as_ref()),
             "secret_offered": request_hints.secret_offered.as_ref(),
         },
+        "active_guidance": crate::core::prompt_fragments::prompt_fragment_selection_for_prompt(&active_guidance),
         "turn_plan": turn_plan_for_prompt(turn_plan),
         "conversation_context": read_only_conversation_context_for_prompt(
             packed_context,
@@ -2246,6 +3533,7 @@ fn build_agent_loop_read_only_user_prompt(
         "current_state": {
             "attachments": attachment_hints_for_prompt(request_hints),
             "arkorbit_context": request_hints.arkorbit_context.as_ref(),
+            "accepted_suggestion_context": request_hints.accepted_suggestion_context.as_ref(),
             "recent_artifacts": recent_artifacts_for_prompt_limited(recent_artifacts, 3, true),
         },
         "action_scope": {
@@ -2289,6 +3577,7 @@ fn build_agent_loop_user_prompt(
     watchers: &[crate::core::watcher::Watcher],
     actions: &[crate::actions::ActionDef],
     full_authorized_action_count: usize,
+    prompt_fragment_bundle: &crate::core::prompt_fragments::PromptFragmentBundleProfile,
     request_hints: &RequestExecutionHints,
     turn_plan: Option<&AgentLoopTurnPlanState>,
     include_action_schemas: bool,
@@ -2302,6 +3591,7 @@ fn build_agent_loop_user_prompt(
             packed_context,
             recent_artifacts,
             actions,
+            prompt_fragment_bundle,
             request_hints,
             turn_plan,
             include_action_schemas,
@@ -2393,6 +3683,7 @@ fn build_agent_loop_user_prompt(
                 "rules": [
                     "Emit one <file> block per app file.",
                     "Use app-relative paths such as index.html, style.css, app.js, package.json, or src/App.tsx.",
+                    "Emit the minimal complete file set for the requested app; ordinary browser-native apps should be compact bundles, not product scaffolds.",
                     "Do not emit app_deploy JSON, agent_tool_calls JSON, markdown code fences around the file blocks, or native tool calls.",
                     "AgentArk will parse the streamed file blocks and run the app delivery action after the model response completes."
                 ]
@@ -2413,10 +3704,61 @@ fn build_agent_loop_user_prompt(
         })
     };
     let app_delivery_rule = if app_delivery_stream_blocks {
-        "For generated app/site/dashboard/tool delivery, emit complete app files as streaming <file> blocks using the protocol above. Do not call or spell out app_deploy JSON in this model response; AgentArk will synthesize and run the app-hosting action from the parsed file blocks. When updating a recent deployed app, preserve the active workspace identity, original requirements, and current deployed files instead of replacing the app with an unrelated implementation."
+        "For generated app/site/dashboard/tool delivery, emit complete app files as streaming <file> blocks using the protocol above. Build the smallest working app that satisfies the requested workflow, with polished responsive UI, clear controls, and useful loading/empty/error states. Keep the bundle lean: avoid unrelated routes, auth, databases, admin areas, test suites, generated boilerplate, package manifests, server files, or lifecycle commands unless the user's intent semantically requires them. Prefer a standalone static/browser bundle when the requested behavior can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Use a dynamic backend/runtime only for server-only needs such as secrets, authenticated server-side APIs, durable jobs with no browser open, server-side databases/state, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs the browser/app proxy cannot safely call. Deploy locally by default; content visibility or audience requirements inside the app are not the same as external network exposure. Do not call or spell out app_deploy JSON in this model response; AgentArk will synthesize and run the app-hosting action from the parsed file blocks. When updating a recent deployed app, preserve the active workspace identity, original requirements, current deployed files, and working behavior unless the user asks to replace or recreate it. After deployment, nudge the user to the Apps page for controls and details."
     } else {
-        "For generated app/site/dashboard/tool delivery, file writes only stage content. Finish with the authorized app-hosting action that returns the runnable app result or asks for missing required inputs. When the turn updates a recent deployed app, preserve the active workspace identity, original requirements, and current deployed files instead of replacing the app with an unrelated implementation."
+        "For generated app/site/dashboard/tool delivery, file writes only stage content. Build the smallest working app that satisfies the requested workflow, with polished responsive UI, clear controls, and useful loading/empty/error states. Keep the bundle lean: avoid unrelated routes, auth, databases, admin areas, test suites, generated boilerplate, package manifests, server files, or lifecycle commands unless the user's intent semantically requires them. Prefer a standalone static/browser bundle when the requested behavior can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Use a dynamic backend/runtime only for server-only needs such as secrets, authenticated server-side APIs, durable jobs with no browser open, server-side databases/state, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs the browser/app proxy cannot safely call. Deploy locally by default; content visibility or audience requirements inside the app are not the same as external network exposure. Finish with the authorized app-hosting action that returns the runnable app result or asks for missing required inputs. When the turn updates a recent deployed app, preserve the active workspace identity, original requirements, and current deployed files, and working behavior unless the user asks to replace or recreate it. After deployment, nudge the user to the Apps page for controls and details."
     };
+    let can_request_scope_expansion = actions.len() < full_authorized_action_count;
+    let active_guidance = agent_loop_prompt_fragment_selection_with_bundle(
+        prompt_fragment_bundle,
+        actions,
+        request_hints,
+        turn_plan,
+        app_delivery_stream_blocks,
+        read_only_bounded_mode,
+        can_request_scope_expansion,
+    );
+    let active_tags = &active_guidance.active_tags;
+    let app_delivery_selection_rule = active_tags
+        .contains("app_delivery")
+        .then_some(app_delivery_rule);
+    let cadence_selection_rule = (active_tags.contains("app_hosting")
+        || active_tags.contains("scheduler")
+        || active_tags.contains("watcher")
+        || active_tags.contains("role_orchestration"))
+    .then_some("Timing and recurrence belong to the artifact or workflow they modify. App/dashboard/tool refresh, polling, auto-update, and live-data cadence should be implemented in the generated artifact. Create schedule/watch objects only for AgentArk-owned later execution, independent background monitoring, or notifications outside that artifact.");
+    let attachment_selection_rule = (!request_hints.attachments.is_empty()).then_some("When attachments are present, follow the user's request and treat attachments as evidence or context for that request. Use the authorized document or vision action when the answer depends on attached file contents.");
+    let arkorbit_selection_rule = request_hints.arkorbit_context.is_some().then_some("When arkorbit_context is present, treat the turn as an ArkOrbit file-backed build/edit session. Keep credentials, cookies, bearer headers, tokens, and private identifiers out of orbit files.");
+    let accepted_suggestion_selection_rule = request_hints.accepted_suggestion_context.is_some().then_some("When accepted_suggestion_context is present, treat it as a user-approved structured launch packet. Use accepted_kind and goal fields as the durable outcome contract, choose matching authorized actions by schema and metadata, and do not reinterpret the request from the visible launch text alone.");
+    let scope_expansion_rule = can_request_scope_expansion.then_some("If the supplied action subset is insufficient, request expansion using the expansion_protocol sentinel exactly as specified instead of claiming the capability is unavailable.");
+    let durable_action_active = request_hints
+        .routing
+        .as_ref()
+        .is_some_and(|routing| routing.has_durable_goal())
+        || actions.iter().any(|action| {
+            let metadata = action.planner_metadata();
+            matches!(
+                metadata.role,
+                crate::actions::PlannerActionRole::Mutation
+                    | crate::actions::PlannerActionRole::Orchestration
+                    | crate::actions::PlannerActionRole::Delivery
+            ) || matches!(
+                metadata.side_effect_level,
+                crate::actions::PlannerSideEffectLevel::Notify
+                    | crate::actions::PlannerSideEffectLevel::Write
+            )
+        });
+    let read_action_active = active_tags.contains("read_only")
+        || actions.iter().any(|action| {
+            matches!(
+                action.planner_metadata().role,
+                crate::actions::PlannerActionRole::Inspection
+                    | crate::actions::PlannerActionRole::DataSource
+            )
+        });
+    let durable_work_selection_rule = durable_action_active.then_some("Create or update the durable object before optional reads. Scheduled tasks, watchers, reminders, background sessions, deployments, and delegated work are durable outcomes.");
+    let direct_durable_actions_rule = durable_action_active.then_some("Prefer authorized actions whose metadata directly matches the durable object's class. Do not use sandbox/code/extension-management actions as an indirect way to create durable objects when direct app, watcher, scheduler, file, integration, or session actions are supplied.");
+    let read_actions_rule = read_action_active.then_some("Use read/data-source actions for current information requests or missing required arguments, not as a prerequisite baseline for durable work.");
 
     let payload = serde_json::json!({
         "protocol": protocol,
@@ -2431,6 +3773,7 @@ fn build_agent_loop_user_prompt(
             "advisory_intent_plan": request_hints.intent_plan.as_ref(),
             "secret_offered": request_hints.secret_offered.as_ref(),
         },
+        "active_guidance": crate::core::prompt_fragments::prompt_fragment_selection_for_prompt(&active_guidance),
         "product_identity": product_identity_context_for_prompt(),
         "turn_plan": turn_plan_for_prompt(turn_plan),
         "conversation_context": conversation_context_for_prompt(
@@ -2451,13 +3794,14 @@ fn build_agent_loop_user_prompt(
             "watchers": active_watchers,
             "attachments": attachment_hints_for_prompt(request_hints),
             "arkorbit_context": request_hints.arkorbit_context.as_ref(),
+            "accepted_suggestion_context": request_hints.accepted_suggestion_context.as_ref(),
             "recent_artifacts": recent_artifacts_for_prompt(recent_artifacts),
             "active_workspace": active_workspace_snapshot,
         },
         "action_scope": {
             "actions_available_this_step": actions.len(),
             "full_authorized_action_count": full_authorized_action_count,
-            "can_request_expansion": actions.len() < full_authorized_action_count,
+            "can_request_expansion": can_request_scope_expansion,
             "expansion_protocol": {
                 "use_when": "The supplied action subset is insufficient to fulfill the user request.",
                 "reply_format": "Your ENTIRE reply must be exactly this single line and nothing else (no JSON, no prose, no rationale): <<<AGENT_SCOPE_EXPAND>>>",
@@ -2479,15 +3823,16 @@ fn build_agent_loop_user_prompt(
             },
             "conversation_context": "Use prior conversation only to resolve the current message's semantic dependencies, including explicit continuations, corrections, approvals, and references. Do not ask the user to restate a clear referent, but if the current message is self-contained or changes topic/outcome/work type, treat it as the new intent instead of continuing the prior task.",
             "turn_plan": "When present, the turn plan is the completion contract. Durable goals need a matching write/orchestration action; answer or research goals may be completed by grounded final text.",
-            "cadence_ownership": "Timing and recurrence belong to the artifact or workflow they modify. App/dashboard/tool refresh, polling, auto-update, and live-data cadence should be implemented in the generated artifact. Create schedule/watch objects only for AgentArk-owned later execution, independent background monitoring, or notifications outside that artifact.",
-            "arkorbit": "When arkorbit_context is present, treat the turn as an ArkOrbit file-backed build/edit session. Keep the same authorized tool catalog as normal chat: use Google Workspace, custom integrations, messaging, search, files, or app tools only when the user's request semantically needs them. Durable orbit output should be clean browser assets written to the selected orbit file namespace; use app hosting for larger browser apps that need managed runtime beyond the orbit iframe. Never put OAuth tokens, API keys, cookies, or provider credentials into orbit HTML/JS; fetch authenticated data through authorized server-side tools first and pass only safe rendered data or summaries into the browser surface, or build a backend/app proxy that uses the secure credential path.",
-            "app_delivery": app_delivery_rule,
-            "durable_work": "Create or update the durable object before optional reads. Scheduled tasks, watchers, reminders, background sessions, deployments, and delegated work are durable outcomes.",
-            "direct_durable_actions": "Prefer authorized actions whose metadata directly matches the durable object's class. Do not use sandbox/code/extension-management actions as an indirect way to create durable objects when direct app, watcher, scheduler, file, integration, or session actions are supplied.",
-            "read_actions": "Use read/data-source actions for current information requests or missing required arguments, not as a prerequisite baseline for durable work.",
-            "attachments": "When attachments are present with a non-empty user_message, follow the user's request and treat attachments as evidence or context for that request. For example, a screenshot attached to a repair report such as an app not working is diagnostic context for debugging the referenced app. Use the authorized document or vision action when the answer depends on attached file contents. For visual uploads, pass the supplied upload_id to vision_ocr. For indexed documents, pass document_id values to document_lookup. If the user_message is empty and visual attachments are present, treat the turn as an implicit request to understand the image; analyze it first, and only surface durable user preferences or reusable workflow constraints when the image actually supports them. Do not infer sensitive traits or store one-off image contents as preferences.",
+            "cadence_ownership": cadence_selection_rule,
+            "arkorbit": arkorbit_selection_rule,
+            "accepted_suggestion": accepted_suggestion_selection_rule,
+            "app_delivery": app_delivery_selection_rule,
+            "durable_work": durable_work_selection_rule,
+            "direct_durable_actions": direct_durable_actions_rule,
+            "read_actions": read_actions_rule,
+            "attachments": attachment_selection_rule,
             "tool_budget": "Prefer the fewest actions that complete the user outcome. Avoid repeated read-only calls when a write/orchestration action is available and still needed.",
-            "scope_expansion": "If the supplied action subset is insufficient, request expansion using the expansion_protocol sentinel exactly as specified instead of claiming the capability is unavailable.",
+            "scope_expansion": scope_expansion_rule,
             "output_hygiene": "Final assistant text must be plain prose for the user. Do not emit internal protocol JSON, control sentinels, or chain-of-thought into the user-visible reply. Never wrap reasoning, rationale, narration, or commentary inside `{...}` braces; reserve braces for code fences, code samples, or genuine JSON the user explicitly asked for.",
             "secret_handling": "If secret_offered is present, the raw secret was removed before this prompt. Do not ask the user to paste it again in normal chat. If secret_offered.secure_prompt_pending is true, tell the user the secure credential form is available and ask them to save the credential there or choose the intended Settings/integration target when the target is ambiguous. Continue handling any non-secret parts of the request when possible."
         },
@@ -2511,6 +3856,7 @@ fn build_agent_loop_followup_prompt(
     tool_history: &[serde_json::Value],
     actions: &[crate::actions::ActionDef],
     full_authorized_action_count: usize,
+    prompt_fragment_bundle: &crate::core::prompt_fragments::PromptFragmentBundleProfile,
     request_hints: &RequestExecutionHints,
     turn_plan: Option<&AgentLoopTurnPlanState>,
     include_action_schemas: bool,
@@ -2524,6 +3870,7 @@ fn build_agent_loop_followup_prompt(
             conversation_key,
             tool_history,
             actions,
+            prompt_fragment_bundle,
             request_hints,
             turn_plan,
             include_action_schemas,
@@ -2535,6 +3882,16 @@ fn build_agent_loop_followup_prompt(
         .iter()
         .map(|action| action_prompt_summary(action, include_action_schemas))
         .collect::<Vec<_>>();
+    let can_request_scope_expansion = actions.len() < full_authorized_action_count;
+    let active_guidance = agent_loop_prompt_fragment_selection_with_bundle(
+        prompt_fragment_bundle,
+        actions,
+        request_hints,
+        turn_plan,
+        app_delivery_stream_blocks,
+        read_only_bounded_mode,
+        can_request_scope_expansion,
+    );
     let protocol = if app_delivery_stream_blocks {
         serde_json::json!({
             "version": AGENT_TURN_LOOP_VERSION,
@@ -2546,6 +3903,7 @@ fn build_agent_loop_followup_prompt(
                 "rules": [
                     "Emit one <file> block per app file.",
                     "Use app-relative paths.",
+                    "Emit the minimal complete file set for the requested app; ordinary browser-native apps should be compact bundles, not product scaffolds.",
                     "Do not emit app_deploy JSON, agent_tool_calls JSON, markdown code fences around the file blocks, or native tool calls.",
                     "AgentArk will parse the streamed file blocks and run app delivery after this response completes."
                 ]
@@ -2576,6 +3934,7 @@ fn build_agent_loop_followup_prompt(
             "advisory_intent_plan": request_hints.intent_plan.as_ref(),
             "secret_offered": request_hints.secret_offered.as_ref(),
         },
+        "active_guidance": crate::core::prompt_fragments::prompt_fragment_selection_for_prompt(&active_guidance),
         "product_identity": product_identity_context_for_prompt(),
         "turn_plan": turn_plan_for_prompt(turn_plan),
         "conversation_context": conversation_context_for_prompt(
@@ -2594,13 +3953,14 @@ fn build_agent_loop_followup_prompt(
         "current_state": {
             "attachments": attachment_hints_for_prompt(request_hints),
             "arkorbit_context": request_hints.arkorbit_context.as_ref(),
+            "accepted_suggestion_context": request_hints.accepted_suggestion_context.as_ref(),
             "recent_artifacts": recent_artifacts_for_prompt(recent_artifacts),
             "active_workspace": active_workspace_snapshot,
         },
         "action_scope": {
             "actions_available_this_step": actions.len(),
             "full_authorized_action_count": full_authorized_action_count,
-            "can_request_expansion": actions.len() < full_authorized_action_count,
+            "can_request_expansion": can_request_scope_expansion,
             "expansion_protocol": {
                 "use_when": "The supplied action subset is insufficient to fulfill the user request.",
                 "reply_format": "Your ENTIRE reply must be exactly this single line and nothing else (no JSON, no prose, no rationale): <<<AGENT_SCOPE_EXPAND>>>",
@@ -2619,7 +3979,7 @@ fn build_agent_loop_followup_prompt(
             Some("The routing signal was unavailable or not trusted. Do not choose durable side-effect actions unless the current user message and turn plan make that durable outcome clear. Ask a concise clarification question when the intended outcome is still ambiguous.")
         },
         "arkorbit_instruction": if request_hints.arkorbit_context.is_some() {
-            Some("This is an ArkOrbit browser-surface turn. Continue to use any authorized integration/tool only when needed by the requested surface, then materialize the result as clean sandboxed browser files. Keep credentials, cookies, bearer headers, tokens, and private identifiers out of orbit files; write only safe display data.")
+            Some("This is an ArkOrbit browser-surface turn. Continue with the active guidance and authorized tools only when needed by the requested surface.")
         } else {
             None
         },
@@ -2636,6 +3996,7 @@ fn build_agent_loop_read_only_followup_prompt(
     conversation_key: &str,
     tool_history: &[serde_json::Value],
     actions: &[crate::actions::ActionDef],
+    prompt_fragment_bundle: &crate::core::prompt_fragments::PromptFragmentBundleProfile,
     request_hints: &RequestExecutionHints,
     turn_plan: Option<&AgentLoopTurnPlanState>,
     include_action_schemas: bool,
@@ -2647,6 +4008,15 @@ fn build_agent_loop_read_only_followup_prompt(
         .collect::<Vec<_>>();
     let include_memory_context = should_include_saved_user_facts_context(request_hints);
     let final_synthesis = actions.is_empty();
+    let active_guidance = agent_loop_prompt_fragment_selection_with_bundle(
+        prompt_fragment_bundle,
+        actions,
+        request_hints,
+        turn_plan,
+        false,
+        true,
+        false,
+    );
     let payload = serde_json::json!({
         "protocol": {
             "version": AGENT_TURN_LOOP_VERSION,
@@ -2673,11 +4043,8 @@ fn build_agent_loop_read_only_followup_prompt(
             "routing_trusted": request_hints.routing_trusted,
             "routing_signal": routing_signal_for_prompt(request_hints.routing.as_ref()),
         },
+        "active_guidance": crate::core::prompt_fragments::prompt_fragment_selection_for_prompt(&active_guidance),
         "turn_plan": turn_plan_for_prompt(turn_plan),
-        "visualization_policy": {
-            "inline_charts": crate::core::inline_artifacts::inline_visualization_guidance(),
-            "app_boundary": crate::core::inline_artifacts::app_deploy_inline_report_boundary(),
-        },
         "memory_context": if include_memory_context {
             Some(serde_json::json!({
                 "saved_user_facts": request_hints.saved_user_facts_context.as_ref(),
@@ -2876,6 +4243,214 @@ fn synthetic_app_deploy_call_from_stream_blocks(
         name: "app_deploy".to_string(),
         arguments: serde_json::Value::Object(arguments),
     }
+}
+
+fn merge_app_delivery_stream_blocks(
+    target: &mut crate::core::llm::stream_blocks::ParsedStreamBlocks,
+    source: crate::core::llm::stream_blocks::ParsedStreamBlocks,
+) {
+    for (path, content) in source.files {
+        target.files.insert(path, content);
+    }
+    for path in source.delete_paths {
+        if !target.delete_paths.iter().any(|existing| existing == &path) {
+            target.delete_paths.push(path);
+        }
+    }
+    target.delete_orphans |= source.delete_orphans;
+    for item in source.checklist_items {
+        if !target
+            .checklist_items
+            .iter()
+            .any(|existing| existing == &item)
+        {
+            target.checklist_items.push(item);
+        }
+    }
+}
+
+fn app_delivery_response_from_stream_blocks(
+    blocks: crate::core::llm::stream_blocks::ParsedStreamBlocks,
+    content: String,
+    model: &str,
+) -> Option<crate::core::llm::LlmResponse> {
+    if !blocks.has_operations() {
+        return None;
+    }
+    Some(crate::core::llm::LlmResponse {
+        content,
+        tool_calls: vec![synthetic_app_deploy_call_from_stream_blocks(&blocks)],
+        reasoning: None,
+        usage: None,
+        provider: "agentark".to_string(),
+        model: model.to_string(),
+    })
+}
+
+fn recovered_app_delivery_response_from_stream_text(
+    text: &str,
+    allowed_action_names: &HashSet<String>,
+    app_delivery_expected: bool,
+) -> Option<crate::core::llm::LlmResponse> {
+    if !app_delivery_expected {
+        return None;
+    }
+    if !allowed_action_names.contains("app_deploy") {
+        return None;
+    }
+    let blocks = crate::core::llm::stream_blocks::parse_stream_blocks_from_text(text);
+    app_delivery_response_from_stream_blocks(blocks, text.to_string(), "stream_block_recovery")
+}
+
+fn recovered_app_delivery_response_from_stream_capture(
+    capture: &AgentLoopStreamCapture,
+    allowed_action_names: &HashSet<String>,
+    app_delivery_expected: bool,
+) -> Option<crate::core::llm::LlmResponse> {
+    if let Some(response) = recovered_app_delivery_response_from_stream_text(
+        &capture.token_text,
+        allowed_action_names,
+        app_delivery_expected,
+    ) {
+        return Some(response);
+    }
+    if !app_delivery_expected {
+        return None;
+    }
+    if !allowed_action_names.contains("app_deploy") {
+        return None;
+    }
+    if capture.has_incomplete_draft_files() {
+        return None;
+    }
+    let blocks = capture.completed_stream_blocks();
+    app_delivery_response_from_stream_blocks(
+        blocks,
+        "Recovered app bundle from streamed draft-file state after model transport failure."
+            .to_string(),
+        "stream_draft_state_recovery",
+    )
+}
+
+fn recover_app_delivery_response_from_continuation_state(
+    original_capture: &AgentLoopStreamCapture,
+    continuation_capture: &AgentLoopStreamCapture,
+    continuation_content: &str,
+    allowed_action_names: &HashSet<String>,
+    app_delivery_expected: bool,
+) -> Option<crate::core::llm::LlmResponse> {
+    if !app_delivery_expected || !allowed_action_names.contains("app_deploy") {
+        return None;
+    }
+    if continuation_capture.has_incomplete_draft_files() {
+        return None;
+    }
+
+    let mut blocks = crate::core::llm::stream_blocks::parse_stream_blocks_from_text(
+        &original_capture.token_text,
+    );
+    merge_app_delivery_stream_blocks(&mut blocks, original_capture.completed_stream_blocks());
+    merge_app_delivery_stream_blocks(
+        &mut blocks,
+        crate::core::llm::stream_blocks::parse_stream_blocks_from_text(continuation_content),
+    );
+    merge_app_delivery_stream_blocks(&mut blocks, continuation_capture.completed_stream_blocks());
+
+    let incomplete_paths = original_capture.incomplete_draft_paths();
+    if incomplete_paths
+        .iter()
+        .any(|path| !blocks.files.contains_key(path))
+    {
+        return None;
+    }
+
+    app_delivery_response_from_stream_blocks(
+        blocks,
+        "Recovered app bundle by continuing an interrupted app-delivery stream.".to_string(),
+        "stream_continuation_recovery",
+    )
+}
+
+fn safe_tail_chars(text: &str, limit: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= limit {
+        return text.to_string();
+    }
+    let omitted = char_count.saturating_sub(limit);
+    let tail = text.chars().skip(omitted).collect::<String>();
+    format!("[{} chars omitted before this tail]\n{}", omitted, tail)
+}
+
+fn app_delivery_continuation_capture_state(capture: &AgentLoopStreamCapture) -> serde_json::Value {
+    let completed_files = capture
+        .draft_files
+        .iter()
+        .filter(|(_, file)| file.done)
+        .map(|(path, file)| {
+            serde_json::json!({
+                "path": path,
+                "chars": file.content.chars().count(),
+                "lines": file.content.lines().count(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let incomplete_files = capture
+        .draft_files
+        .iter()
+        .filter(|(_, file)| !file.done)
+        .map(|(path, file)| {
+            serde_json::json!({
+                "path": path,
+                "chars": file.content.chars().count(),
+                "lines": file.content.lines().count(),
+                "content_tail": safe_tail_chars(&file.content, 6_000),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "completed_files_already_saved_by_agentark": completed_files,
+        "incomplete_files_to_finish": incomplete_files,
+        "delete_paths": capture.delete_paths.clone(),
+        "delete_orphans": capture.delete_orphans,
+        "raw_stream_tail": safe_tail_chars(&capture.token_text, 6_000),
+        "reasoning_tail": safe_tail_chars(&capture.reasoning_text, 6_000),
+    })
+}
+
+fn app_delivery_continuation_system_prompt() -> String {
+    concat!(
+        "You are AgentArk's bounded app-delivery continuation worker.\n",
+        "An earlier app-generation model stream was interrupted before AgentArk received a valid deploy action.\n",
+        "Continue only the app delivery. Do not answer the user conversationally, do not request action-scope expansion, and do not call unrelated tools.\n",
+        "Emit complete app file blocks using exactly <file path=\"relative/path.ext\">complete file contents</file> for files that are incomplete, missing, or need replacement.\n",
+        "If a previously completed file does not need changes, omit it; AgentArk will merge saved completed files with your new complete blocks.\n",
+        "For any file listed as incomplete, emit one complete final <file> block for that same path. Do not emit partial deltas.\n",
+        "Use app-relative paths only. Do not wrap file blocks in markdown fences or prose.\n"
+    )
+    .to_string()
+}
+
+fn build_app_delivery_continuation_prompt(
+    original_message: &str,
+    capture: &AgentLoopStreamCapture,
+    provider_reason: &str,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "protocol": {
+            "version": AGENT_TURN_LOOP_VERSION,
+            "tool_calling": "disabled_for_app_delivery_continuation",
+            "file_block_shape": "<file path=\"relative/path.ext\">complete file contents</file>",
+            "merge_policy": "AgentArk will merge completed saved files with complete file blocks emitted now. Re-emitting the same path replaces the saved content for that path."
+        },
+        "original_user_message": original_message,
+        "interruption": {
+            "provider_reason": provider_reason,
+            "recovery_budget": "one bounded continuation attempt"
+        },
+        "saved_partial_state": app_delivery_continuation_capture_state(capture),
+        "instruction": "Continue from the saved app-delivery state. Emit only complete <file> blocks needed to finish a deployable app bundle. If no file is incomplete, emit complete replacements only for files that are necessary to make the app deployable."
+    }))
+    .unwrap_or_else(|_| original_message.to_string())
 }
 
 /// Sentinel emitted by the model to request action-scope expansion. Designed
@@ -3423,17 +4998,282 @@ fn structured_search_completion_response(value: &serde_json::Value) -> Option<St
     Some(out.trim_end().to_string())
 }
 
+fn structured_app_completion_response(value: &serde_json::Value) -> Option<String> {
+    let app_data = value.get("data").filter(|item| item.is_object());
+    let app_field = |key: &str| {
+        value
+            .get(key)
+            .or_else(|| app_data.and_then(|data| data.get(key)))
+    };
+    let app_id = value
+        .get("app_id")
+        .or_else(|| app_data.and_then(|data| data.get("app_id")))
+        .and_then(|item| item.as_str())?
+        .trim();
+    if app_id.is_empty() {
+        return None;
+    }
+    let url = value
+        .get("access_url")
+        .or_else(|| value.get("url"))
+        .or_else(|| app_data.and_then(|data| data.get("access_url")))
+        .or_else(|| app_data.and_then(|data| data.get("url")))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("/apps/{}/", app_id));
+    let title = value
+        .get("title")
+        .or_else(|| app_data.and_then(|data| data.get("title")))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or("App");
+    let app_type = app_field("type")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty());
+    let status = value
+        .get("status")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or("completed");
+    let tool = value
+        .get("tool")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty());
+    let has_required_or_missing_inputs = value
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.keys())
+        .chain(
+            value
+                .get("data")
+                .and_then(|item| item.as_object())
+                .into_iter()
+                .flat_map(|object| object.keys()),
+        )
+        .any(|key| key.starts_with("required_") || key.starts_with("missing_"));
+    let mut lines = Vec::new();
+    let headline = match tool {
+        Some("app_deploy")
+            if value.get("success").and_then(|item| item.as_bool()) == Some(false) =>
+        {
+            "Deployment needs attention"
+        }
+        Some("app_deploy") => {
+            if value
+                .get("updated_existing")
+                .or_else(|| app_data.and_then(|data| data.get("updated_existing")))
+                .and_then(|item| item.as_bool())
+                .unwrap_or(false)
+            {
+                "Updated app"
+            } else {
+                "Deployed app"
+            }
+        }
+        Some("app_restart") => "Restarted app",
+        _ => match status {
+            "deployed" => "Deployed app",
+            "restarted" => "Restarted app",
+            "needs_secrets" | "needs_inputs" => "App needs configuration",
+            "validation_incomplete" => "Deployment needs attention",
+            _ => "Completed app action",
+        },
+    };
+    lines.push(format!("{}: **{}**", headline, title));
+    if let Some(app_type) = app_type {
+        lines.push(format!("- Type: {} app.", app_type));
+    }
+    lines.push(format!("- Open: [{}]({}).", url, url));
+    lines.push(format!("- App ID: `{}`.", app_id));
+
+    let verified = app_field("verified").and_then(|item| item.as_bool());
+    let validation_attempts = app_field("validation_attempts").and_then(|item| item.as_u64());
+    let validation_detail = app_field("validation_detail")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty());
+    match verified {
+        Some(true) => {
+            let probes = validation_attempts
+                .map(|count| format!(" ({} probe{})", count, if count == 1 { "" } else { "s" }))
+                .unwrap_or_default();
+            lines.push(format!(
+                "- Verification: local structural validation passed{}.",
+                probes
+            ));
+        }
+        Some(false) => {
+            let probes = validation_attempts
+                .map(|count| format!(" ({} probe{})", count, if count == 1 { "" } else { "s" }))
+                .unwrap_or_default();
+            let mut line = format!(
+                "- Verification: local structural validation did not pass{}.",
+                probes
+            );
+            if let Some(detail) = validation_detail {
+                line.push_str(&format!(
+                    " {}",
+                    safe_truncate(&collapse_for_agent_loop(detail), 260)
+                ));
+            }
+            lines.push(line);
+        }
+        None => {
+            lines.push(
+                "- Verification: deployment result was recorded; no structural probe result was returned."
+                    .to_string(),
+            );
+        }
+    }
+
+    if let Some(quality_status) = app_field("quality_report_status")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let quality_line = match quality_status {
+            "pending" => "background browser quality report queued.",
+            "passed" => "background browser quality report passed.",
+            "concerns" => "background browser quality report found concerns.",
+            "error" => "background browser quality report failed.",
+            "skipped" => "background browser quality report skipped.",
+            _ => "background browser quality report status recorded.",
+        };
+        lines.push(format!("- Quality check: {}", quality_line));
+    }
+
+    let access_guard_enabled = app_field("access_guard_enabled")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    let expose_public = app_field("expose_public")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    let public_access_guard_enabled = app_field("public_access_guard_enabled")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(expose_public || access_guard_enabled);
+    if expose_public {
+        lines.push(format!(
+            "- Access: public exposure is enabled; public App Guard is {}.",
+            if public_access_guard_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+    } else {
+        lines.push(format!(
+            "- Access: local App Guard is {}.",
+            if access_guard_enabled { "on" } else { "off" }
+        ));
+    }
+
+    if has_required_or_missing_inputs
+        || value.get("success").and_then(|item| item.as_bool()) == Some(false)
+    {
+        if let Some(detail) = value
+            .get("detail")
+            .or_else(|| value.get("message"))
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            lines.push(safe_truncate(&collapse_for_agent_loop(detail), 700));
+        }
+    }
+    if let Some(port) = value.get("port").and_then(|item| item.as_u64()) {
+        lines.push(format!("- Port: `{}`.", port));
+    } else if let Some(port) = app_data
+        .and_then(|data| data.get("port"))
+        .and_then(|item| item.as_u64())
+    {
+        lines.push(format!("- Port: `{}`.", port));
+    }
+    let controls_hint = value
+        .get("apps_page_hint")
+        .or_else(|| app_data.and_then(|data| data.get("apps_page_hint")))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .unwrap_or(crate::actions::app::APP_DEPLOY_CONTROL_HINT);
+    lines.push(format!("- Controls: {}", controls_hint));
+    Some(lines.join("\n"))
+}
+
+fn structured_app_inventory_response(value: &serde_json::Value) -> Option<String> {
+    let data = value.get("data").filter(|item| item.is_object());
+    let apps = value
+        .get("apps")
+        .or_else(|| data.and_then(|item| item.get("apps")))
+        .and_then(|item| item.as_array())?;
+    let mut lines = Vec::new();
+    if apps.is_empty() {
+        lines.push("No deployed apps were returned.".to_string());
+    } else {
+        lines.push("Deployed apps:".to_string());
+        for app in apps.iter().take(8) {
+            let title = app
+                .get("title")
+                .and_then(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .unwrap_or("App");
+            let app_id = app
+                .get("app_id")
+                .or_else(|| app.get("id"))
+                .and_then(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty());
+            let status = app
+                .get("status")
+                .and_then(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty());
+            let url = app
+                .get("url")
+                .or_else(|| app.get("access_url"))
+                .or_else(|| app.get("local_url"))
+                .and_then(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty());
+            let mut line = format!("- {}", title);
+            if let Some(app_id) = app_id {
+                line.push_str(&format!(" (`{}`)", app_id));
+            }
+            if let Some(status) = status {
+                line.push_str(&format!(" - {}", humanize_tool_name(status)));
+            }
+            if let Some(url) = url {
+                line.push_str(&format!(" - {}", url));
+            }
+            lines.push(line);
+        }
+        if apps.len() > 8 {
+            lines.push(format!("- {} more app(s) omitted.", apps.len() - 8));
+        }
+    }
+    lines.push(crate::actions::app::APP_DEPLOY_CONTROL_HINT.to_string());
+    Some(lines.join("\n"))
+}
+
 fn structured_tool_completion_response(value: &serde_json::Value) -> String {
+    if let Some(response) = structured_app_completion_response(value) {
+        return response;
+    }
+
+    if let Some(response) = structured_app_inventory_response(value) {
+        return response;
+    }
+
     if let Some(response) = structured_search_completion_response(value) {
         return response;
     }
 
-    let status = value
-        .get("status")
-        .and_then(|item| item.as_str())
-        .unwrap_or("completed")
-        .trim();
-    let status_lower = status.to_ascii_lowercase();
     let tool = value
         .get("tool")
         .and_then(|item| item.as_str())
@@ -3451,7 +5291,7 @@ fn structured_tool_completion_response(value: &serde_json::Value) -> String {
         }
     }
 
-    if status_lower.contains("fail") || status_lower.contains("error") {
+    if value.get("success").and_then(|item| item.as_bool()) == Some(false) {
         return if let Some(detail_value) = detail {
             format!("The action failed: {}", safe_truncate(detail_value, 500))
         } else {
@@ -3482,6 +5322,7 @@ fn tool_result_grounded_response(result: &str) -> String {
 
     if let Some(value) = first_tool_completion_value(trimmed)
         .or_else(|| serde_json::from_str::<serde_json::Value>(trimmed).ok())
+        .or_else(|| extract_json_object_from_text(trimmed))
         .filter(|value| value.is_object())
     {
         if value.get("tool").is_none()
@@ -3692,6 +5533,42 @@ fn action_is_capability_management_candidate(action: &crate::actions::ActionDef)
     })
 }
 
+fn action_is_setup_delivery_candidate(action: &crate::actions::ActionDef) -> bool {
+    if action_is_capability_management_candidate(action) {
+        return true;
+    }
+    let metadata = action.planner_metadata();
+    matches!(
+        metadata.integration_class,
+        crate::actions::PlannerIntegrationClass::Messaging
+    ) && matches!(
+        metadata.side_effect_level,
+        crate::actions::PlannerSideEffectLevel::Write
+    )
+}
+
+fn action_is_setup_resolution_candidate(action: &crate::actions::ActionDef) -> bool {
+    let metadata = action.planner_metadata();
+    if !matches!(
+        metadata.integration_class,
+        crate::actions::PlannerIntegrationClass::Search
+            | crate::actions::PlannerIntegrationClass::Browser
+            | crate::actions::PlannerIntegrationClass::Network
+    ) || !matches!(metadata.role, crate::actions::PlannerActionRole::DataSource)
+        || !matches!(
+            metadata.side_effect_level,
+            crate::actions::PlannerSideEffectLevel::None
+        )
+    {
+        return false;
+    }
+    action
+        .input_schema
+        .get("properties")
+        .and_then(|value| value.as_object())
+        .is_some_and(|properties| properties.contains_key("query"))
+}
+
 fn action_is_app_delivery_candidate(action: &crate::actions::ActionDef) -> bool {
     let metadata = action.planner_metadata();
     if !matches!(
@@ -3711,6 +5588,17 @@ fn action_is_app_delivery_candidate(action: &crate::actions::ActionDef) -> bool 
         return false;
     };
     properties.contains_key("files") || properties.contains_key("repo_url")
+}
+
+fn action_is_app_write_candidate(action: &crate::actions::ActionDef) -> bool {
+    let metadata = action.planner_metadata();
+    matches!(
+        metadata.integration_class,
+        crate::actions::PlannerIntegrationClass::App
+    ) && matches!(
+        metadata.side_effect_level,
+        crate::actions::PlannerSideEffectLevel::Write
+    )
 }
 
 fn action_is_direct_write_candidate(action: &crate::actions::ActionDef) -> bool {
@@ -3892,6 +5780,67 @@ where
         })
         .filter(|score| *score > 0.0)
         .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn best_durable_orchestration_score_for_goal<'a, I>(
+    goal: &AgentLoopGoalState,
+    actions: I,
+    semantic_scores: &HashMap<String, f32>,
+) -> Option<f32>
+where
+    I: IntoIterator<Item = &'a crate::actions::ActionDef>,
+{
+    actions
+        .into_iter()
+        .filter(|action| {
+            let metadata = action.planner_metadata();
+            matches!(
+                metadata.role,
+                crate::actions::PlannerActionRole::Orchestration
+            ) && matches!(
+                metadata.integration_class,
+                crate::actions::PlannerIntegrationClass::Internal
+            ) && matches!(
+                metadata.delivery_mode,
+                crate::actions::PlannerDeliveryMode::Async
+                    | crate::actions::PlannerDeliveryMode::Conditional
+            )
+        })
+        .map(|action| {
+            goal_action_match_score(goal, action).max(
+                semantic_scores
+                    .get(&action.name)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        })
+        .filter(|score| *score > 0.0)
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn goal_has_scored_app_delivery_intent(
+    goal: &AgentLoopGoalState,
+    actions: &[crate::actions::ActionDef],
+    semantic_scores: &HashMap<String, f32>,
+) -> bool {
+    if matches!(normalized_goal_durability(goal).as_str(), "integration") {
+        return false;
+    }
+    let app_score =
+        best_app_context_score_for_goal(goal, actions.iter(), semantic_scores).unwrap_or_default();
+    if app_score < AGENT_TURN_LOOP_APP_CONTEXT_SCORE_THRESHOLD {
+        return false;
+    }
+    if matches!(
+        normalized_goal_durability(goal).as_str(),
+        "scheduled_time" | "recurring_monitor" | "watcher"
+    ) {
+        let orchestration_score =
+            best_durable_orchestration_score_for_goal(goal, actions.iter(), semantic_scores)
+                .unwrap_or_default();
+        return orchestration_score <= 0.0 || app_score >= orchestration_score * 0.65;
+    }
+    goal_requires_durable_commit(goal)
 }
 
 fn best_competing_non_app_direct_score_for_goal<'a, I>(
@@ -4084,7 +6033,9 @@ fn app_delivery_required_for_goal_with_scores(
     actions: &[crate::actions::ActionDef],
     semantic_scores: &HashMap<String, f32>,
 ) -> bool {
-    if !goal_has_app_delivery_intent(goal, actions) {
+    let scored_app_delivery_intent =
+        goal_has_scored_app_delivery_intent(goal, actions, semantic_scores);
+    if !goal_has_app_delivery_intent(goal, actions) && !scored_app_delivery_intent {
         return false;
     }
     let structured_deployment_goal = normalized_goal_durability(goal) == "deployment";
@@ -4149,11 +6100,15 @@ fn app_delivery_required_for_goal_with_scores(
         }
     }
     let best_direct =
-        best_competing_non_app_direct_score_for_goal(goal, actions.iter(), semantic_scores)
-            .map(|(integration_class, _, direct_score)| (integration_class, direct_score));
+        best_competing_non_app_direct_score_for_goal(goal, actions.iter(), semantic_scores);
     match best_direct {
-        Some((crate::actions::PlannerIntegrationClass::App, _)) | None => true,
-        Some((_, direct_score)) => score >= direct_score * 0.92,
+        Some((crate::actions::PlannerIntegrationClass::App, _, _)) | None => true,
+        Some((
+            crate::actions::PlannerIntegrationClass::Internal,
+            crate::actions::PlannerActionRole::Orchestration,
+            _,
+        )) if scored_app_delivery_intent => true,
+        Some((_, _, direct_score)) => score >= direct_score * 0.92,
     }
 }
 
@@ -5405,6 +7360,43 @@ fn tool_output_deploy_attempted(value: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+fn tool_output_has_app_delivery_result(value: &serde_json::Value) -> bool {
+    fn non_empty_string(value: &serde_json::Value, key: &str) -> bool {
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .is_some_and(|item| !item.is_empty())
+    }
+
+    fn walk(value: &serde_json::Value, depth: u8) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        if non_empty_string(value, "app_id") {
+            return true;
+        }
+        if non_empty_string(value, "bundle_id")
+            && value
+                .get("services")
+                .and_then(|item| item.as_array())
+                .is_some_and(|items| items.iter().any(|item| walk(item, depth + 1)))
+        {
+            return true;
+        }
+        value
+            .get("result")
+            .is_some_and(|item| walk(item, depth + 1))
+            || value.get("data").is_some_and(|item| walk(item, depth + 1))
+            || value
+                .get("services")
+                .and_then(|item| item.as_array())
+                .is_some_and(|items| items.iter().any(|item| walk(item, depth + 1)))
+    }
+
+    walk(value, 0)
+}
+
 fn retryable_app_deploy_failure(
     calls: &[crate::core::llm::ToolCall],
     output_value: &serde_json::Value,
@@ -5532,7 +7524,27 @@ impl Agent {
         message: &str,
         authorized_actions: &[crate::actions::ActionDef],
     ) -> HashMap<String, f32> {
+        self.semantic_action_scores_for_agent_loop_with_timing(message, authorized_actions, None)
+            .await
+    }
+
+    pub(super) async fn semantic_action_scores_for_agent_loop_with_timing(
+        &self,
+        message: &str,
+        authorized_actions: &[crate::actions::ActionDef],
+        timing: Option<AgentLoopTimingContext<'_>>,
+    ) -> HashMap<String, f32> {
+        let total_started = std::time::Instant::now();
         let Some(embedder) = self.embedding_client.as_deref() else {
+            if let Some(timing) = timing {
+                log_agent_loop_timing_instant(
+                    timing,
+                    "agent_loop_semantic_action_scores_no_embedder",
+                    total_started,
+                    true,
+                    AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                );
+            }
             return HashMap::new();
         };
         let authorized_names = authorized_actions
@@ -5540,6 +7552,15 @@ impl Agent {
             .map(|action| action.name.clone())
             .collect::<HashSet<_>>();
         if authorized_names.is_empty() {
+            if let Some(timing) = timing {
+                log_agent_loop_timing_instant(
+                    timing,
+                    "agent_loop_semantic_action_scores_no_authorized_actions",
+                    total_started,
+                    true,
+                    AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                );
+            }
             return HashMap::new();
         }
 
@@ -5559,22 +7580,81 @@ impl Agent {
             }
         }
         if queries.is_empty() {
+            if let Some(timing) = timing {
+                log_agent_loop_timing_instant(
+                    timing,
+                    "agent_loop_semantic_action_scores_no_queries",
+                    total_started,
+                    true,
+                    AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                );
+            }
             return HashMap::new();
         }
 
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            turn_timing_id = timing.map(|ctx| ctx.turn_timing_id).unwrap_or(""),
+            conversation_id = timing.map(|ctx| ctx.conversation_id).unwrap_or(""),
+            channel = timing.map(|ctx| ctx.channel).unwrap_or(""),
+            stage = "agent_loop_semantic_action_queries",
+            authorized_action_count = authorized_names.len(),
+            query_count = queries.len(),
+            "agent loop semantic action scoring queries"
+        );
+        let embed_started = std::time::Instant::now();
         let embeddings = match embedder.embed_texts(&queries).await {
             Ok(embeddings) => embeddings,
             Err(error) => {
+                if let Some(timing) = timing {
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_semantic_embedding",
+                        embed_started,
+                        false,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_semantic_action_scores_total",
+                        total_started,
+                        false,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                }
                 tracing::debug!("Agent-loop action embedding failed: {}", error);
                 return HashMap::new();
             }
         };
+        let embedding_duration_ms = agent_loop_elapsed_ms(embed_started);
+        if let Some(timing) = timing {
+            log_agent_loop_timing_stage(
+                timing,
+                "agent_loop_semantic_embedding",
+                embedding_duration_ms,
+                true,
+                AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+            );
+        }
         if embeddings.is_empty() {
+            if let Some(timing) = timing {
+                log_agent_loop_timing_instant(
+                    timing,
+                    "agent_loop_semantic_action_scores_total",
+                    total_started,
+                    true,
+                    AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                );
+            }
             return HashMap::new();
         }
 
         let mut scores: HashMap<String, f32> = HashMap::new();
+        let lookup_total_started = std::time::Instant::now();
+        let mut lookup_count = 0usize;
+        let mut lookup_max_ms = 0u64;
         for embedding in embeddings.iter() {
+            let lookup_started = std::time::Instant::now();
             let nearest = match self
                 .storage
                 .nearest_action_catalog_index_entries(
@@ -5583,8 +7663,16 @@ impl Agent {
                 )
                 .await
             {
-                Ok(rows) => rows,
+                Ok(rows) => {
+                    let lookup_ms = agent_loop_elapsed_ms(lookup_started);
+                    lookup_count = lookup_count.saturating_add(1);
+                    lookup_max_ms = lookup_max_ms.max(lookup_ms);
+                    rows
+                }
                 Err(error) => {
+                    let lookup_ms = agent_loop_elapsed_ms(lookup_started);
+                    lookup_count = lookup_count.saturating_add(1);
+                    lookup_max_ms = lookup_max_ms.max(lookup_ms);
                     tracing::debug!("Agent-loop action catalog lookup failed: {}", error);
                     continue;
                 }
@@ -5599,6 +7687,41 @@ impl Agent {
                     *entry = similarity;
                 }
             }
+        }
+        let lookup_total_ms = agent_loop_elapsed_ms(lookup_total_started);
+        let total_ms = agent_loop_elapsed_ms(total_started);
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            turn_timing_id = timing.map(|ctx| ctx.turn_timing_id).unwrap_or(""),
+            conversation_id = timing.map(|ctx| ctx.conversation_id).unwrap_or(""),
+            channel = timing.map(|ctx| ctx.channel).unwrap_or(""),
+            stage = "agent_loop_semantic_action_scores_breakdown",
+            authorized_action_count = authorized_names.len(),
+            query_count = queries.len(),
+            embedding_count = embeddings.len(),
+            embedding_duration_ms,
+            lookup_count,
+            lookup_total_ms,
+            lookup_max_ms,
+            score_count = scores.len(),
+            total_ms,
+            "agent loop semantic action scoring breakdown"
+        );
+        if let Some(timing) = timing {
+            log_agent_loop_timing_stage(
+                timing,
+                "agent_loop_semantic_catalog_lookups",
+                lookup_total_ms,
+                true,
+                AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+            );
+            log_agent_loop_timing_stage(
+                timing,
+                "agent_loop_semantic_action_scores_total",
+                total_ms,
+                true,
+                AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+            );
         }
 
         scores
@@ -6037,13 +8160,50 @@ Next step: {next_step}",
         request_hints: &RequestExecutionHints,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> anyhow::Result<ProcessedMessage> {
+        let agent_loop_started = std::time::Instant::now();
         let mut request_hints = request_hints.clone();
         let conversation_key = conversation_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| channel.to_string());
+        let turn_timing_id = request_hints
+            .turn_timing_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let timing = AgentLoopTimingContext {
+            turn_timing_id: &turn_timing_id,
+            conversation_id: &conversation_key,
+            channel,
+        };
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            turn_timing_id = %turn_timing_id,
+            conversation_id = %conversation_key,
+            channel = %channel,
+            message_chars = message.chars().count(),
+            "agent loop timing start"
+        );
 
         let progress_recorder: AgentLoopProgressRecorder = Arc::new(Mutex::new(Vec::new()));
+        let stage_started = std::time::Instant::now();
+        let prompt_fragment_bundle = self
+            .active_prompt_fragment_bundle_for_message(message)
+            .await;
+        log_agent_loop_timing_instant(
+            timing,
+            "agent_loop_prompt_fragment_bundle",
+            stage_started,
+            true,
+            AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+        );
+        let stage_started = std::time::Instant::now();
         let mut turn_plan = build_agent_loop_turn_plan(message, request_hints.routing.as_ref());
+        log_agent_loop_timing_instant(
+            timing,
+            "agent_loop_turn_plan_build",
+            stage_started,
+            true,
+            AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+        );
         let direct_answer_only = should_use_direct_answer_agent_loop_scope(&request_hints);
 
         emit_agent_loop_progress(
@@ -6079,53 +8239,170 @@ Next step: {next_step}",
             mut background_sessions,
             mut watchers,
         ) = tokio::join!(
-            self.build_packed_conversation_context(&conversation_key, message),
             async {
+                let started = std::time::Instant::now();
+                let value = self
+                    .build_packed_conversation_context(&conversation_key, message)
+                    .await;
+                log_agent_loop_timing_instant(
+                    timing,
+                    "agent_loop_packed_context",
+                    started,
+                    true,
+                    AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                );
+                value
+            },
+            async {
+                let started = std::time::Instant::now();
                 if direct_answer_only {
-                    Vec::new()
+                    let value = Vec::new();
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_recent_artifacts",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 } else {
-                    self.load_recent_artifact_contexts(&conversation_key).await
+                    let value = self.load_recent_artifact_contexts(&conversation_key).await;
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_recent_artifacts",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 }
             },
             async {
+                let started = std::time::Instant::now();
                 if direct_answer_only {
-                    None
+                    let value = None;
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_workspace_snapshot",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 } else {
-                    self.load_conversation_workspace_snapshot(&conversation_key)
-                        .await
+                    let value = self
+                        .load_conversation_workspace_snapshot(&conversation_key)
+                        .await;
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_workspace_snapshot",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 }
             },
             async {
+                let started = std::time::Instant::now();
                 if include_saved_user_facts_for_turn {
-                    self.build_saved_user_facts_context(
-                        project_id,
-                        Some(&conversation_key),
-                        message,
-                    )
-                    .await
+                    let value = self
+                        .build_saved_user_facts_context(
+                            project_id,
+                            Some(&conversation_key),
+                            message,
+                        )
+                        .await;
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_saved_user_facts_context",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 } else {
-                    None
+                    let value = None;
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_saved_user_facts_context",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 }
             },
             async {
+                let started = std::time::Instant::now();
                 if direct_answer_only {
-                    Vec::new()
+                    let value = Vec::new();
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_pending_actions",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 } else {
-                    self.pending_conversation_actions(&conversation_key).await
+                    let value = self.pending_conversation_actions(&conversation_key).await;
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_pending_actions",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 }
             },
             async {
+                let started = std::time::Instant::now();
                 if direct_answer_only {
-                    Vec::new()
+                    let value = Vec::new();
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_background_sessions",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 } else {
-                    self.background_sessions.list().await
+                    let value = self.background_sessions.list().await;
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_background_sessions",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 }
             },
             async {
+                let started = std::time::Instant::now();
                 if direct_answer_only {
-                    Vec::new()
+                    let value = Vec::new();
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_watchers",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 } else {
-                    self.watcher_manager.list().await
+                    let value = self.watcher_manager.list().await;
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_watchers",
+                        started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    value
                 }
             }
         );
@@ -6133,6 +8410,7 @@ Next step: {next_step}",
         background_sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         watchers.sort_by(|left, right| right.created_at.cmp(&left.created_at));
 
+        let stage_started = std::time::Instant::now();
         let all_actions = match self.load_action_catalog_actions().await {
             Ok(actions) => actions,
             Err(error) => {
@@ -6146,6 +8424,13 @@ Next step: {next_step}",
                     .unwrap_or_default()
             }
         };
+        log_agent_loop_timing_instant(
+            timing,
+            "agent_loop_action_catalog_load",
+            stage_started,
+            true,
+            AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+        );
 
         let authorization = crate::actions::ActionAuthorizationContext {
             principal: request_hints.caller_principal.clone(),
@@ -6156,9 +8441,17 @@ Next step: {next_step}",
             agent_access_scope: None,
             capability_context_id: Some(conversation_key.clone()),
         };
+        let stage_started = std::time::Instant::now();
         let authorized_actions = self
             .authorize_agent_loop_actions_for_turn(&all_actions, &authorization)
             .await;
+        log_agent_loop_timing_instant(
+            timing,
+            "agent_loop_action_authorization",
+            stage_started,
+            true,
+            AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+        );
         let authorized_action_count = authorized_actions.len();
         let authorized_action_map = authorized_actions
             .iter()
@@ -6170,12 +8463,14 @@ Next step: {next_step}",
         let mut semantic_action_scores = if direct_answer_only {
             HashMap::new()
         } else {
-            self.semantic_action_scores_for_agent_loop(
+            self.semantic_action_scores_for_agent_loop_with_timing(
                 &pre_advisory_action_scope_query,
                 &authorized_actions,
+                Some(timing),
             )
             .await
         };
+        let stage_started = std::time::Instant::now();
         assign_direct_actions_to_pending_goals(
             turn_plan.as_mut(),
             &authorized_actions,
@@ -6195,7 +8490,7 @@ Next step: {next_step}",
                 &semantic_action_scores,
             )
             .is_empty();
-        let app_delivery_fast_path = !direct_answer_only
+        let routed_app_delivery_fast_path = !direct_answer_only
             && request_hints.routing_trusted
             && !suppress_app_delivery_for_turn
             && should_use_app_delivery_fast_path(
@@ -6204,6 +8499,24 @@ Next step: {next_step}",
                 &authorized_actions,
                 &semantic_action_scores,
             );
+        let semantic_app_delivery_fast_path = (!direct_answer_only
+            && !routed_app_delivery_fast_path
+            && !suppress_app_delivery_for_turn
+            && semantic_app_delivery_fast_path_allowed_for_plan(
+                turn_plan.as_ref(),
+                &authorized_actions,
+                &semantic_action_scores,
+            ))
+        .then(|| {
+            select_semantic_app_delivery_fast_path(
+                request_hints.routing.as_ref(),
+                &authorized_actions,
+                &semantic_action_scores,
+            )
+        })
+        .flatten();
+        let app_delivery_fast_path =
+            routed_app_delivery_fast_path || semantic_app_delivery_fast_path.is_some();
         let read_only_fast_path = if direct_answer_only || app_delivery_fast_path {
             None
         } else {
@@ -6214,20 +8527,42 @@ Next step: {next_step}",
                 &semantic_action_scores,
             )
         };
-        let read_only_bounded_mode = read_only_fast_path.is_some();
+        let visual_attachment_analysis = if direct_answer_only || app_delivery_fast_path {
+            None
+        } else {
+            select_visual_attachment_analysis_action(&authorized_actions, &request_hints)
+        };
+        let visual_attachment_final_answer_mode =
+            visual_attachment_analysis.as_ref().is_some_and(|_| {
+                visual_attachment_analysis_allows_final_answer(
+                    request_hints.routing.as_ref(),
+                    turn_plan.as_ref(),
+                )
+            });
+        let read_only_bounded_mode =
+            read_only_fast_path.is_some() || visual_attachment_final_answer_mode;
         let skip_advisory_for_routed_read_only =
             should_skip_advisory_intent_plan_for_routed_read_only(
                 request_hints.routing.as_ref(),
                 turn_plan.as_ref(),
             );
+        log_agent_loop_timing_instant(
+            timing,
+            "agent_loop_pre_advisory_action_decisions",
+            stage_started,
+            true,
+            AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+        );
         let advisory_intent_plan_result = if direct_answer_only
             || app_delivery_fast_path
             || read_only_fast_path.is_some()
+            || visual_attachment_analysis.is_some()
             || skip_advisory_for_routed_read_only
             || routing_turn_has_required_direct_actions
         {
             None
         } else {
+            let advisory_started = std::time::Instant::now();
             let mut advisory_actions = authorized_actions.clone();
             if !semantic_action_scores.is_empty() {
                 let expects_current_answer = request_hints
@@ -6260,16 +8595,30 @@ Next step: {next_step}",
                 "intent_plan",
                 "Preparing advisory intent plan for action selection...",
             );
-            self.build_advisory_intent_plan(
-                message,
-                &packed_context,
-                &pending_actions,
-                &background_sessions,
-                &watchers,
-                &advisory_actions,
-                stream_tx.clone(),
-            )
-            .await
+            let result = self
+                .build_advisory_intent_plan(
+                    message,
+                    &packed_context,
+                    &pending_actions,
+                    &background_sessions,
+                    &watchers,
+                    &advisory_actions,
+                    stream_tx.clone(),
+                    Some((
+                        timing.turn_timing_id,
+                        timing.conversation_id,
+                        timing.channel,
+                    )),
+                )
+                .await;
+            log_agent_loop_timing_instant(
+                timing,
+                "agent_loop_advisory_intent_plan",
+                advisory_started,
+                result.is_some(),
+                AGENT_LOOP_TIMING_ADVISORY_WARN_MS,
+            );
+            result
         };
 
         if !direct_answer_only {
@@ -6321,11 +8670,19 @@ Next step: {next_step}",
             );
         }
         if app_delivery_fast_path {
+            let detail = if let Some(fast_path) = semantic_app_delivery_fast_path.as_ref() {
+                format!(
+                    "Using app-delivery fast path from semantic action dominance: app {:.3}, next {:.3}.",
+                    fast_path.score, fast_path.runner_up_score
+                )
+            } else {
+                "Using app-delivery fast path from routing and semantic action score.".to_string()
+            };
             emit_agent_loop_progress(
                 stream_tx.as_ref(),
                 Some(&progress_recorder),
                 "action_scope",
-                "Using app-delivery fast path from routing and semantic action score.",
+                detail,
             );
         }
         if let Some(fast_path) = read_only_fast_path.as_ref() {
@@ -6346,48 +8703,141 @@ Next step: {next_step}",
                 ),
             );
         }
+        if let Some(analysis) = visual_attachment_analysis.as_ref() {
+            emit_agent_loop_progress(
+                stream_tx.as_ref(),
+                Some(&progress_recorder),
+                "action_scope",
+                format!(
+                    "Analyzing visual attachment first with {}{}.",
+                    analysis.action.name,
+                    if visual_attachment_final_answer_mode {
+                        " before answering from the result"
+                    } else {
+                        " before continuing the routed turn"
+                    }
+                ),
+            );
+        }
 
         let action_scope_query = agent_loop_action_scope_query(message, &request_hints);
-        let advisory_action_names = apply_advisory_intent_plan_action_scores(
-            &mut semantic_action_scores,
-            request_hints.intent_plan.as_ref(),
-            &authorized_actions,
-        );
-        assign_direct_actions_to_pending_goals(
-            turn_plan.as_mut(),
-            &authorized_actions,
-            &semantic_action_scores,
-        );
-        let suppress_app_delivery_for_turn = routing_should_suppress_app_delivery_candidates(
-            request_hints.routing.as_ref(),
-            request_hints.routing_trusted,
-            turn_plan.as_ref(),
-            &authorized_actions,
-            &semantic_action_scores,
-        );
-        let initial_route = if direct_answer_only {
-            SemanticActionRoute {
-                actions: Vec::new(),
-                anchored_to_direct_actions: false,
-            }
-        } else if let Some(fast_path) = read_only_fast_path.as_ref() {
-            SemanticActionRoute {
-                actions: fast_path.actions.clone(),
-                anchored_to_direct_actions: true,
-            }
-        } else {
-            self.semantic_route_agent_loop_actions(
-                &action_scope_query,
+        let stage_started = std::time::Instant::now();
+        let (advisory_action_names, suppress_app_delivery_for_turn, initial_route) =
+            crate::core::capability_router::with_action_intent_profiles(
                 &authorized_actions,
-                &semantic_action_scores,
-                turn_plan.as_ref(),
-                request_hints.routing.as_ref(),
-                request_hints.routing_trusted,
-                AGENT_TURN_LOOP_INITIAL_ACTION_SCOPE,
-            )
-        };
+                || {
+                    let route_stage_started = std::time::Instant::now();
+                    let advisory_action_names = apply_advisory_intent_plan_action_scores(
+                        &mut semantic_action_scores,
+                        request_hints.intent_plan.as_ref(),
+                        &authorized_actions,
+                    );
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_route_apply_advisory_scores",
+                        route_stage_started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    let route_stage_started = std::time::Instant::now();
+                    assign_direct_actions_to_pending_goals(
+                        turn_plan.as_mut(),
+                        &authorized_actions,
+                        &semantic_action_scores,
+                    );
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_route_assign_direct_actions",
+                        route_stage_started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    let route_stage_started = std::time::Instant::now();
+                    let suppress_app_delivery_for_turn =
+                        routing_should_suppress_app_delivery_candidates(
+                            request_hints.routing.as_ref(),
+                            request_hints.routing_trusted,
+                            turn_plan.as_ref(),
+                            &authorized_actions,
+                            &semantic_action_scores,
+                        );
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_route_suppress_app_delivery",
+                        route_stage_started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    let route_stage_started = std::time::Instant::now();
+                    let initial_route = if direct_answer_only {
+                        SemanticActionRoute {
+                            actions: Vec::new(),
+                            anchored_to_direct_actions: false,
+                        }
+                    } else if let Some(analysis) = visual_attachment_analysis.as_ref() {
+                        SemanticActionRoute {
+                            actions: vec![analysis.action.clone()],
+                            anchored_to_direct_actions: true,
+                        }
+                    } else if let Some(fast_path) = read_only_fast_path.as_ref() {
+                        SemanticActionRoute {
+                            actions: fast_path.actions.clone(),
+                            anchored_to_direct_actions: true,
+                        }
+                    } else {
+                        self.semantic_route_agent_loop_actions(
+                            &action_scope_query,
+                            &authorized_actions,
+                            &semantic_action_scores,
+                            turn_plan.as_ref(),
+                            request_hints.routing.as_ref(),
+                            request_hints.routing_trusted,
+                            AGENT_TURN_LOOP_INITIAL_ACTION_SCOPE,
+                        )
+                    };
+                    log_agent_loop_timing_instant(
+                        timing,
+                        "agent_loop_route_initial_route",
+                        route_stage_started,
+                        true,
+                        AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                    );
+                    (
+                        advisory_action_names,
+                        suppress_app_delivery_for_turn,
+                        initial_route,
+                    )
+                },
+            );
+        log_agent_loop_timing_instant(
+            timing,
+            "agent_loop_action_route_selection",
+            stage_started,
+            true,
+            AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+        );
         let mut scoped_actions = initial_route.actions;
         let anchored_to_direct_actions = initial_route.anchored_to_direct_actions;
+        if ensure_visual_attachment_action_for_scope(
+            &mut scoped_actions,
+            &authorized_action_map,
+            &request_hints,
+        ) {
+            emit_agent_loop_progress(
+                stream_tx.as_ref(),
+                Some(&progress_recorder),
+                "action_scope",
+                "Added visual attachment analysis action to the scoped action set.",
+            );
+        }
+        if ensure_setup_resolution_action_for_scope(&mut scoped_actions, &authorized_action_map) {
+            emit_agent_loop_progress(
+                stream_tx.as_ref(),
+                Some(&progress_recorder),
+                "action_scope",
+                "Added a read-only setup-resolution action for integration/channel setup ambiguity.",
+            );
+        }
         if self.expand_agent_loop_action_scope_with_names(
             &mut scoped_actions,
             &authorized_action_map,
@@ -6426,6 +8876,13 @@ Next step: {next_step}",
             anchored_to_direct_actions,
             "agent loop action shortlist"
         );
+        log_agent_loop_timing_instant(
+            timing,
+            "agent_loop_to_action_shortlist_total",
+            agent_loop_started,
+            true,
+            AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+        );
         let native_tool_calling_available = !matches!(
             self.llm_candidates_for_role(&ModelRole::Primary)
                 .first()
@@ -6455,10 +8912,61 @@ Next step: {next_step}",
             );
         }
 
-        let mut app_delivery_stream_blocks_mode = app_delivery_fast_path
-            && scoped_actions
+        let mut app_delivery_stream_blocks_mode = should_use_app_delivery_stream_blocks_mode(
+            app_delivery_fast_path,
+            suppress_app_delivery_for_turn,
+            turn_plan.as_ref(),
+            &scoped_actions,
+            &authorized_actions,
+            &semantic_action_scores,
+        );
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            app_delivery_stream_blocks_mode,
+            app_delivery_fast_path,
+            suppress_app_delivery_for_turn,
+            scoped_actions = scoped_actions.len(),
+            scoped_app_writes = scoped_actions
                 .iter()
-                .any(|action| action.name == "app_deploy");
+                .filter(|action| action_is_app_write_candidate(action))
+                .count(),
+            scoped_app_delivery = scoped_actions
+                .iter()
+                .filter(|action| action_is_app_delivery_candidate(action))
+                .count(),
+            "agent_loop app delivery stream mode decision"
+        );
+        if app_delivery_stream_blocks_mode {
+            let app_delivery_plan = turn_plan_to_execution_plan_with_actions(
+                turn_plan.as_ref(),
+                Some(&authorized_action_map),
+            )
+            .filter(execution_plan_has_app_delivery_substeps)
+            .or_else(|| {
+                app_delivery_execution_plan_from_scoped_actions(
+                    format!("app_delivery:{}", uuid::Uuid::new_v4()),
+                    &scoped_actions,
+                )
+            });
+            if let Some(plan) = app_delivery_plan {
+                emit_execution_plan_generated(stream_tx.as_ref(), Some(&progress_recorder), plan);
+            }
+        } else {
+            let setup_plan = turn_plan_to_execution_plan_with_actions(
+                turn_plan.as_ref(),
+                Some(&authorized_action_map),
+            )
+            .filter(execution_plan_has_setup_substeps)
+            .or_else(|| {
+                setup_delivery_execution_plan_from_scoped_actions(
+                    format!("capability_setup:{}", uuid::Uuid::new_v4()),
+                    &scoped_actions,
+                )
+            });
+            if let Some(plan) = setup_plan {
+                emit_execution_plan_generated(stream_tx.as_ref(), Some(&progress_recorder), plan);
+            }
+        }
         let quick_durable_direct_mode = !direct_answer_only
             && !app_delivery_fast_path
             && turn_plan_has_only_quick_durable_direct_actions(
@@ -6466,6 +8974,7 @@ Next step: {next_step}",
                 &authorized_actions,
                 &semantic_action_scores,
             );
+        let stage_started = std::time::Instant::now();
         let mut user_prompt = build_agent_loop_user_prompt(
             message,
             &conversation_key,
@@ -6477,16 +8986,25 @@ Next step: {next_step}",
             &watchers,
             &scoped_actions,
             authorized_action_count,
+            &prompt_fragment_bundle,
             &request_hints,
             turn_plan.as_ref(),
             include_action_schemas_in_prompt,
             app_delivery_stream_blocks_mode,
             read_only_bounded_mode,
         );
+        log_agent_loop_timing_instant(
+            timing,
+            "agent_loop_prompt_build",
+            stage_started,
+            true,
+            AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+        );
         let mut tool_history: Vec<serde_json::Value> = Vec::new();
         let mut turn_records: Vec<AgentTurnRecord> = Vec::new();
         let mut last_tool_result: Option<String> = None;
         let mut read_only_final_synthesis_mode = false;
+        let mut visual_attachment_analysis_completed = false;
         let mut consecutive_read_only_iterations = 0usize;
         let mut action_scope_expansion_level = 0usize;
         let max_iterations = if direct_answer_only {
@@ -6522,6 +9040,7 @@ Next step: {next_step}",
         let mut failed_tool_convergence_counter: HashMap<String, u32> = HashMap::new();
         let mut app_deploy_repair_attempts = 0usize;
         let mut durable_no_action_iterations = 0usize;
+        let mut app_delivery_stream_recovery_used = false;
 
         for iteration in 1..=max_iterations {
             let allowed_action_names = scoped_actions
@@ -6533,16 +9052,20 @@ Next step: {next_step}",
                 .map(|action| (action.name.clone(), action.clone()))
                 .collect::<HashMap<_, _>>();
             let app_delivery_pending_for_timeout = !suppress_app_delivery_for_turn
-                && app_delivery_pending_for_plan_with_scores(
-                    turn_plan.as_ref(),
-                    &authorized_actions,
-                    &semantic_action_scores,
-                );
-            app_delivery_stream_blocks_mode = app_delivery_fast_path
-                && app_delivery_pending_for_timeout
-                && scoped_actions
-                    .iter()
-                    .any(|action| action.name == "app_deploy");
+                && (app_delivery_fast_path
+                    || app_delivery_pending_for_plan_with_scores(
+                        turn_plan.as_ref(),
+                        &authorized_actions,
+                        &semantic_action_scores,
+                    ));
+            app_delivery_stream_blocks_mode = should_use_app_delivery_stream_blocks_mode(
+                app_delivery_fast_path,
+                suppress_app_delivery_for_turn,
+                turn_plan.as_ref(),
+                &scoped_actions,
+                &authorized_actions,
+                &semantic_action_scores,
+            );
             let mut timeout_ms = agent_loop_timeout_ms(
                 user_prompt.len(),
                 scoped_actions.len(),
@@ -6555,13 +9078,18 @@ Next step: {next_step}",
                 timeout_ms = timeout_ms.min(AGENT_TURN_LOOP_QUICK_DURABLE_TIMEOUT_MS);
             }
             let synthetic_fast_path_call = if iteration == 1 && last_tool_result.is_none() {
-                read_only_fast_path.as_ref().and_then(|fast_path| {
-                    synthetic_read_only_fast_path_call(
-                        fast_path,
-                        message,
-                        request_hints.routing.as_ref(),
-                    )
-                })
+                visual_attachment_analysis
+                    .as_ref()
+                    .map(|analysis| visual_attachment_analysis_call(analysis, message))
+                    .or_else(|| {
+                        read_only_fast_path.as_ref().and_then(|fast_path| {
+                            synthetic_read_only_fast_path_call(
+                                fast_path,
+                                message,
+                                request_hints.routing.as_ref(),
+                            )
+                        })
+                    })
             } else {
                 None
             };
@@ -6624,11 +9152,41 @@ Next step: {next_step}",
                     native_tool_calling_available,
                     "agent loop model call budget"
                 );
+                log_agent_loop_timing_instant(
+                    timing,
+                    "agent_loop_to_model_call_total",
+                    agent_loop_started,
+                    true,
+                    AGENT_LOOP_TIMING_SLOW_STAGE_WARN_MS,
+                );
                 let system_prompt = agent_loop_system_prompt_for_turn(
                     app_delivery_stream_blocks_mode,
                     read_only_bounded_mode,
                     read_only_final_synthesis_mode,
                 );
+                record_agent_loop_prompt_telemetry(
+                    &progress_recorder,
+                    agent_loop_prompt_telemetry_payload(
+                        usage_label,
+                        iteration,
+                        &system_prompt,
+                        &user_prompt,
+                        &model_actions,
+                        native_tool_calling_available,
+                    ),
+                );
+                let (model_stream_tx, captured_stream_text) = if native_tool_calling_available {
+                    capture_agent_loop_stream_tokens(
+                        stream_tx.clone(),
+                        Some(progress_recorder.clone()),
+                        app_delivery_stream_blocks_mode || app_delivery_pending_for_timeout,
+                    )
+                } else {
+                    (
+                        None,
+                        Arc::new(Mutex::new(AgentLoopStreamCapture::default())),
+                    )
+                };
                 let response_result = self
                     .supervised_internal_chat_detailed_with_stream(
                         channel,
@@ -6643,10 +9201,11 @@ Next step: {next_step}",
                         timeout_ms,
                         max_candidates,
                         if native_tool_calling_available {
-                            stream_tx.clone()
+                            model_stream_tx
                         } else {
                             None
                         },
+                        app_delivery_stream_blocks_mode || app_delivery_pending_for_timeout,
                     )
                     .await;
 
@@ -6658,44 +9217,186 @@ Next step: {next_step}",
                             .lock()
                             .map(|steps| steps.clone())
                             .unwrap_or_default();
-                        if let Some(result) = last_tool_result.as_deref() {
-                            let mut degradation = vec![crate::core::DegradationNote {
-                                kind: "agent_loop".to_string(),
-                                summary: "final model response unavailable after tool execution"
-                                    .to_string(),
-                                detail: Some(format!(
-                                    "The action completed, but the configured model did not produce a final synthesis. Reason: {}",
+                        let recovered_stream_capture =
+                            captured_agent_loop_stream_capture(&captured_stream_text);
+                        let app_delivery_expected_for_recovery =
+                            app_delivery_stream_blocks_mode || app_delivery_pending_for_timeout;
+                        let mut recovered_response = if app_delivery_stream_recovery_used {
+                            None
+                        } else {
+                            recovered_app_delivery_response_from_stream_capture(
+                                &recovered_stream_capture,
+                                &allowed_action_names,
+                                app_delivery_expected_for_recovery,
+                            )
+                        };
+                        if recovered_response.is_none()
+                            && !app_delivery_stream_recovery_used
+                            && app_delivery_expected_for_recovery
+                            && allowed_action_names.contains("app_deploy")
+                            && (recovered_stream_capture.has_incomplete_draft_files()
+                                || recovered_stream_capture
+                                    .completed_stream_blocks()
+                                    .has_operations()
+                                || !recovered_stream_capture.token_text.trim().is_empty())
+                        {
+                            app_delivery_stream_recovery_used = true;
+                            let continuation_timeout_ms =
+                                agent_loop_app_delivery_continuation_timeout_ms();
+                            emit_agent_loop_progress(
+                                stream_tx.as_ref(),
+                                Some(&progress_recorder),
+                                "model_call",
+                                format!(
+                                    "Model timed out after streaming partial app-delivery state; asking one bounded continuation model call to finish the missing deployable bundle. Provider reason: {}",
                                     reason
-                                )),
-                            }];
-                            let response = degraded_tool_result_response(&reason, result);
-                            mark_final_response_goals(
-                                turn_plan.as_mut(),
-                                &response,
-                                "answered from completed tool result after final model timeout",
-                                &authorized_actions,
+                                ),
                             );
-                            degradation
-                                .extend(unfinished_turn_plan_degradation(turn_plan.as_ref()));
-                            return Ok(agent_loop_processed_message(
-                                response,
+                            let continuation_system_prompt =
+                                app_delivery_continuation_system_prompt();
+                            let continuation_prompt = build_app_delivery_continuation_prompt(
+                                message,
+                                &recovered_stream_capture,
+                                &reason,
+                            );
+                            tracing::info!(
+                                target: "agent_loop.prompt_budget",
+                                iteration,
+                                usage_label = "agent_turn_loop_app_delivery_continuation",
+                                prompt_chars = continuation_prompt.chars().count(),
+                                tool_count = 0usize,
+                                scoped_action_count = scoped_actions.len(),
+                                timeout_ms = continuation_timeout_ms,
+                                "agent loop app delivery continuation model call budget"
+                            );
+                            let (continuation_stream_tx, continuation_capture_ref) =
+                                capture_agent_loop_stream_tokens(
+                                    stream_tx.clone(),
+                                    Some(progress_recorder.clone()),
+                                    true,
+                                );
+                            match self
+                                .supervised_internal_chat_detailed_with_stream(
+                                    channel,
+                                    "agent_turn_loop_app_delivery_continuation",
+                                    AGENT_TURN_LOOP_VERSION,
+                                    &ModelRole::Primary,
+                                    self.llm_candidates_for_role(&ModelRole::Primary),
+                                    &continuation_system_prompt,
+                                    &continuation_prompt,
+                                    &[],
+                                    &[],
+                                    continuation_timeout_ms,
+                                    max_candidates.min(2).max(1),
+                                    continuation_stream_tx,
+                                    true,
+                                )
+                                .await
+                            {
+                                Ok(continuation_response) => {
+                                    let continuation_capture = captured_agent_loop_stream_capture(
+                                        &continuation_capture_ref,
+                                    );
+                                    recovered_response =
+                                        recover_app_delivery_response_from_continuation_state(
+                                            &recovered_stream_capture,
+                                            &continuation_capture,
+                                            &continuation_response.content,
+                                            &allowed_action_names,
+                                            app_delivery_expected_for_recovery,
+                                        );
+                                    if recovered_response.is_none() {
+                                        emit_agent_loop_progress(
+                                            stream_tx.as_ref(),
+                                            Some(&progress_recorder),
+                                            "model_call",
+                                            "App-delivery continuation completed but did not produce a complete deployable bundle; preserving the original model failure."
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                                Err(continuation_outcome) => {
+                                    emit_agent_loop_progress(
+                                        stream_tx.as_ref(),
+                                        Some(&progress_recorder),
+                                        "model_call",
+                                        format!(
+                                            "App-delivery continuation failed within its bounded recovery budget: {}",
+                                            safe_truncate(&continuation_outcome.message, 500)
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(mut response) = recovered_response {
+                            if !app_delivery_stream_recovery_used {
+                                app_delivery_stream_recovery_used = true;
+                            }
+                            if response.usage.is_none() {
+                                let prompt_chars = system_prompt
+                                    .chars()
+                                    .count()
+                                    .saturating_add(user_prompt.chars().count());
+                                let completion_chars =
+                                    recovered_stream_capture.generated_output_chars_for_usage();
+                                response.usage =
+                                    Some(crate::core::llm::estimated_usage_from_chars(
+                                        prompt_chars,
+                                        completion_chars,
+                                    ));
+                            }
+                            self.record_llm_usage(channel, usage_label, &response).await;
+                            emit_agent_loop_progress(
+                                stream_tx.as_ref(),
+                                Some(&progress_recorder),
+                                "model_call",
+                                format!(
+                                    "Recovered complete app file blocks after model transport failure; deploying parsed bundle. Provider reason: {}",
+                                    reason
+                                ),
+                            );
+                            response
+                        } else {
+                            if let Some(result) = last_tool_result.as_deref() {
+                                let mut degradation = vec![crate::core::DegradationNote {
+                                    kind: "agent_loop".to_string(),
+                                    summary:
+                                        "final model response unavailable after tool execution"
+                                            .to_string(),
+                                    detail: Some(format!(
+                                        "The action completed, but the configured model did not produce a final synthesis. Reason: {}",
+                                        reason
+                                    )),
+                                }];
+                                let response = degraded_tool_result_response(&reason, result);
+                                mark_final_response_goals(
+                                    turn_plan.as_mut(),
+                                    &response,
+                                    "answered from completed tool result after final model timeout",
+                                    &authorized_actions,
+                                );
+                                degradation
+                                    .extend(unfinished_turn_plan_degradation(turn_plan.as_ref()));
+                                return Ok(agent_loop_processed_message(
+                                    response,
+                                    conversation_id,
+                                    "completed_degraded",
+                                    std::mem::take(&mut degradation),
+                                    None,
+                                    trace_steps,
+                                    turn_records.clone(),
+                                    turn_plan_to_execution_plan(turn_plan.as_ref()),
+                                ));
+                            }
+                            return Ok(self.agent_loop_service_failure_processed_message(
                                 conversation_id,
-                                "completed_degraded",
-                                std::mem::take(&mut degradation),
-                                None,
+                                &reason,
+                                Some(timeout_ms),
+                                Some(&model_outcome),
                                 trace_steps,
-                                turn_records.clone(),
                                 turn_plan_to_execution_plan(turn_plan.as_ref()),
                             ));
                         }
-                        return Ok(self.agent_loop_service_failure_processed_message(
-                            conversation_id,
-                            &reason,
-                            Some(timeout_ms),
-                            Some(&model_outcome),
-                            trace_steps,
-                            turn_plan_to_execution_plan(turn_plan.as_ref()),
-                        ));
                     }
                 }
             };
@@ -6725,6 +9426,12 @@ Next step: {next_step}",
                         &semantic_action_scores,
                     )
                 {
+                    if visual_attachment_analysis_completed {
+                        remove_visual_attachment_action_from_scope(
+                            &mut scoped_actions,
+                            visual_attachment_analysis.as_ref(),
+                        );
+                    }
                     emit_agent_loop_progress(
                         stream_tx.as_ref(),
                         Some(&progress_recorder),
@@ -6743,6 +9450,7 @@ Next step: {next_step}",
                         &tool_history,
                         &scoped_actions,
                         authorized_action_count,
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -6793,6 +9501,12 @@ Next step: {next_step}",
                         &authorized_actions,
                         &semantic_action_scores,
                     );
+                    if visual_attachment_analysis_completed {
+                        remove_visual_attachment_action_from_scope(
+                            &mut scoped_actions,
+                            visual_attachment_analysis.as_ref(),
+                        );
+                    }
                     emit_agent_loop_progress(
                         stream_tx.as_ref(),
                         Some(&progress_recorder),
@@ -6811,6 +9525,7 @@ Next step: {next_step}",
                         &tool_history,
                         &scoped_actions,
                         authorized_action_count,
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -6877,6 +9592,7 @@ Next step: {next_step}",
                         &tool_history,
                         &scoped_actions,
                         authorized_action_count,
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -6990,6 +9706,7 @@ Next step: {next_step}",
                         &tool_history,
                         &scoped_actions,
                         authorized_action_count,
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -7046,6 +9763,7 @@ Next step: {next_step}",
                         &tool_history,
                         &scoped_actions,
                         authorized_action_count,
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -7084,6 +9802,10 @@ Next step: {next_step}",
             }
             let parsed_calls_have_side_effect =
                 calls_have_side_effect(&parsed_calls.calls, &scoped_action_map);
+            let parsed_calls_are_visual_analysis =
+                visual_attachment_analysis.as_ref().is_some_and(|analysis| {
+                    calls_only_action(&parsed_calls.calls, &analysis.action.name)
+                });
             let parsed_calls_are_code_surrogates = parsed_calls.calls.iter().all(|call| {
                 action_is_code_surrogate(
                     scoped_action_map
@@ -7265,6 +9987,7 @@ Next step: {next_step}",
                     &tool_history,
                     &scoped_actions,
                     authorized_action_count,
+                    &prompt_fragment_bundle,
                     &request_hints,
                     turn_plan.as_ref(),
                     include_action_schemas_in_prompt,
@@ -7392,6 +10115,7 @@ Next step: {next_step}",
                     &tool_history,
                     &scoped_actions,
                     authorized_action_count,
+                    &prompt_fragment_bundle,
                     &request_hints,
                     turn_plan.as_ref(),
                     include_action_schemas_in_prompt,
@@ -7441,6 +10165,7 @@ Next step: {next_step}",
                     &tool_history,
                     &scoped_actions,
                     authorized_action_count,
+                    &prompt_fragment_bundle,
                     &request_hints,
                     turn_plan.as_ref(),
                     include_action_schemas_in_prompt,
@@ -7489,6 +10214,7 @@ Next step: {next_step}",
                     &tool_history,
                     &scoped_actions,
                     authorized_action_count,
+                    &prompt_fragment_bundle,
                     &request_hints,
                     turn_plan.as_ref(),
                     include_action_schemas_in_prompt,
@@ -7537,6 +10263,7 @@ Next step: {next_step}",
                     &tool_history,
                     &scoped_actions,
                     authorized_action_count,
+                    &prompt_fragment_bundle,
                     &request_hints,
                     turn_plan.as_ref(),
                     include_action_schemas_in_prompt,
@@ -7576,6 +10303,7 @@ Next step: {next_step}",
                         &tool_history,
                         &scoped_actions,
                         authorized_action_count,
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -7599,6 +10327,7 @@ Next step: {next_step}",
                         &conversation_key,
                         &tool_history,
                         &scoped_actions,
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -7982,7 +10711,123 @@ Next step: {next_step}",
                 &tool_result,
             ));
 
-            if read_only_fast_path.is_some()
+            if parsed_calls_are_visual_analysis && !tool_completed_successfully {
+                emit_agent_loop_progress(
+                    stream_tx.as_ref(),
+                    Some(&progress_recorder),
+                    "tool_result",
+                    "Visual attachment analysis failed; stopping instead of retrying through unrelated tools.",
+                );
+                let response = tool_result_grounded_response(&tool_result);
+                let trace_steps = progress_recorder
+                    .lock()
+                    .map(|steps| steps.clone())
+                    .unwrap_or_default();
+                let degradation = vec![crate::core::DegradationNote {
+                    kind: "visual_attachment_analysis".to_string(),
+                    summary: "visual attachment analysis failed".to_string(),
+                    detail: Some(response.clone()),
+                }];
+                return Ok(agent_loop_processed_message(
+                    response,
+                    conversation_id,
+                    crate::core::ExecutionRunStatus::PlatformFailed.as_str(),
+                    degradation,
+                    None,
+                    trace_steps,
+                    turn_records.clone(),
+                    turn_plan_to_execution_plan(turn_plan.as_ref()),
+                ));
+            }
+
+            if parsed_calls_are_visual_analysis
+                && tool_completed_successfully
+                && !visual_attachment_final_answer_mode
+            {
+                visual_attachment_analysis_completed = true;
+                let mut next_scope = self
+                    .semantic_route_agent_loop_actions(
+                        &action_scope_query,
+                        &authorized_actions,
+                        &semantic_action_scores,
+                        turn_plan.as_ref(),
+                        request_hints.routing.as_ref(),
+                        request_hints.routing_trusted,
+                        AGENT_TURN_LOOP_EXPANDED_ACTION_SCOPE,
+                    )
+                    .actions;
+                self.expand_agent_loop_action_scope_with_names(
+                    &mut next_scope,
+                    &authorized_action_map,
+                    &advisory_action_names,
+                    turn_plan.as_ref(),
+                    request_hints.routing.as_ref(),
+                    request_hints.routing_trusted,
+                    &authorized_actions,
+                    &semantic_action_scores,
+                );
+                remove_visual_attachment_action_from_scope(
+                    &mut next_scope,
+                    visual_attachment_analysis.as_ref(),
+                );
+                if next_scope.is_empty() {
+                    scoped_actions.clear();
+                    read_only_final_synthesis_mode = true;
+                    emit_agent_loop_progress(
+                        stream_tx.as_ref(),
+                        Some(&progress_recorder),
+                        "model_call",
+                        "Visual attachment analysis completed; synthesizing the final answer from the observed image evidence.",
+                    );
+                    user_prompt = build_agent_loop_read_only_followup_prompt(
+                        message,
+                        &conversation_key,
+                        &tool_history,
+                        &scoped_actions,
+                        &prompt_fragment_bundle,
+                        &request_hints,
+                        turn_plan.as_ref(),
+                        include_action_schemas_in_prompt,
+                        Some(
+                            "Use the completed visual attachment analysis to satisfy the user's current semantic intent. Do not call more actions. If the user asked to remember durable visual information, acknowledge the durable fact only when the visual analysis supports it; do not invent or store sensitive traits, one-off contents, credentials, or guesses.",
+                        ),
+                    );
+                    continue;
+                }
+                scoped_actions = next_scope;
+                emit_agent_loop_progress(
+                    stream_tx.as_ref(),
+                    Some(&progress_recorder),
+                    "action_scope",
+                    format!(
+                        "Visual attachment analysis completed; continuing with {} routed action(s).",
+                        scoped_actions.len()
+                    ),
+                );
+                user_prompt = build_agent_loop_followup_prompt(
+                    message,
+                    &conversation_key,
+                    &packed_context,
+                    &recent_artifacts,
+                    active_workspace_snapshot.as_ref(),
+                    &tool_history,
+                    &scoped_actions,
+                    authorized_action_count,
+                    &prompt_fragment_bundle,
+                    &request_hints,
+                    turn_plan.as_ref(),
+                    include_action_schemas_in_prompt,
+                    app_delivery_stream_blocks_mode,
+                    false,
+                    Some(
+                        "The uploaded visual attachment has already been analyzed in the compact tool history. Use that analysis as evidence for the user's underlying outcome, then call any remaining authorized action that is semantically required. Do not re-run visual analysis unless the current scope contains a different visual input that has not been analyzed.",
+                    ),
+                );
+                continue;
+            }
+
+            if (read_only_fast_path.is_some()
+                || (visual_attachment_final_answer_mode && parsed_calls_are_visual_analysis))
                 && !parsed_calls_have_side_effect
                 && tool_completed_successfully
             {
@@ -8006,6 +10851,7 @@ Next step: {next_step}",
                         &tool_history,
                         &scoped_actions,
                         scoped_actions.len(),
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -8082,6 +10928,38 @@ Next step: {next_step}",
                 }
             }
 
+            if parsed_calls_are_code_surrogates
+                && !tool_completed_successfully
+                && !tool_output_is_retryable(&output_value)
+            {
+                emit_agent_loop_progress(
+                    stream_tx.as_ref(),
+                    Some(&progress_recorder),
+                    "tool_result",
+                    "Code execution failed with a non-retryable result; stopping instead of re-entering the sandbox loop.",
+                );
+                let response = tool_result_grounded_response(&tool_result);
+                let trace_steps = progress_recorder
+                    .lock()
+                    .map(|steps| steps.clone())
+                    .unwrap_or_default();
+                let degradation = vec![crate::core::DegradationNote {
+                    kind: "code_execute_nonretryable_failure".to_string(),
+                    summary: "code execution failed without a retryable result".to_string(),
+                    detail: Some(response.clone()),
+                }];
+                return Ok(agent_loop_processed_message(
+                    response,
+                    conversation_id,
+                    crate::core::ExecutionRunStatus::PlatformFailed.as_str(),
+                    degradation,
+                    None,
+                    trace_steps,
+                    turn_records.clone(),
+                    turn_plan_to_execution_plan(turn_plan.as_ref()),
+                ));
+            }
+
             if tool_completed_successfully
                 && calls_are_quick_durable_commits(&parsed_calls.calls, &scoped_action_map)
             {
@@ -8128,28 +11006,25 @@ Next step: {next_step}",
                 }
             }
 
-            let attempted_app_deploy_after_tool = parsed_calls
-                .calls
-                .iter()
-                .any(|call| call.name == "app_deploy")
-                && tool_output_deploy_attempted(&output_value);
-            if attempted_app_deploy_after_tool {
+            let parsed_calls_include_app_delivery_action = parsed_calls.calls.iter().any(|call| {
+                scoped_action_map
+                    .get(&call.name)
+                    .or_else(|| authorized_action_map.get(&call.name))
+                    .map(action_is_app_delivery_candidate)
+                    .unwrap_or(false)
+            });
+            let app_delivery_attempted_after_tool = parsed_calls_include_app_delivery_action
+                && (tool_output_deploy_attempted(&output_value)
+                    || (tool_completed_successfully
+                        && tool_output_has_app_delivery_result(&output_value)));
+            if app_delivery_attempted_after_tool {
                 let remaining_direct_actions =
                     pending_required_non_app_direct_action_names_with_scores(
                         turn_plan.as_ref(),
                         &authorized_actions,
                         &semantic_action_scores,
                     );
-                let advisory_plan_needs_continuation =
-                    advisory_intent_plan_requires_continuation_after_side_effect(
-                        request_hints.intent_plan.as_ref(),
-                        turn_plan.as_ref(),
-                        &turn_records,
-                        &parsed_calls.calls,
-                    );
-                if tool_completed_successfully
-                    && (advisory_plan_needs_continuation || !remaining_direct_actions.is_empty())
-                {
+                if tool_completed_successfully && !remaining_direct_actions.is_empty() {
                     if suppress_app_delivery_for_turn
                         || !app_delivery_pending_for_plan_with_scores(
                             turn_plan.as_ref(),
@@ -8159,14 +11034,51 @@ Next step: {next_step}",
                     {
                         scoped_actions.retain(|action| !action_is_app_delivery_candidate(action));
                     }
+                    let remaining_names = remaining_direct_actions
+                        .iter()
+                        .cloned()
+                        .collect::<HashSet<_>>();
+                    scoped_actions.retain(|action| remaining_names.contains(&action.name));
+                    for name in &remaining_direct_actions {
+                        if scoped_actions.iter().any(|action| action.name == *name) {
+                            continue;
+                        }
+                        if let Some(action) = authorized_action_map.get(name) {
+                            scoped_actions.push(action.clone());
+                        }
+                    }
                     emit_agent_loop_progress(
                         stream_tx.as_ref(),
                         Some(&progress_recorder),
                         "model_call",
-                        "App delivery completed, but the structured turn plan still has remaining outcome(s); continuing without redeploying the app.",
+                        "App delivery completed; continuing only with the remaining non-app action(s) required by the structured turn plan.",
                     );
                     let continuation_guard =
                         post_app_delivery_continuation_guard(&remaining_direct_actions);
+                    let continuation_action_count = scoped_actions.len();
+                    if continuation_action_count == 0 {
+                        let response = tool_result_grounded_response(&tool_result);
+                        let trace_steps = progress_recorder
+                            .lock()
+                            .map(|steps| steps.clone())
+                            .unwrap_or_default();
+                        let mut degradation = Vec::new();
+                        degradation.extend(unfinished_turn_plan_degradation(turn_plan.as_ref()));
+                        return Ok(agent_loop_processed_message(
+                            response,
+                            conversation_id,
+                            if degradation.is_empty() {
+                                "completed"
+                            } else {
+                                "completed_degraded"
+                            },
+                            degradation,
+                            None,
+                            trace_steps,
+                            turn_records.clone(),
+                            turn_plan_to_execution_plan(turn_plan.as_ref()),
+                        ));
+                    }
                     user_prompt = build_agent_loop_followup_prompt(
                         message,
                         &conversation_key,
@@ -8175,7 +11087,8 @@ Next step: {next_step}",
                         active_workspace_snapshot.as_ref(),
                         &tool_history,
                         &scoped_actions,
-                        authorized_action_count,
+                        continuation_action_count,
+                        &prompt_fragment_bundle,
                         &request_hints,
                         turn_plan.as_ref(),
                         include_action_schemas_in_prompt,
@@ -8375,6 +11288,7 @@ Next step: {next_step}",
                 &tool_history,
                 &scoped_actions,
                 authorized_action_count,
+                &prompt_fragment_bundle,
                 &request_hints,
                 turn_plan.as_ref(),
                 include_action_schemas_in_prompt,
@@ -8461,6 +11375,192 @@ mod tests {
             capabilities: vec!["app_hosting".to_string()],
             ..crate::actions::ActionDef::default()
         }
+    }
+
+    fn app_lifecycle_action(name: &str) -> crate::actions::ActionDef {
+        crate::actions::ActionDef {
+            name: name.to_string(),
+            description: "Manage a deployed application runtime lifecycle.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app_id": {"type": "string"}
+                }
+            }),
+            capabilities: vec!["app_hosting".to_string()],
+            ..crate::actions::ActionDef::default()
+        }
+    }
+
+    fn integration_builder_action(name: &str) -> crate::actions::ActionDef {
+        crate::actions::ActionDef {
+            name: name.to_string(),
+            description: "Create or update an integration or custom messaging channel.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "integration_id": {"type": "string"},
+                    "configuration": {"type": "object"}
+                }
+            }),
+            capabilities: vec!["integration_builder".to_string()],
+            ..crate::actions::ActionDef::default()
+        }
+    }
+
+    fn search_action(name: &str) -> crate::actions::ActionDef {
+        crate::actions::ActionDef {
+            name: name.to_string(),
+            description: "Search external documentation or public information.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                }
+            }),
+            capabilities: vec!["network".to_string()],
+            ..crate::actions::ActionDef::default()
+        }
+    }
+
+    fn vision_ocr_action() -> crate::actions::ActionDef {
+        crate::actions::ActionDef {
+            name: "vision_ocr".to_string(),
+            description:
+                "Analyze an uploaded image or visual document and answer questions about it."
+                    .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "upload_id": {"type": "string"},
+                    "task": {"type": "string"},
+                    "question": {"type": "string"},
+                    "detail": {"type": "string"}
+                }
+            }),
+            capabilities: vec!["vision_ocr".to_string(), "network".to_string()],
+            ..crate::actions::ActionDef::default()
+        }
+    }
+
+    fn selected_fragment_ids(
+        selection: &crate::core::prompt_fragments::PromptFragmentSelection,
+    ) -> Vec<&str> {
+        selection
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn app_delivery_prompt_fragments_do_not_pull_vision_without_attachment() {
+        let app = app_delivery_action();
+        let vision = vision_ocr_action();
+        let plan = turn_plan(AgentLoopGoalState {
+            action_name: Some(app.name.clone()),
+            ..goal("deployment")
+        });
+        let hints = RequestExecutionHints::default();
+        let selection = agent_loop_prompt_fragment_selection(
+            &[app, vision],
+            &hints,
+            Some(&plan),
+            true,
+            false,
+            true,
+        );
+        let ids = selected_fragment_ids(&selection);
+
+        assert!(ids.contains(&"fragment.app_delivery.protocol"));
+        assert!(!ids.contains(&"fragment.attachments.vision_documents"));
+    }
+
+    #[test]
+    fn app_delivery_stream_mode_does_not_tag_every_small_scoped_action() {
+        let selection = agent_loop_prompt_fragment_selection(
+            &[app_delivery_action(), vision_ocr_action()],
+            &RequestExecutionHints::default(),
+            None,
+            true,
+            false,
+            true,
+        );
+        let ids = selected_fragment_ids(&selection);
+
+        assert!(ids.contains(&"fragment.app_delivery.protocol"));
+        assert!(!ids.contains(&"fragment.attachments.vision_documents"));
+    }
+
+    #[test]
+    fn arkorbit_context_activates_only_arkorbit_fragment_from_turn_context() {
+        let hints = RequestExecutionHints {
+            arkorbit_context: Some(serde_json::json!({"orbit_id": "orbit-1"})),
+            ..Default::default()
+        };
+        let selection =
+            agent_loop_prompt_fragment_selection(&[], &hints, None, false, false, false);
+        let ids = selected_fragment_ids(&selection);
+
+        assert!(ids.contains(&"fragment.arkorbit.surface"));
+        assert!(!ids.contains(&"fragment.app_delivery.protocol"));
+        assert!(!ids.contains(&"fragment.attachments.vision_documents"));
+    }
+
+    #[test]
+    fn live_state_routing_activates_ark_inspection_fragment_without_action_anchor() {
+        let hints = RequestExecutionHints {
+            routing: Some(crate::security::intent_classifier::InboundRoutingSignal {
+                current_answer_expected: true,
+                live_state_expected: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let selection =
+            agent_loop_prompt_fragment_selection(&[], &hints, None, false, false, false);
+        let ids = selected_fragment_ids(&selection);
+
+        assert!(ids.contains(&"fragment.ark_inspection.local_state"));
+        assert!(!ids.contains(&"fragment.app_delivery.protocol"));
+        assert!(!ids.contains(&"fragment.attachments.vision_documents"));
+    }
+
+    #[test]
+    fn capability_routing_activates_agentark_knowledge_fragment_without_action_anchor() {
+        let hints = RequestExecutionHints {
+            routing: Some(crate::security::intent_classifier::InboundRoutingSignal {
+                current_answer_expected: true,
+                agentark_capabilities_expected: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let selection =
+            agent_loop_prompt_fragment_selection(&[], &hints, None, false, false, false);
+        let ids = selected_fragment_ids(&selection);
+
+        assert!(ids.contains(&"fragment.agentark_knowledge.capabilities"));
+        assert!(!ids.contains(&"fragment.app_delivery.protocol"));
+        assert!(!ids.contains(&"fragment.attachments.vision_documents"));
+    }
+
+    #[test]
+    fn ordinary_current_answer_routing_does_not_activate_read_only_fragment() {
+        let hints = RequestExecutionHints {
+            routing: Some(crate::security::intent_classifier::InboundRoutingSignal {
+                current_answer_expected: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let selection =
+            agent_loop_prompt_fragment_selection(&[], &hints, None, false, false, false);
+        let ids = selected_fragment_ids(&selection);
+
+        assert!(!ids.contains(&"fragment.read_only.synthesis"));
+        assert!(!ids.contains(&"fragment.app_delivery.protocol"));
+        assert!(!ids.contains(&"fragment.attachments.vision_documents"));
     }
 
     fn required_file_write_action() -> crate::actions::ActionDef {
@@ -8992,14 +12092,12 @@ mod tests {
         };
         let actions = vec![app_delivery_action()];
 
-        assert!(
-            build_agent_loop_turn_plan_from_advisory_intent_plan(
-                "what current apps do i have",
-                &plan,
-                &actions
-            )
-            .is_none()
-        );
+        assert!(build_agent_loop_turn_plan_from_advisory_intent_plan(
+            "what current apps do i have",
+            &plan,
+            &actions
+        )
+        .is_none());
     }
 
     #[test]
@@ -9025,14 +12123,12 @@ mod tests {
         let actions = vec![inspect];
         let mut scores = HashMap::new();
 
-        assert!(
-            build_agent_loop_turn_plan_from_advisory_intent_plan(
-                "show the latest trace",
-                &plan,
-                &actions
-            )
-            .is_none()
-        );
+        assert!(build_agent_loop_turn_plan_from_advisory_intent_plan(
+            "show the latest trace",
+            &plan,
+            &actions
+        )
+        .is_none());
         let boosted = apply_advisory_intent_plan_action_scores(&mut scores, Some(&plan), &actions);
 
         assert_eq!(boosted, vec!["ark_inspect".to_string()]);
@@ -9302,34 +12398,38 @@ mod tests {
     }
 
     #[test]
-    fn product_help_routing_uses_product_help_grounding_only() {
+    fn agentark_capability_routing_uses_capability_grounding_only() {
         let web_search = action(
             "web_search",
             "Retrieve current public information and return structured results.",
             &["search"],
         );
-        let product_help = action(
-            "product_help_search",
-            "Search bundled product help and runtime documentation.",
-            &["product_help", "documentation", "database_readonly"],
+        let agentark_lookup = action(
+            "agentark_capability_lookup",
+            "Search live AgentArk capabilities with manual context.",
+            &[
+                "agentark_capabilities",
+                "agentark_manual",
+                "database_readonly",
+            ],
         );
-        let actions = vec![web_search, product_help];
+        let actions = vec![web_search, agentark_lookup];
         let scores = HashMap::from([
             ("web_search".to_string(), 0.99),
-            ("product_help_search".to_string(), 0.86),
+            ("agentark_capability_lookup".to_string(), 0.86),
         ]);
         let routing = crate::security::intent_classifier::InboundRoutingSignal {
             should_execute: true,
             tool_use_expected: true,
             current_answer_expected: true,
-            product_help_expected: true,
+            agentark_capabilities_expected: true,
             goals: vec![crate::security::intent_classifier::InboundTurnGoal {
                 id: "g1".to_string(),
                 intent_summary: "Explain a product concept".to_string(),
-                capability_query: "Read relevant bundled product documentation".to_string(),
-                expected_outcome: "A grounded product explanation".to_string(),
+                capability_query: "Read live AgentArk capability data".to_string(),
+                expected_outcome: "A grounded AgentArk capability explanation".to_string(),
                 durability: "none".to_string(),
-                groundings: vec!["product_help".to_string()],
+                groundings: vec!["agentark_capabilities".to_string()],
                 dependencies: Vec::new(),
                 ..Default::default()
             }],
@@ -9337,22 +12437,29 @@ mod tests {
         };
 
         let selected = select_read_only_fast_path_action(Some(&routing), None, &actions, &scores)
-            .expect("product-help routing should select product help lookup");
+            .expect("AgentArk capability routing should select capability lookup");
 
         assert_eq!(selected.actions.len(), 1);
         assert_eq!(
             selected.primary_action().map(|action| action.name.as_str()),
-            Some("product_help_search")
+            Some("agentark_capability_lookup")
         );
-        assert!(selected.actions.iter().all(action_is_product_help_lookup));
+        assert!(selected
+            .actions
+            .iter()
+            .all(action_is_agentark_knowledge_lookup));
     }
 
     #[test]
-    fn product_help_scope_expansion_rejects_external_read_only_actions() {
-        let product_help = action(
-            "product_help_search",
-            "Search bundled product help and runtime documentation.",
-            &["product_help", "documentation", "database_readonly"],
+    fn agentark_capability_scope_expansion_rejects_external_read_only_actions() {
+        let agentark_lookup = action(
+            "agentark_capability_lookup",
+            "Search live AgentArk capabilities with manual context.",
+            &[
+                "agentark_capabilities",
+                "agentark_manual",
+                "database_readonly",
+            ],
         );
         let web_search = action(
             "web_search",
@@ -9363,14 +12470,14 @@ mod tests {
             should_execute: true,
             tool_use_expected: true,
             current_answer_expected: true,
-            product_help_expected: true,
+            agentark_capabilities_expected: true,
             goals: vec![crate::security::intent_classifier::InboundTurnGoal {
                 id: "g1".to_string(),
                 intent_summary: "Explain a product concept".to_string(),
-                capability_query: "Read relevant bundled product documentation".to_string(),
-                expected_outcome: "A grounded product explanation".to_string(),
+                capability_query: "Read live AgentArk capability data".to_string(),
+                expected_outcome: "A grounded AgentArk capability explanation".to_string(),
                 durability: "none".to_string(),
-                groundings: vec!["product_help".to_string()],
+                groundings: vec!["agentark_capabilities".to_string()],
                 dependencies: Vec::new(),
                 ..Default::default()
             }],
@@ -9378,7 +12485,7 @@ mod tests {
         };
 
         assert!(action_matches_routed_read_only_grounding(
-            &product_help,
+            &agentark_lookup,
             &routing
         ));
         assert!(!action_matches_routed_read_only_grounding(
@@ -9674,6 +12781,494 @@ mod tests {
     }
 
     #[test]
+    fn app_delivery_stream_blocks_can_follow_structurally_selected_plan() {
+        let app_deploy = app_delivery_action();
+        let mut delivery_goal = goal("deployment");
+        delivery_goal.action_name = Some(app_deploy.name.clone());
+        let plan = turn_plan(delivery_goal);
+        let actions = vec![app_deploy.clone()];
+        let scores = HashMap::from([(app_deploy.name.clone(), 0.91)]);
+
+        assert!(should_use_app_delivery_stream_blocks_mode(
+            false,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn app_delivery_stream_blocks_tolerate_structural_app_lifecycle_scope() {
+        let app_deploy = app_delivery_action();
+        let app_restart = app_lifecycle_action("app_restart");
+        let mut delivery_goal = goal("deployment");
+        delivery_goal.action_name = Some(app_deploy.name.clone());
+        let plan = turn_plan(delivery_goal);
+        let actions = vec![app_deploy.clone(), app_restart.clone()];
+        let scores = HashMap::from([
+            (app_deploy.name.clone(), 0.91),
+            (app_restart.name.clone(), 0.84),
+        ]);
+
+        assert!(should_use_app_delivery_stream_blocks_mode(
+            false,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn app_delivery_stream_blocks_handle_recurring_dashboard_with_artifact_competitor() {
+        let app_deploy = app_delivery_action();
+        let pdf_generate = pdf_generate_action();
+        let watch = watch_action();
+        let mut delivery_goal = goal("recurring_monitor");
+        delivery_goal.expected_outcome =
+            "A deployed local dashboard with internal refresh and a live URL".to_string();
+        let plan = turn_plan(delivery_goal);
+        let scoped_actions = vec![app_deploy.clone(), pdf_generate.clone()];
+        let authorized_actions = vec![app_deploy.clone(), pdf_generate.clone(), watch.clone()];
+        let scores = HashMap::from([
+            (app_deploy.name.clone(), 0.684),
+            (pdf_generate.name.clone(), 0.695),
+            (watch.name.clone(), 0.90),
+        ]);
+
+        assert!(app_delivery_required_for_goal_with_scores(
+            &plan.goals[0],
+            &authorized_actions,
+            &scores
+        ));
+        assert_eq!(
+            required_direct_action_for_goal_with_scores(
+                &plan.goals[0],
+                &authorized_actions,
+                &scores
+            )
+            .map(|action| action.name),
+            Some(app_deploy.name.clone())
+        );
+        assert!(should_use_app_delivery_stream_blocks_mode(
+            false,
+            false,
+            Some(&plan),
+            &scoped_actions,
+            &authorized_actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn durable_orchestration_still_blocks_app_delivery_when_app_is_not_competitive() {
+        let app_deploy = app_delivery_action();
+        let watch = watch_action();
+        let delivery_goal = goal("recurring_monitor");
+        let plan = turn_plan(delivery_goal);
+        let actions = vec![app_deploy.clone(), watch.clone()];
+        let scores = HashMap::from([(app_deploy.name.clone(), 0.30), (watch.name.clone(), 0.90)]);
+
+        assert!(!app_delivery_required_for_goal_with_scores(
+            &plan.goals[0],
+            &actions,
+            &scores
+        ));
+        assert!(!should_use_app_delivery_stream_blocks_mode(
+            false,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn app_delivery_stream_blocks_reject_non_app_write_scope() {
+        let app_deploy = app_delivery_action();
+        let file_write = crate::actions::ActionDef {
+            name: "file_write".to_string(),
+            description: "Write local workspace files.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                }
+            }),
+            capabilities: vec!["file_write".to_string()],
+            ..crate::actions::ActionDef::default()
+        };
+        let mut delivery_goal = goal("deployment");
+        delivery_goal.action_name = Some(app_deploy.name.clone());
+        let mut file_goal = goal("workspace_file");
+        file_goal.action_name = Some(file_write.name.clone());
+        let plan = AgentLoopTurnPlanState {
+            plan_id: "turn-test".to_string(),
+            summary: "Create app and write an unrelated workspace file.".to_string(),
+            goals: vec![delivery_goal, file_goal],
+        };
+        let actions = vec![app_deploy.clone(), file_write.clone()];
+        let scores = HashMap::from([
+            (app_deploy.name.clone(), 0.91),
+            (file_write.name.clone(), 0.89),
+        ]);
+
+        assert!(!should_use_app_delivery_stream_blocks_mode(
+            false,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+        assert!(!should_use_app_delivery_stream_blocks_mode(
+            true,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn app_delivery_stream_blocks_reject_pure_app_lifecycle_goal() {
+        let app_deploy = app_delivery_action();
+        let app_restart = app_lifecycle_action("app_restart");
+        let mut lifecycle_goal = goal("restart_deployed_app");
+        lifecycle_goal.action_name = Some(app_restart.name.clone());
+        let plan = turn_plan(lifecycle_goal);
+        let actions = vec![app_deploy.clone(), app_restart.clone()];
+        let scores = HashMap::from([
+            (app_deploy.name.clone(), 0.50),
+            (app_restart.name.clone(), 0.95),
+        ]);
+
+        assert!(!should_use_app_delivery_stream_blocks_mode(
+            false,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+        assert!(!should_use_app_delivery_stream_blocks_mode(
+            true,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn app_delivery_stream_blocks_reject_integration_builder_goal() {
+        let app_deploy = app_delivery_action();
+        let integration_builder = integration_builder_action("manage_actions");
+        let mut integration_goal = goal("integration");
+        integration_goal.intent_summary = "Add a new external service integration".to_string();
+        integration_goal.capability_query =
+            "Create or configure a connected integration capability".to_string();
+        integration_goal.expected_outcome = "A usable integration action is available".to_string();
+        integration_goal.action_name = Some(integration_builder.name.clone());
+        let plan = turn_plan(integration_goal);
+        let actions = vec![app_deploy.clone(), integration_builder.clone()];
+        let scores = HashMap::from([
+            (app_deploy.name.clone(), 0.88),
+            (integration_builder.name.clone(), 0.95),
+        ]);
+
+        assert!(!semantic_app_delivery_fast_path_allowed_for_plan(
+            Some(&plan),
+            &actions,
+            &scores
+        ));
+        assert!(select_semantic_app_delivery_fast_path(None, &actions, &scores).is_none());
+        assert!(!should_use_app_delivery_stream_blocks_mode(
+            false,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+        assert!(!should_use_app_delivery_stream_blocks_mode(
+            true,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn app_delivery_stream_blocks_respect_suppressed_app_delivery() {
+        let app_deploy = app_delivery_action();
+        let mut delivery_goal = goal("deployment");
+        delivery_goal.action_name = Some(app_deploy.name.clone());
+        let plan = turn_plan(delivery_goal);
+        let actions = vec![app_deploy.clone()];
+        let scores = HashMap::from([(app_deploy.name.clone(), 0.91)]);
+
+        assert!(!should_use_app_delivery_stream_blocks_mode(
+            false,
+            true,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn semantic_app_delivery_fast_path_requires_dominant_app_score() {
+        let app_deploy = app_delivery_action();
+        let research = action(
+            "research",
+            "Retrieve and synthesize external evidence for a current answer.",
+            &["research", "database_readonly"],
+        );
+        let actions = vec![app_deploy.clone(), research.clone()];
+
+        let selected = select_semantic_app_delivery_fast_path(
+            None,
+            &actions,
+            &HashMap::from([
+                (app_deploy.name.clone(), 0.91),
+                (research.name.clone(), 0.70),
+            ]),
+        )
+        .expect("dominant app-delivery score should use the app fast path");
+        assert_eq!(selected.score, 0.91);
+        assert_eq!(selected.runner_up_score, 0.70);
+
+        assert!(select_semantic_app_delivery_fast_path(
+            None,
+            &actions,
+            &HashMap::from([
+                (app_deploy.name.clone(), 0.61),
+                (research.name.clone(), 0.58),
+            ]),
+        )
+        .is_none());
+
+        let read_only_routing = crate::security::intent_classifier::InboundRoutingSignal {
+            current_answer_expected: true,
+            external_info_expected: true,
+            goals: vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: "Answer from external evidence".to_string(),
+                capability_query: "Retrieve external evidence".to_string(),
+                expected_outcome: "Current answer in chat".to_string(),
+                groundings: vec!["external_info".to_string()],
+                dependencies: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(select_semantic_app_delivery_fast_path(
+            Some(&read_only_routing),
+            &actions,
+            &HashMap::from([(app_deploy.name.clone(), 0.99)]),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn stream_block_recovery_synthesizes_app_deploy_after_model_failure() {
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let response = recovered_app_delivery_response_from_stream_text(
+            "Ready.\n<file path=\"index.html\"><!doctype html><title>x</title></file>\n<file path=\"style.css\">body{margin:0}</file>",
+            &allowed,
+            true,
+        )
+        .expect("complete app file blocks should recover a deploy call");
+
+        assert_eq!(response.provider, "agentark");
+        assert_eq!(response.model, "stream_block_recovery");
+        assert_eq!(response.tool_calls.len(), 1);
+        let call = &response.tool_calls[0];
+        assert_eq!(call.name, "app_deploy");
+        let files = call
+            .arguments
+            .get("files")
+            .and_then(|value| value.as_object())
+            .expect("recovered call should carry streamed files");
+        assert_eq!(
+            files.get("index.html").and_then(|value| value.as_str()),
+            Some("<!doctype html><title>x</title>")
+        );
+        assert_eq!(
+            files.get("style.css").and_then(|value| value.as_str()),
+            Some("body{margin:0}")
+        );
+    }
+
+    #[test]
+    fn stream_draft_state_recovery_uses_ui_draft_file_events() {
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let mut capture = AgentLoopStreamCapture::default();
+        capture.record_event(&StreamEvent::ToolProgress {
+            name: "app_deploy".to_string(),
+            content: "Drafted index.html".to_string(),
+            payload: Some(serde_json::json!({
+                "kind": "draft_file",
+                "file": "index.html",
+                "content_snapshot": "<!doctype html><title>x</title>",
+                "done": true
+            })),
+        });
+        capture.record_event(&StreamEvent::ToolProgress {
+            name: "app_deploy".to_string(),
+            content: "Drafted app.js".to_string(),
+            payload: Some(serde_json::json!({
+                "kind": "draft_file",
+                "file": "app.js",
+                "content_delta": "console.log('ok');",
+                "done": true
+            })),
+        });
+
+        let response =
+            recovered_app_delivery_response_from_stream_capture(&capture, &allowed, true)
+                .expect("completed UI draft-file state should recover a deploy call");
+
+        assert_eq!(response.model, "stream_draft_state_recovery");
+        let files = response.tool_calls[0]
+            .arguments
+            .get("files")
+            .and_then(|value| value.as_object())
+            .expect("recovered call should carry files");
+        assert_eq!(
+            files.get("index.html").and_then(|value| value.as_str()),
+            Some("<!doctype html><title>x</title>")
+        );
+        assert_eq!(
+            files.get("app.js").and_then(|value| value.as_str()),
+            Some("console.log('ok');")
+        );
+    }
+
+    #[test]
+    fn stream_draft_state_recovery_waits_for_completed_files() {
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let mut capture = AgentLoopStreamCapture::default();
+        capture.record_event(&StreamEvent::ToolProgress {
+            name: "app_deploy".to_string(),
+            content: "Drafting index.html".to_string(),
+            payload: Some(serde_json::json!({
+                "kind": "draft_file",
+                "file": "index.html",
+                "content_delta": "<!doctype html>",
+                "done": false
+            })),
+        });
+
+        assert!(
+            recovered_app_delivery_response_from_stream_capture(&capture, &allowed, true).is_none()
+        );
+    }
+
+    #[test]
+    fn app_delivery_continuation_merges_saved_and_finished_files() {
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let mut original = AgentLoopStreamCapture::default();
+        original.record_event(&StreamEvent::ToolProgress {
+            name: "app_deploy".to_string(),
+            content: "Drafted app.py".to_string(),
+            payload: Some(serde_json::json!({
+                "kind": "draft_file",
+                "file": "app.py",
+                "content_snapshot": "print('ready')",
+                "done": true
+            })),
+        });
+        original.record_event(&StreamEvent::ToolProgress {
+            name: "app_deploy".to_string(),
+            content: "Drafting static/index.html".to_string(),
+            payload: Some(serde_json::json!({
+                "kind": "draft_file",
+                "file": "static/index.html",
+                "content_delta": "<!doctype html>",
+                "done": false
+            })),
+        });
+        let continuation = AgentLoopStreamCapture::default();
+        let response = recover_app_delivery_response_from_continuation_state(
+            &original,
+            &continuation,
+            r#"<file path="static/index.html"><!doctype html><title>done</title></file>"#,
+            &allowed,
+            true,
+        )
+        .expect("continuation should merge saved complete file with finished missing file");
+
+        assert_eq!(response.model, "stream_continuation_recovery");
+        let files = response.tool_calls[0]
+            .arguments
+            .get("files")
+            .and_then(|value| value.as_object())
+            .expect("merged deploy call should carry files");
+        assert_eq!(
+            files.get("app.py").and_then(|value| value.as_str()),
+            Some("print('ready')")
+        );
+        assert_eq!(
+            files
+                .get("static/index.html")
+                .and_then(|value| value.as_str()),
+            Some("<!doctype html><title>done</title>")
+        );
+    }
+
+    #[test]
+    fn app_delivery_continuation_requires_original_incomplete_files_to_finish() {
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let mut original = AgentLoopStreamCapture::default();
+        original.record_event(&StreamEvent::ToolProgress {
+            name: "app_deploy".to_string(),
+            content: "Drafting app.py".to_string(),
+            payload: Some(serde_json::json!({
+                "kind": "draft_file",
+                "file": "app.py",
+                "content_delta": "print(",
+                "done": false
+            })),
+        });
+        let continuation = AgentLoopStreamCapture::default();
+
+        assert!(recover_app_delivery_response_from_continuation_state(
+            &original,
+            &continuation,
+            r#"<file path="index.html"><!doctype html></file>"#,
+            &allowed,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn stream_block_recovery_ignores_non_app_contexts() {
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let streamed = "<file path=\"index.html\"><!doctype html></file>";
+
+        assert!(
+            recovered_app_delivery_response_from_stream_text(streamed, &allowed, false).is_none()
+        );
+        assert!(
+            recovered_app_delivery_response_from_stream_text(streamed, &HashSet::new(), true,)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn read_only_fast_path_can_synthesize_single_query_call_from_schema() {
         let mut lookup = action(
             "web_search",
@@ -9715,11 +13310,15 @@ mod tests {
     }
 
     #[test]
-    fn product_help_fast_path_synthesizes_scoped_doc_ids() {
+    fn agentark_capability_fast_path_synthesizes_scoped_doc_ids() {
         let mut lookup = action(
-            "product_help_search",
-            "Search bundled product help and runtime documentation.",
-            &["product_help", "documentation", "database_readonly"],
+            "agentark_capability_lookup",
+            "Search live AgentArk capabilities with manual context.",
+            &[
+                "agentark_capabilities",
+                "agentark_manual",
+                "database_readonly",
+            ],
         );
         lookup.input_schema = serde_json::json!({
             "type": "object",
@@ -9733,18 +13332,18 @@ mod tests {
             should_execute: true,
             tool_use_expected: true,
             current_answer_expected: true,
-            product_help_expected: true,
+            agentark_capabilities_expected: true,
             grounding_doc_ids: vec![
-                "product_help:1111222233334444".to_string(),
-                "product_help:aaaabbbbccccdddd".to_string(),
+                "agentark_knowledge:1111222233334444".to_string(),
+                "agentark_knowledge:aaaabbbbccccdddd".to_string(),
             ],
             goals: vec![crate::security::intent_classifier::InboundTurnGoal {
                 id: "g1".to_string(),
                 intent_summary: "Explain a product concept".to_string(),
-                capability_query: "Read relevant bundled product documentation".to_string(),
-                expected_outcome: "A grounded product explanation".to_string(),
+                capability_query: "Read live AgentArk capability data".to_string(),
+                expected_outcome: "A grounded AgentArk capability explanation".to_string(),
                 durability: "none".to_string(),
-                groundings: vec!["product_help".to_string()],
+                groundings: vec!["agentark_capabilities".to_string()],
                 dependencies: Vec::new(),
                 ..Default::default()
             }],
@@ -9758,9 +13357,9 @@ mod tests {
 
         let call =
             synthetic_read_only_fast_path_call(&fast_path, "what is this feature?", Some(&routing))
-                .expect("product-help lookup should be directly invokable");
+                .expect("AgentArk capability lookup should be directly invokable");
 
-        assert_eq!(call.name, "product_help_search");
+        assert_eq!(call.name, "agentark_capability_lookup");
         assert_eq!(
             call.arguments.get("query").and_then(|value| value.as_str()),
             Some("what is this feature?")
@@ -9877,6 +13476,20 @@ mod tests {
     }
 
     #[test]
+    fn embedded_app_result_is_rendered_as_user_safe_summary() {
+        let response = tool_result_grounded_response(
+            r#"Deployment done: {"status":"deployed","app_id":"abc123","title":"Demo","url":"/apps/abc123/","access_guard_enabled":false,"expose_public":false}"#,
+        );
+
+        assert!(response.contains("Deployed app: **Demo**"));
+        assert!(response.contains("- Open: [/apps/abc123/](/apps/abc123/)."));
+        assert!(response.contains("- App ID: `abc123`."));
+        assert!(response.contains("Apps page"));
+        assert!(!response.contains("\"app_id\""));
+        assert!(!response.contains("access_guard_enabled"));
+    }
+
+    #[test]
     fn attachment_context_prevents_zero_tool_direct_answer_scope() {
         let direct_answer = crate::security::intent_classifier::InboundRoutingSignal {
             should_execute: false,
@@ -9902,6 +13515,150 @@ mod tests {
         assert!(
             agent_loop_action_scope_query("what should I notice?", &hints)
                 .contains("uploaded visual attachment")
+        );
+    }
+
+    #[test]
+    fn visual_attachment_analysis_uses_vision_action_from_metadata() {
+        let routing = crate::security::intent_classifier::InboundRoutingSignal {
+            should_execute: false,
+            tool_use_expected: false,
+            current_answer_expected: true,
+            goals: vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: "Answer from the attached visual evidence".to_string(),
+                capability_query: "Analyze attached visual evidence".to_string(),
+                expected_outcome: "Current chat answer grounded in the uploaded image".to_string(),
+                durability: "none".to_string(),
+                dependencies: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let hints = RequestExecutionHints {
+            routing: Some(routing.clone()),
+            attachments: vec![crate::core::ChatAttachmentHint {
+                upload_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                kind: "visual".to_string(),
+                content_type: Some("image/png".to_string()),
+                document_id: None,
+            }],
+            ..Default::default()
+        };
+        let actions = vec![
+            action(
+                "code_execute",
+                "Run code in a sandbox for scripts or computational work.",
+                &["code_execute"],
+            ),
+            vision_ocr_action(),
+        ];
+
+        let analysis = select_visual_attachment_analysis_action(&actions, &hints)
+            .expect("visual upload metadata should select the vision action");
+        let call = visual_attachment_analysis_call(&analysis, "describe the attached image");
+
+        assert_eq!(analysis.action.name, "vision_ocr");
+        assert!(visual_attachment_analysis_allows_final_answer(
+            Some(&routing),
+            None
+        ));
+        assert_eq!(call.name, "vision_ocr");
+        assert_eq!(
+            call.arguments
+                .get("upload_id")
+                .and_then(|value| value.as_str()),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(
+            call.arguments.get("task").and_then(|value| value.as_str()),
+            Some("answer_question")
+        );
+        assert_eq!(
+            call.arguments
+                .get("question")
+                .and_then(|value| value.as_str()),
+            Some("describe the attached image")
+        );
+    }
+
+    #[test]
+    fn visual_attachment_analysis_does_not_force_final_answer_for_durable_turn_plan() {
+        let routing = crate::security::intent_classifier::InboundRoutingSignal {
+            should_execute: true,
+            tool_use_expected: true,
+            current_answer_expected: true,
+            durable_work_expected: true,
+            goals: vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: "Create a durable artifact using attached visual context"
+                    .to_string(),
+                capability_query: "Generate and host an application artifact".to_string(),
+                expected_outcome: "Saved deployment".to_string(),
+                durability: "deployment".to_string(),
+                side_effect: "write".to_string(),
+                dependencies: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let hints = RequestExecutionHints {
+            routing: Some(routing.clone()),
+            attachments: vec![crate::core::ChatAttachmentHint {
+                upload_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                kind: "visual".to_string(),
+                content_type: Some("image/png".to_string()),
+                document_id: None,
+            }],
+            ..Default::default()
+        };
+        let actions = vec![vision_ocr_action(), app_delivery_action()];
+        let plan = turn_plan(goal("deployment"));
+        let analysis = select_visual_attachment_analysis_action(&actions, &hints)
+            .expect("visual uploads should still be analyzed before durable continuation");
+
+        assert_eq!(analysis.action.name, "vision_ocr");
+        assert!(!visual_attachment_analysis_allows_final_answer(
+            Some(&routing),
+            Some(&plan),
+        ));
+    }
+
+    #[test]
+    fn visual_attachment_scope_keeps_vision_available_when_code_scores_high() {
+        let hints = RequestExecutionHints {
+            attachments: vec![crate::core::ChatAttachmentHint {
+                upload_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                kind: "file".to_string(),
+                content_type: Some("image/png".to_string()),
+                document_id: None,
+            }],
+            ..Default::default()
+        };
+        let code_execute = action(
+            "code_execute",
+            "Run code in a sandbox for scripts or computational work.",
+            &["code_execute"],
+        );
+        let vision = vision_ocr_action();
+        let authorized = vec![code_execute.clone(), vision.clone()];
+        let authorized_map = authorized
+            .iter()
+            .map(|action| (action.name.clone(), action.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut scoped = vec![code_execute];
+
+        assert!(ensure_visual_attachment_action_for_scope(
+            &mut scoped,
+            &authorized_map,
+            &hints,
+        ));
+        assert_eq!(
+            scoped
+                .iter()
+                .map(|action| action.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["code_execute", "vision_ocr"]
         );
     }
 
@@ -10074,6 +13831,16 @@ mod tests {
     }
 
     #[test]
+    fn agent_loop_system_prompt_uses_request_scoped_capability_guidance() {
+        let prompt = agent_loop_system_prompt();
+
+        assert!(prompt.contains("Request-scoped active_guidance"));
+        assert!(prompt.contains("internal capability tags are active"));
+        assert!(!prompt.contains("Prefer `ark_inspect` with the `activity` surface"));
+        assert!(!prompt.contains("When delivering a generated app/site/dashboard"));
+    }
+
+    #[test]
     fn agent_loop_prompt_contains_semantic_followup_context_contract() {
         let prompt = agent_loop_system_prompt();
 
@@ -10125,6 +13892,7 @@ mod tests {
             &[],
             &[],
             0,
+            &crate::core::prompt_fragments::default_prompt_fragment_bundle(),
             &request_hints,
             None,
             true,
@@ -10138,24 +13906,20 @@ mod tests {
             payload["conversation_context"]["prior_context_included"],
             serde_json::Value::Bool(true)
         );
-        assert!(
-            payload["conversation_context"]["resolution_policy"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("self-contained")
-        );
+        assert!(payload["conversation_context"]["resolution_policy"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("self-contained"));
         assert_eq!(
             payload["conversation_context"]["recent_messages"]
                 .as_array()
                 .map(|items| items.len()),
             Some(2)
         );
-        assert!(
-            payload["selection_rules"]["conversation_context"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Do not ask the user to restate a clear referent")
-        );
+        assert!(payload["selection_rules"]["conversation_context"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Do not ask the user to restate a clear referent"));
     }
 
     #[test]
@@ -10192,6 +13956,7 @@ mod tests {
                 &["platform_observability"],
             )],
             65,
+            &crate::core::prompt_fragments::default_prompt_fragment_bundle(),
             &hints,
             None,
             false,
@@ -10225,6 +13990,7 @@ mod tests {
             &tool_history,
             &[],
             0,
+            &crate::core::prompt_fragments::default_prompt_fragment_bundle(),
             &RequestExecutionHints::default(),
             None,
             false,
@@ -10243,12 +14009,14 @@ mod tests {
         assert!(payload.get("current_state").is_none());
         assert!(payload["action_scope"].is_null());
         assert_eq!(payload["authorized_actions"].as_array().unwrap().len(), 0);
-        assert!(
-            payload["visualization_policy"]["inline_charts"]
+        assert!(payload["active_guidance"]["fragments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|fragment| fragment["body"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("agentark-chart")
-        );
+                .contains("agentark-chart")));
         assert!(prompt.chars().count() < 3_500);
     }
 
@@ -10258,7 +14026,7 @@ mod tests {
 
         assert!(prompt.contains("bounded read-only final-answer synthesizer"));
         assert!(prompt.contains("Do not call tools"));
-        assert!(prompt.contains("agentark-chart"));
+        assert!(prompt.contains("active_guidance"));
         assert!(!prompt.contains("generated app/site/dashboard"));
     }
 
@@ -10297,13 +14065,11 @@ mod tests {
             context.get("name").and_then(|value| value.as_str()),
             Some(crate::branding::PRODUCT_NAME)
         );
-        assert!(
-            context
-                .get("summary")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .contains("self-hosted personal AI Agent OS")
-        );
+        assert!(context
+            .get("summary")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("self-hosted personal AI Agent OS"));
     }
 
     #[test]
@@ -10639,6 +14405,82 @@ mod tests {
     }
 
     #[test]
+    fn structured_app_completion_formats_nested_app_data() {
+        let result = format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "app_restart",
+                "status": "restarted",
+                "detail": "internal app lifecycle result",
+                "data": {
+                    "app_id": "app-123",
+                    "title": "Research Monitor",
+                    "url": "/apps/app-123/",
+                    "port": 9100,
+                    "expose_public": false,
+                    "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT
+                }
+            })
+        );
+
+        let response = tool_result_grounded_response(&result);
+
+        assert!(response.contains("Research Monitor"));
+        assert!(response.contains("- Open: [/apps/app-123/](/apps/app-123/)."));
+        assert!(response.contains("- App ID: `app-123`."));
+        assert!(response.contains("- Verification:"));
+        assert!(response.contains("- Controls:"));
+        assert!(response.contains(crate::actions::app::APP_DEPLOY_CONTROL_HINT));
+        assert!(!response.contains("The action returned this result"));
+        assert!(!response.contains("internal app lifecycle result"));
+    }
+
+    #[test]
+    fn structured_app_inventory_formats_without_raw_json() {
+        let value = serde_json::json!({
+            "tool": "ark_inspect",
+            "status": "completed",
+            "apps": [
+                {
+                    "id": "app-123",
+                    "title": "Research Monitor",
+                    "status": "active",
+                    "url": "/apps/app-123/"
+                }
+            ]
+        });
+
+        let response = structured_tool_completion_response(&value);
+
+        assert!(response.contains("Deployed apps:"));
+        assert!(response.contains("Research Monitor"));
+        assert!(response.contains("/apps/app-123/"));
+        assert!(response.contains(crate::actions::app::APP_DEPLOY_CONTROL_HINT));
+        assert!(!response.contains("\"apps\""));
+    }
+
+    #[test]
+    fn app_delivery_result_detection_accepts_nested_app_result() {
+        let value = serde_json::json!({
+            "tool": "app_deploy",
+            "status": "completed",
+            "data": {
+                "services": [
+                    {
+                        "result": {
+                            "app_id": "app-123",
+                            "url": "/apps/app-123/"
+                        }
+                    }
+                ]
+            }
+        });
+
+        assert!(tool_output_has_app_delivery_result(&value));
+    }
+
+    #[test]
     fn structured_completion_fallback_hides_internal_watch_details() {
         let result = format!(
             "{}{}",
@@ -10794,6 +14636,143 @@ mod tests {
     }
 
     #[test]
+    fn execution_plan_adds_app_delivery_substeps_from_action_metadata() {
+        let app_deploy = app_delivery_action();
+        let mut actions = HashMap::new();
+        actions.insert(app_deploy.name.clone(), app_deploy);
+        let mut plan = turn_plan(goal("deployment"));
+        plan.goals[0].action_name = Some("app_deploy".to_string());
+
+        let execution_plan =
+            turn_plan_to_execution_plan_with_actions(Some(&plan), Some(&actions)).unwrap();
+
+        assert_eq!(execution_plan.steps.len(), 1);
+        assert_eq!(execution_plan.steps[0].substeps.len(), 8);
+        assert!(execution_plan_has_app_delivery_substeps(&execution_plan));
+        assert!(execution_plan.steps[0].substeps.iter().all(|substep| {
+            substep
+                .tool_hint
+                .as_deref()
+                .is_some_and(|hint| hint.starts_with("app_delivery:"))
+        }));
+    }
+
+    #[test]
+    fn execution_plan_does_not_add_app_delivery_substeps_for_integrations() {
+        let integration = integration_builder_action("integration_install");
+        let mut actions = HashMap::new();
+        actions.insert(integration.name.clone(), integration);
+        let mut plan = turn_plan(goal("connect integration"));
+        plan.goals[0].action_name = Some("integration_install".to_string());
+
+        let execution_plan =
+            turn_plan_to_execution_plan_with_actions(Some(&plan), Some(&actions)).unwrap();
+
+        assert!(!execution_plan_has_app_delivery_substeps(&execution_plan));
+        assert!(execution_plan_has_setup_substeps(&execution_plan));
+        assert!(execution_plan.steps[0].substeps.iter().all(|substep| {
+            substep
+                .tool_hint
+                .as_deref()
+                .is_some_and(|hint| hint.starts_with("capability_setup:"))
+        }));
+    }
+
+    #[test]
+    fn setup_delivery_scope_adds_low_cost_read_only_resolution_action() {
+        let integration = integration_builder_action("integration_install");
+        let search = search_action("docs_search");
+        let mut authorized_actions = HashMap::new();
+        authorized_actions.insert(integration.name.clone(), integration.clone());
+        authorized_actions.insert(search.name.clone(), search.clone());
+        let mut scoped_actions = vec![integration];
+
+        assert!(ensure_setup_resolution_action_for_scope(
+            &mut scoped_actions,
+            &authorized_actions
+        ));
+
+        assert!(scoped_actions.iter().any(
+            |action| action.name == search.name && action_is_setup_resolution_candidate(action)
+        ));
+    }
+
+    #[test]
+    fn setup_resolution_action_is_not_added_without_setup_delivery_scope() {
+        let search = search_action("docs_search");
+        let mut authorized_actions = HashMap::new();
+        authorized_actions.insert(search.name.clone(), search);
+        let mut scoped_actions = vec![app_lifecycle_action("app_restart")];
+
+        assert!(!ensure_setup_resolution_action_for_scope(
+            &mut scoped_actions,
+            &authorized_actions
+        ));
+
+        assert_eq!(scoped_actions.len(), 1);
+    }
+
+    #[test]
+    fn setup_resolution_action_is_not_duplicated_when_already_scoped() {
+        let integration = integration_builder_action("integration_install");
+        let search = search_action("docs_search");
+        let mut authorized_actions = HashMap::new();
+        authorized_actions.insert(integration.name.clone(), integration.clone());
+        authorized_actions.insert(search.name.clone(), search.clone());
+        let mut scoped_actions = vec![integration, search.clone()];
+
+        assert!(!ensure_setup_resolution_action_for_scope(
+            &mut scoped_actions,
+            &authorized_actions
+        ));
+
+        assert_eq!(
+            scoped_actions
+                .iter()
+                .filter(|action| action.name == search.name)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fallback_app_delivery_plan_requires_delivery_action_metadata() {
+        let lifecycle = app_lifecycle_action("app_restart");
+        let app_deploy = app_delivery_action();
+
+        assert!(app_delivery_execution_plan_from_scoped_actions(
+            "app_delivery:test".to_string(),
+            std::slice::from_ref(&lifecycle)
+        )
+        .is_none());
+        assert!(app_delivery_execution_plan_from_scoped_actions(
+            "app_delivery:test".to_string(),
+            &[lifecycle, app_deploy]
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn fallback_setup_plan_requires_setup_delivery_action_metadata() {
+        let lifecycle = app_lifecycle_action("app_restart");
+        let integration = integration_builder_action("integration_install");
+
+        assert!(setup_delivery_execution_plan_from_scoped_actions(
+            "capability_setup:test".to_string(),
+            std::slice::from_ref(&lifecycle)
+        )
+        .is_none());
+        let plan = setup_delivery_execution_plan_from_scoped_actions(
+            "capability_setup:test".to_string(),
+            &[lifecycle, integration],
+        )
+        .expect("setup action should create a fallback setup plan");
+
+        assert!(execution_plan_has_setup_substeps(&plan));
+        assert!(!execution_plan_has_app_delivery_substeps(&plan));
+    }
+
+    #[test]
     fn failed_tool_result_signature_tracks_identical_structured_failures() {
         let calls = vec![tool_call(
             "app_deploy",
@@ -10838,6 +14817,37 @@ mod tests {
             failed_tool_result_signature(&calls, &result),
             failed_tool_result_signature(&calls, &changed_result)
         );
+    }
+
+    #[test]
+    fn code_execute_nonretryable_failure_is_visible_to_agent_loop() {
+        let calls = vec![tool_call(
+            "code_execute",
+            serde_json::json!({
+                "language": "python",
+                "code": "raise SystemExit(1)"
+            }),
+        )];
+        let result = format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "code_execute",
+                "status": "failed",
+                "detail": "Code execution failed after bounded self-heal.",
+                "data": {
+                    "success": false,
+                    "retryable": false,
+                    "exit_code": 1,
+                    "self_heal_attempts": 1
+                }
+            })
+        );
+        let value = tool_result_value(&result);
+
+        assert_eq!(tool_result_completion_success(&result), Some(false));
+        assert!(!tool_output_is_retryable(&value));
+        assert!(failed_tool_result_signature(&calls, &result).is_some());
     }
 
     #[test]
@@ -11270,13 +15280,11 @@ mod tests {
             crate::core::planner::PlanStepStatus::Running
         );
         assert_eq!(plan.goals[0].action_name.as_deref(), Some("app_deploy"));
-        assert!(
-            plan.goals[0]
-                .reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains("app-hosting")
-        );
+        assert!(plan.goals[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("app-hosting"));
     }
 
     #[test]
@@ -11301,13 +15309,11 @@ mod tests {
             crate::core::planner::PlanStepStatus::Running
         );
         assert_eq!(plan.goals[0].action_name.as_deref(), Some("file_write"));
-        assert!(
-            plan.goals[0]
-                .reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains("staged")
-        );
+        assert!(plan.goals[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("staged"));
 
         update_turn_plan_for_action_result(
             Some(&mut plan),
@@ -11459,16 +15465,14 @@ mod tests {
             }),
         )];
 
-        assert!(
-            reject_calls_before_pending_app_delivery(
-                &calls,
-                &action_map,
-                Some(&plan),
-                &actions,
-                &HashMap::new(),
-            )
-            .is_none()
-        );
+        assert!(reject_calls_before_pending_app_delivery(
+            &calls,
+            &action_map,
+            Some(&plan),
+            &actions,
+            &HashMap::new(),
+        )
+        .is_none());
         assert!(tool_call_validation_issue(&calls[0], &app_deploy).is_none());
     }
 

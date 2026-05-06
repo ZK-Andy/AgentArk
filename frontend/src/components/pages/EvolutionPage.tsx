@@ -157,6 +157,245 @@ function backgroundImprovementReason(reason: string) {
   }
 }
 
+type ExperimentSurfaceItem = {
+  key: string;
+  name: string;
+  audienceLabel: string;
+  summary: string;
+  benefit: string;
+  stableSummary: string;
+  enabled: boolean;
+  rollout: number;
+  baseline: string;
+  candidate: string;
+  gate: string;
+  last: string;
+  metrics: JsonRecord[];
+  canaryState: JsonRecord;
+  primaryMetricLabel: string;
+  replayGateReasons: JsonRecord[];
+};
+
+type ExperimentMetricSummary = {
+  label: string;
+  value: string;
+  helper: string;
+  tone?: "default" | "good" | "warn" | "info";
+};
+
+function finiteNumber(value: unknown): number | null {
+  const parsed = num(value, Number.NaN);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function findVersionMetric(rows: JsonRecord[], version: string): JsonRecord | null {
+  const target = version.trim();
+  if (!target || target === "-") return null;
+  return (
+    rows.find((row) => str(row.version, "").trim() === target) ?? null
+  );
+}
+
+function findMatchingCanarySafetyEvent(
+  rows: JsonRecord[],
+  item: ExperimentSurfaceItem,
+): JsonRecord | null {
+  const candidate = item.candidate.trim();
+  const baseline = item.baseline.trim();
+  if (!candidate || candidate === "-") return null;
+  return (
+    rows.find((row) => {
+      const rowCandidate = str(row.candidate_version, "").trim();
+      if (rowCandidate !== candidate) return false;
+      const rowBaseline = str(row.baseline_version, "").trim();
+      return !baseline || baseline === "-" || !rowBaseline || rowBaseline === baseline;
+    }) ?? null
+  );
+}
+
+function formatSampleCount(value: number | null): string {
+  if (value == null) return "No samples yet";
+  const count = Math.max(0, Math.round(value));
+  return `${count.toLocaleString()} sample${count === 1 ? "" : "s"}`;
+}
+
+function formatPercentRatio(value: number | null, digits = 1): string {
+  if (value == null) return "-";
+  return percentageLabel(value, digits) || "-";
+}
+
+function formatLatencyMs(value: unknown): string {
+  const parsed = finiteNumber(value);
+  if (parsed == null) return "";
+  if (parsed >= 1000) {
+    const seconds = parsed / 1000;
+    return `${seconds >= 10 ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+  }
+  return `${Math.round(parsed).toLocaleString()}ms`;
+}
+
+function promotionGateSummary(data: JsonRecord): string {
+  const report = asRecord(data.promotion_gate_report);
+  return (
+    str(report.summary, "").trim() ||
+    str(data.promotion_gate_summary, "").trim() ||
+    str(data.promotion_gate, "").trim()
+  );
+}
+
+function replayGateReasonLabels(item: ExperimentSurfaceItem): string[] {
+  return item.replayGateReasons
+    .map((reason) => str(reason.label, "").trim())
+    .filter(Boolean);
+}
+
+function buildExperimentMetricSummaries(
+  item: ExperimentSurfaceItem,
+  safetyEvent: JsonRecord | null,
+): ExperimentMetricSummary[] {
+  const baselineMetric = findVersionMetric(item.metrics, item.baseline);
+  const candidateMetric = findVersionMetric(item.metrics, item.candidate);
+  const baselineSuccess =
+    finiteNumber(safetyEvent?.baseline_success_rate) ??
+    finiteNumber(baselineMetric?.success_rate);
+  const candidateSuccess =
+    finiteNumber(safetyEvent?.candidate_success_rate) ??
+    finiteNumber(candidateMetric?.success_rate);
+  const successDelta =
+    finiteNumber(safetyEvent?.success_delta) ??
+    (baselineSuccess != null && candidateSuccess != null
+      ? candidateSuccess - baselineSuccess
+      : null);
+  const baselineSamples =
+    finiteNumber(safetyEvent?.baseline_samples) ??
+    finiteNumber(baselineMetric?.samples);
+  const candidateSamples =
+    finiteNumber(safetyEvent?.candidate_samples) ??
+    finiteNumber(candidateMetric?.samples);
+  const baselineError = finiteNumber(baselineMetric?.error_rate);
+  const candidateError = finiteNumber(candidateMetric?.error_rate);
+  const baselineLatency = formatLatencyMs(baselineMetric?.p95_latency_ms);
+  const candidateLatency = formatLatencyMs(candidateMetric?.p95_latency_ms);
+  const cards: ExperimentMetricSummary[] = [
+    {
+      label: "Measures",
+      value: item.primaryMetricLabel,
+      helper:
+        successDelta != null
+          ? `${evolutionGainLabel(successDelta)} versus stable`
+          : "Comparing the candidate with stable behavior",
+      tone:
+        successDelta == null
+          ? "info"
+          : successDelta >= 0
+            ? "good"
+            : "warn",
+    },
+    {
+      label: "Stable",
+      value: formatPercentRatio(baselineSuccess),
+      helper: formatSampleCount(baselineSamples),
+    },
+    {
+      label: "Experiment",
+      value: formatPercentRatio(candidateSuccess),
+      helper: formatSampleCount(candidateSamples),
+      tone:
+        successDelta == null
+          ? "default"
+          : successDelta >= 0
+            ? "good"
+            : "warn",
+    },
+  ];
+  if (successDelta != null) {
+    cards.push({
+      label: "Difference",
+      value: evolutionGainLabel(successDelta),
+      helper: "Higher success is better",
+      tone: successDelta >= 0 ? "good" : "warn",
+    });
+  } else if (baselineSamples != null || candidateSamples != null) {
+    cards.push({
+      label: "Samples",
+      value: `${Math.round(baselineSamples ?? 0).toLocaleString()} / ${Math.round(
+        candidateSamples ?? 0,
+      ).toLocaleString()}`,
+      helper: "Stable / experiment",
+    });
+  }
+  if (baselineError != null || candidateError != null) {
+    cards.push({
+      label: "Error rate",
+      value: formatPercentRatio(candidateError),
+      helper: `Stable ${formatPercentRatio(baselineError)}`,
+      tone:
+        baselineError != null && candidateError != null && candidateError <= baselineError
+          ? "good"
+          : "default",
+    });
+  }
+  if (baselineLatency || candidateLatency) {
+    cards.push({
+      label: "p95 latency",
+      value: candidateLatency || "-",
+      helper: `Stable ${baselineLatency || "-"}`,
+    });
+  }
+  return cards.slice(0, 6);
+}
+
+function experimentStageText(
+  item: ExperimentSurfaceItem,
+  safetyEvent: JsonRecord | null,
+): string {
+  const reviewStatus = str(safetyEvent?.review_status, "").trim();
+  if (reviewStatus === "open" || reviewStatus === "review_recommended") {
+    return "Needs decision";
+  }
+  if (reviewStatus) return humanizeStatusLabel(reviewStatus);
+  const gate = item.gate.trim();
+  if (gate && gate !== "-") {
+    return gate === "passed" ? "Gate passed" : "Evaluating gate";
+  }
+  const candidateSamples = finiteNumber(
+    findVersionMetric(item.metrics, item.candidate)?.samples,
+  );
+  const minSamples = finiteNumber(item.canaryState.min_samples_per_version);
+  if (candidateSamples != null && minSamples != null && candidateSamples < minSamples) {
+    return "Collecting samples";
+  }
+  return "Testing candidate";
+}
+
+function experimentGuardrailText(item: ExperimentSurfaceItem): string {
+  const minSamples = finiteNumber(item.canaryState.min_samples_per_version);
+  const minGain = finiteNumber(item.canaryState.min_success_gain);
+  const maxP = finiteNumber(item.canaryState.max_sign_test_p_value);
+  const rules = [
+    minSamples != null && minSamples > 0
+      ? `${Math.round(minSamples).toLocaleString()} samples per version`
+      : "",
+    minGain != null ? `${evolutionGainLabel(minGain)} minimum success lift` : "",
+    maxP != null ? `p <= ${maxP.toFixed(2)} sign test` : "",
+  ].filter(Boolean);
+  if (rules.length === 0) {
+    return "Guardrail: candidate stays limited until evidence shows it is safe.";
+  }
+  return `Guardrail: promotion needs ${rules.join(", ")}.`;
+}
+
+function experimentLastActivityText(
+  item: ExperimentSurfaceItem,
+  safetyEvent: JsonRecord | null,
+): string {
+  const eventAt = str(safetyEvent?.created_at, "").trim();
+  if (eventAt) return `Safety check ${humanTs(eventAt).label}`;
+  const activatedAt = str(item.canaryState.activated_at, "").trim();
+  if (activatedAt) return `Started ${humanTs(activatedAt).label}`;
+  return "Waiting for the first recorded run";
+}
+
 export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<EvolutionPageTab>("what");
@@ -238,6 +477,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const strategyCanary = asRecord(evolution.strategy_canary);
   const promptCanary = asRecord(evolution.prompt_canary);
   const specialistCanary = asRecord(evolution.specialist_prompt_canary);
+  const promptFragmentCanary = asRecord(evolution.prompt_fragment_canary);
   const learningQueue = asRecord(evolution.learning_queue);
   const gepaReadiness = asRecord(evolution.gepa_readiness);
   const gepaBudget = asRecord(gepaReadiness.budget);
@@ -282,7 +522,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const latestGepaImportSummary = asRecord(latestGepaImport.summary);
   const latestGepaCandidateCount =
     num(latestGepaImportSummary.prompt_candidates, 0) +
-    num(latestGepaImportSummary.specialist_prompt_candidates, 0);
+    num(latestGepaImportSummary.specialist_prompt_candidates, 0) +
+    num(latestGepaImportSummary.prompt_fragment_candidates, 0);
   const gepaAutoReason = str(gepaAutoState.last_reason, "");
   const gepaEvidenceSamples = num(gepaAutoState.last_evidence_samples, 0);
   const backgroundImprovementPaused = !toBool(evolution.self_evolve_enabled);
@@ -322,11 +563,27 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     evolutionDev.classifier_prompt_insights ?? evolutionDev.classifier_insights,
   );
   const specialistInsights = asRecord(evolutionDev.specialist_prompt_insights);
+  const promptFragmentInsights = asRecord(
+    evolutionDev.prompt_fragment_insights,
+  );
+  const policyMetrics = pickRecords(evolutionDev, "policy_metrics");
   const strategyMetrics = pickRecords(evolutionDev, "strategy_metrics");
   const promptMetrics = pickRecords(evolutionDev, "prompt_metrics");
   const specialistMetrics = pickRecords(
     evolutionDev,
     "specialist_prompt_metrics",
+  );
+  const promptFragmentMetrics = pickRecords(
+    evolutionDev,
+    "prompt_fragment_metrics",
+  );
+  const routingCanaryState = asRecord(evolutionDev.canary_state);
+  const promptCanaryState = asRecord(evolutionDev.prompt_canary_state);
+  const specialistPromptCanaryState = asRecord(
+    evolutionDev.specialist_prompt_canary_state,
+  );
+  const promptFragmentCanaryState = asRecord(
+    evolutionDev.prompt_fragment_canary_state,
   );
   const promptCanarySafetyEvents = pickRecords(
     evolutionDev,
@@ -387,6 +644,13 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         gain: row.score_gain,
       }),
     ),
+    ...pickRecords(evolutionDev, "prompt_fragment_lineage_recent").map(
+      (row): JsonRecord => ({
+        ...row,
+        surface: "Prompt fragments",
+        gain: row.score_gain,
+      }),
+    ),
     ...pickRecords(evolutionDev, "lineage_recent").map(
       (row): JsonRecord => ({
         ...row,
@@ -401,7 +665,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const confirmedRecentChangeCount =
     confirmedLineageRows.length + skillHelpedItems.length;
 
-  const tests = [
+  const tests: ExperimentSurfaceItem[] = [
     {
       key: "routing",
       name: "Routing policy",
@@ -414,10 +678,14 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       baseline: str(canary.baseline_version, "routing-policy-default-v1"),
       candidate: str(canary.candidate_version, "-"),
       gate: str(evolution.replay_gate_result, "-"),
+      replayGateReasons: pickRecords(evolution, "replay_gate_reasons"),
       last: str(
         evolution.last_promotion_result,
         "No routing-policy promotion yet",
       ),
+      metrics: policyMetrics,
+      canaryState: routingCanaryState,
+      primaryMetricLabel: "Task success rate",
     },
     {
       key: "prompt",
@@ -431,10 +699,14 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       baseline: str(promptCanary.baseline_version, "-"),
       candidate: str(promptCanary.candidate_version, "-"),
       gate: str(evolution.prompt_replay_gate_result, "-"),
+      replayGateReasons: pickRecords(evolution, "prompt_replay_gate_reasons"),
       last: str(
         evolution.prompt_last_promotion_result,
         "No prompt promotion yet",
       ),
+      metrics: promptMetrics,
+      canaryState: promptCanaryState,
+      primaryMetricLabel: "Reply success rate",
     },
     {
       key: "specialist",
@@ -448,10 +720,35 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       baseline: str(specialistCanary.baseline_version, "-"),
       candidate: str(specialistCanary.candidate_version, "-"),
       gate: str(evolution.specialist_prompt_replay_gate_result, "-"),
+      replayGateReasons: pickRecords(evolution, "specialist_prompt_replay_gate_reasons"),
       last: str(
         evolution.specialist_prompt_last_promotion_result,
         "No specialist promotion yet",
       ),
+      metrics: specialistMetrics,
+      canaryState: specialistPromptCanaryState,
+      primaryMetricLabel: "Delegated work success",
+    },
+    {
+      key: "prompt-fragments",
+      name: "Prompt fragments",
+      audienceLabel: evolutionSurfaceAudienceLabel("Prompt fragments"),
+      summary: evolutionSurfaceSummary("Prompt fragments"),
+      benefit: evolutionSurfaceBenefit("Prompt fragments"),
+      stableSummary: evolutionSurfaceStableSummary("Prompt fragments"),
+      enabled: toBool(promptFragmentCanary.enabled),
+      rollout: clampPercent(promptFragmentCanary.rollout_percent),
+      baseline: str(promptFragmentCanary.baseline_version, "-"),
+      candidate: str(promptFragmentCanary.candidate_version, "-"),
+      gate: str(evolution.prompt_fragment_replay_gate_result, "-"),
+      replayGateReasons: pickRecords(evolution, "prompt_fragment_replay_gate_reasons"),
+      last: str(
+        evolution.prompt_fragment_last_promotion_result,
+        "No prompt fragment promotion yet",
+      ),
+      metrics: promptFragmentMetrics,
+      canaryState: promptFragmentCanaryState,
+      primaryMetricLabel: "Prompted turn success",
     },
   ];
   const activeExperimentItems = tests.filter((item) => item.enabled);
@@ -469,6 +766,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     }),
     ...stringList(promptInsights.summary),
     ...stringList(specialistInsights.summary),
+    ...stringList(promptFragmentInsights.summary),
   ];
   const metricRows: JsonRecord[] = [
     ...promptMetrics
@@ -480,6 +778,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     ...specialistMetrics
       .slice(0, 3)
       .map((row): JsonRecord => ({ ...row, surface: "Specialist" })),
+    ...promptFragmentMetrics
+      .slice(0, 3)
+      .map((row): JsonRecord => ({ ...row, surface: "Prompt fragments" })),
   ];
   const metricChartRows = metricRows.slice(0, 10);
   const experienceGraphOption = useMemo(() => {
@@ -723,7 +1024,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const lastRoutingOptimization = asRecord(evolutionDev.last_result);
   const lastRoutingPromoted = toBool(lastRoutingOptimization.promoted);
   const lastRoutingMode = str(lastRoutingOptimization.promotion_mode, "none");
-  const lastRoutingGate = str(lastRoutingOptimization.promotion_gate, "");
+  const lastRoutingGate = promotionGateSummary(lastRoutingOptimization);
   const lastRoutingAccuracyGain = num(
     lastRoutingOptimization.accuracy_gain,
     Number.NaN,
@@ -897,6 +1198,275 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               </Typography>
             </Stack>
           </Box>
+          {activeExperimentItems.length > 0 ? (
+            <Box className="list-shell" sx={{ p: 1.5 }}>
+              <Stack spacing={1.25}>
+                <Stack
+                  direction={{ xs: "column", md: "row" }}
+                  spacing={1}
+                  sx={{
+                    alignItems: { xs: "flex-start", md: "center" },
+                    justifyContent: "space-between",
+                  }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography
+                      variant="subtitle1"
+                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                    >
+                      Active experiment{activeExperimentItems.length === 1 ? "" : "s"}
+                    </Typography>
+                    <Typography
+                      variant="body2"
+                      sx={{ color: "text.secondary", mt: 0.25, lineHeight: 1.55 }}
+                    >
+                      Live canary evidence from stable and candidate versions.
+                    </Typography>
+                  </Box>
+                  <Chip
+                    size="small"
+                    color="warning"
+                    label={`${maxRollout.toFixed(0)}% max rollout`}
+                  />
+                </Stack>
+                {detailError ? (
+                  <Alert severity="warning" sx={{ borderRadius: 1 }}>
+                    Run metrics are unavailable: {detailError}
+                  </Alert>
+                ) : null}
+                {detailLoading ? (
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{ alignItems: "center", color: "text.secondary" }}
+                  >
+                    <CircularProgress size={16} />
+                    <Typography variant="body2">Refreshing experiment metrics...</Typography>
+                  </Stack>
+                ) : null}
+                {activeExperimentItems.map((item, idx) => {
+                  const safetyEvent = findMatchingCanarySafetyEvent(
+                    promptCanarySafetyEvents,
+                    item,
+                  );
+                  const metricSummaries = buildExperimentMetricSummaries(
+                    item,
+                    safetyEvent,
+                  );
+                  const stage = experimentStageText(item, safetyEvent);
+                  const reviewStatus = str(safetyEvent?.review_status, "").trim();
+                  const needsDecision =
+                    reviewStatus === "open" ||
+                    reviewStatus === "review_recommended";
+                  const reasonLabels = replayGateReasonLabels(item);
+                  return (
+                    <Box
+                      key={`active-experiment-${item.key}`}
+                      sx={{
+                        pt: idx === 0 ? 0 : 1.25,
+                        borderTop:
+                          idx === 0
+                            ? "none"
+                            : "1px solid var(--ui-rgba-145-170-205-120)",
+                      }}
+                    >
+                      <Stack spacing={1.15}>
+                        <Stack
+                          direction={{ xs: "column", lg: "row" }}
+                          spacing={1}
+                          sx={{
+                            alignItems: { xs: "flex-start", lg: "center" },
+                            justifyContent: "space-between",
+                          }}
+                        >
+                          <Box sx={{ minWidth: 0 }}>
+                            <Stack
+                              direction="row"
+                              spacing={0.75}
+                              useFlexGap
+                              sx={{ alignItems: "center", flexWrap: "wrap" }}
+                            >
+                              <Typography
+                                variant="h6"
+                                sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                              >
+                                {item.audienceLabel}
+                              </Typography>
+                              <Chip size="small" color="warning" label={stage} />
+                              <Chip size="small" label={item.name} />
+                            </Stack>
+                            <Typography
+                              variant="body2"
+                              sx={{ color: "text.secondary", mt: 0.45, lineHeight: 1.6 }}
+                            >
+                              {item.summary}
+                            </Typography>
+                          </Box>
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            sx={{ flexShrink: 0, alignItems: "center" }}
+                          >
+                            <Button
+                              size="small"
+                              variant={needsDecision ? "contained" : "outlined"}
+                              onClick={() => {
+                                setShowArkEvolveInternals(true);
+                                setTab(needsDecision ? "review" : "tests");
+                              }}
+                            >
+                              {needsDecision ? "Review decision" : "View details"}
+                            </Button>
+                          </Stack>
+                        </Stack>
+                        <Box
+                          sx={{
+                            display: "grid",
+                            gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1fr) 260px" },
+                            gap: 1.25,
+                            alignItems: "start",
+                          }}
+                        >
+                          <Stack spacing={1}>
+                            <Box
+                              sx={{
+                                display: "grid",
+                                gridTemplateColumns: {
+                                  xs: "1fr 1fr",
+                                  md: "repeat(3, minmax(0, 1fr))",
+                                  xl: "repeat(6, minmax(0, 1fr))",
+                                },
+                                gap: 0.75,
+                              }}
+                            >
+                              {metricSummaries.map((metric) => {
+                                const valueColor =
+                                  metric.tone === "good"
+                                    ? "#8ee3b1"
+                                    : metric.tone === "warn"
+                                      ? "#ffd180"
+                                      : "#e8f4ff";
+                                return (
+                                  <Box
+                                    key={`${item.key}-${metric.label}`}
+                                    sx={{
+                                      minWidth: 0,
+                                      p: 1,
+                                      border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                      borderRadius: 1,
+                                      bgcolor: "rgba(8, 14, 24, 0.38)",
+                                    }}
+                                  >
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: "text.secondary",
+                                        display: "block",
+                                        lineHeight: 1.35,
+                                      }}
+                                    >
+                                      {metric.label}
+                                    </Typography>
+                                    <Typography
+                                      variant="body2"
+                                      sx={{
+                                        color: valueColor,
+                                        fontWeight: 700,
+                                        mt: 0.2,
+                                        overflowWrap: "anywhere",
+                                        fontVariantNumeric: "tabular-nums",
+                                      }}
+                                    >
+                                      {metric.value}
+                                    </Typography>
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: "text.secondary",
+                                        display: "block",
+                                        mt: 0.25,
+                                        lineHeight: 1.35,
+                                        overflowWrap: "anywhere",
+                                      }}
+                                    >
+                                      {metric.helper}
+                                    </Typography>
+                                  </Box>
+                                );
+                              })}
+                            </Box>
+                            <Box
+                              sx={{
+                                display: "grid",
+                                gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
+                                gap: 1,
+                              }}
+                            >
+                              <Box sx={{ minWidth: 0 }}>
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "text.secondary", display: "block" }}
+                                >
+                                  Why it could help
+                                </Typography>
+                                <Typography
+                                  variant="body2"
+                                  sx={{ color: "#d8edff", lineHeight: 1.55 }}
+                                >
+                                  {item.benefit}
+                                </Typography>
+                              </Box>
+                              <Box sx={{ minWidth: 0 }}>
+                                <Typography
+                                  variant="caption"
+                                  sx={{ color: "text.secondary", display: "block" }}
+                                >
+                                  Last activity
+                                </Typography>
+                                <Typography
+                                  variant="body2"
+                                  sx={{ color: "#d8edff", lineHeight: 1.55 }}
+                                >
+                                  {experimentLastActivityText(item, safetyEvent)}
+                                </Typography>
+                              </Box>
+                            </Box>
+                            <Typography
+                              variant="body2"
+                              sx={{ color: "text.secondary", lineHeight: 1.55 }}
+                            >
+                              {experimentGuardrailText(item)}
+                            </Typography>
+                            {reasonLabels.length > 0 ? (
+                              <Box
+                                component="ul"
+                                sx={{ pl: 2.25, m: 0, color: "text.secondary" }}
+                              >
+                                {reasonLabels.map((label, reasonIdx) => (
+                                  <Typography
+                                    key={`${item.key}-replay-reason-${reasonIdx}`}
+                                    component="li"
+                                    variant="body2"
+                                    sx={{ lineHeight: 1.5 }}
+                                  >
+                                    {label}
+                                  </Typography>
+                                ))}
+                              </Box>
+                            ) : null}
+                          </Stack>
+                          <EvolutionRolloutBar
+                            label="Traffic in experiment"
+                            percent={item.rollout}
+                          />
+                        </Box>
+                      </Stack>
+                    </Box>
+                  );
+                })}
+              </Stack>
+            </Box>
+          ) : null}
           <Accordion
             disableGutters
             sx={{
@@ -934,7 +1504,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           {
             label: "Improvement mode",
             value: toBool(evolution.self_evolve_enabled) ? "On" : "Off",
-            helper: "Learns in the background and asks before lasting changes",
+            helper: "Learns quietly · asks before lasting changes",
             tone: toBool(evolution.self_evolve_enabled) ? "good" : "default",
           },
           {
@@ -942,8 +1512,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             value: activeTests,
             helper:
               activeTests > 0
-                ? `${maxRollout.toFixed(0)}% of recent traffic in test`
-                : "No active rollout",
+                ? `${maxRollout.toFixed(0)}% of traffic in test`
+                : "Nothing running",
             tone: activeTests > 0 ? "warn" : "info",
           },
           {
@@ -951,157 +1521,19 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             value: needsApprovalCount,
             helper:
               needsApprovalCount > 0
-                ? "Meaningful changes are waiting on you"
-                : "Nothing is waiting on you",
-            tone: needsApprovalCount > 0 ? "warn" : "default",
-          },
-          {
-            label: "Reusable lessons",
-            value: num(learningQueue.active_patterns, 0),
-            helper: showArkEvolveInternals
-              ? `${reflectedHeuristics.length} internal heuristics captured`
-              : "Shown after measurable impact",
-            tone: "info",
-          },
-          {
-            label: "Confirmed changes",
-            value: promotedChangeCount,
-            helper:
-              promotedChangeCount > 0
-                ? "Measured improvements that stuck"
-                : "No permanent improvements yet",
+                ? "Waiting on you"
+                : promotedChangeCount > 0
+                  ? `${promotedChangeCount} confirmed so far`
+                  : "Nothing waiting",
             tone:
-              promotedChangeCount > 0
-                ? "good"
-                : needsApprovalCount > 0
-                  ? "warn"
+              needsApprovalCount > 0
+                ? "warn"
+                : promotedChangeCount > 0
+                  ? "good"
                   : "default",
           },
         ]}
       />
-      <Box className="list-shell" sx={{ p: 1.25 }}>
-        <Stack spacing={1.15}>
-          <Box sx={{ minWidth: 0 }}>
-            <Typography
-              variant="subtitle1"
-              sx={{ color: "#e8f4ff", fontWeight: 700 }}
-            >
-              Improve AgentArk
-            </Typography>
-            <Typography
-              variant="body2"
-              sx={{ color: "text.secondary", mt: 0.25 }}
-            >
-              Learn from corrected or slow turns, test safer behavior on a
-              small rollout, then approve or roll back from here.
-            </Typography>
-          </Box>
-          <Box
-            sx={{
-              display: "grid",
-              gridTemplateColumns: {
-                xs: "1fr",
-                md: "repeat(4, minmax(0, 1fr))",
-              },
-              borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
-            }}
-          >
-            {[
-              {
-                label: "1. Learn",
-                value: toBool(evolution.self_evolve_enabled)
-                  ? "Watching completed work"
-                  : "Paused",
-                helper: "Corrections, failures, tools, memory, and context are saved as evidence.",
-              },
-              {
-                label: "2. Optimize",
-                value: runEvolutionActionMutation.isPending
-                  ? "Checking"
-                  : lastRoutingSummary,
-                helper: Number.isFinite(lastRoutingAccuracyGain)
-                  ? `Last measured accuracy change: ${evolutionGainLabel(
-                      lastRoutingAccuracyGain,
-                    )}.`
-                  : "Accuracy must improve before speed or cost savings matter.",
-              },
-              {
-                label: "3. Test safely",
-                value: hasActiveRoutingCanary
-                  ? `${clampPercent(canary.rollout_percent).toFixed(0)}% rollout`
-                  : "No live routing test",
-                helper: hasActiveRoutingCanary
-                  ? "Only a small share of turns sees the candidate while evidence builds."
-                  : "New candidates stay inactive until they pass gates.",
-              },
-              {
-                label: "4. Decide",
-                value:
-                  needsApprovalCount > 0
-                    ? `${needsApprovalCount} item${needsApprovalCount === 1 ? "" : "s"} waiting`
-                    : routingRollbackAvailable
-                      ? "Rollback ready"
-                      : "Nothing waiting",
-                helper:
-                  needsApprovalCount > 0
-                    ? "Approve only when the evidence looks right, or reject it."
-                    : routingRollbackAvailable
-                      ? "The last stable routing change has a saved restore point."
-                      : "A rollback restore point appears after a routing change is tested.",
-              },
-            ].map((item, idx) => (
-              <Box
-                key={item.label}
-                sx={{
-                  py: 1,
-                  px: { xs: 0, md: 1.1 },
-                  pr: idx === 3 ? 0 : { xs: 0, md: 1.1 },
-                  borderRight:
-                    idx === 3
-                      ? "none"
-                      : {
-                          xs: "none",
-                          md: "1px solid var(--ui-rgba-145-170-205-120)",
-                        },
-                }}
-              >
-                <Typography
-                  variant="caption"
-                  sx={{
-                    color: "text.secondary",
-                    display: "block",
-                    textTransform: "uppercase",
-                    letterSpacing: 0,
-                  }}
-                >
-                  {item.label}
-                </Typography>
-                <Typography
-                  variant="body2"
-                  sx={{
-                    color: "#e8f4ff",
-                    fontWeight: 650,
-                    mt: 0.2,
-                    wordBreak: "break-word",
-                  }}
-                >
-                  {item.value}
-                </Typography>
-                <Typography
-                  variant="caption"
-                  sx={{
-                    color: "text.secondary",
-                    display: "block",
-                    mt: 0.25,
-                  }}
-                >
-                  {item.helper}
-                </Typography>
-              </Box>
-            ))}
-          </Box>
-        </Stack>
-      </Box>
       <Box className="list-shell" sx={{ p: 1.25 }}>
         <Stack spacing={1.15}>
           <Stack
@@ -2374,8 +2806,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     </Typography>
                     <Typography variant="body2" sx={{ color: "text.secondary" }}>
                       ArkEvolve is using the current stable behavior across reply
-                      routing, main replies, request understanding, and
-                      specialist helpers.
+                      routing, main replies, adaptive prompt guidance, request
+                      understanding, and specialist helpers.
                     </Typography>
                   </Box>
                   <Chip size="small" label="Stable" />
@@ -2389,7 +2821,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             </Box>
           ) : (
             <Grid2 container spacing={1.5}>
-              {activeExperimentItems.map((item) => (
+              {activeExperimentItems.map((item) => {
+                const reasonLabels = replayGateReasonLabels(item);
+                return (
                 <Grid2 key={item.key} size={{ xs: 12, lg: 6 }}>
                   <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
                     <Stack spacing={1.15}>
@@ -2447,8 +2881,94 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                           <Typography variant="body2">
                             {evolutionExperimentStatusText(item)}
                           </Typography>
+                          {reasonLabels.length > 0 ? (
+                            <Box component="ul" sx={{ pl: 2.25, mt: 0.5, mb: 0 }}>
+                              {reasonLabels.map((label, reasonIdx) => (
+                                <Typography
+                                  key={`${item.key}-tests-reason-${reasonIdx}`}
+                                  component="li"
+                                  variant="body2"
+                                  sx={{ color: "text.secondary", lineHeight: 1.5 }}
+                                >
+                                  {label}
+                                </Typography>
+                              ))}
+                            </Box>
+                          ) : null}
                         </Box>
                       </Box>
+                      {(() => {
+                        const metricSummaries = buildExperimentMetricSummaries(item, null);
+                        if (metricSummaries.length === 0) return null;
+                        return (
+                          <Box
+                            sx={{
+                              display: "grid",
+                              gridTemplateColumns: {
+                                xs: "1fr 1fr",
+                                md: "repeat(4, minmax(0, 1fr))",
+                              },
+                              gap: 0.75,
+                            }}
+                          >
+                            {metricSummaries.map((metric) => {
+                              const valueColor =
+                                metric.tone === "good"
+                                  ? "#8ee3b1"
+                                  : metric.tone === "warn"
+                                    ? "#ffd180"
+                                    : "#e8f4ff";
+                              return (
+                                <Box
+                                  key={`${item.key}-tests-${metric.label}`}
+                                  sx={{
+                                    minWidth: 0,
+                                    p: 1,
+                                    border: "1px solid var(--ui-rgba-145-170-205-120)",
+                                    borderRadius: 1,
+                                    bgcolor: "rgba(8, 14, 24, 0.38)",
+                                  }}
+                                >
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "block",
+                                      lineHeight: 1.35,
+                                    }}
+                                  >
+                                    {metric.label}
+                                  </Typography>
+                                  <Typography
+                                    variant="body2"
+                                    sx={{
+                                      color: valueColor,
+                                      fontWeight: 700,
+                                      mt: 0.2,
+                                      wordBreak: "break-word",
+                                    }}
+                                  >
+                                    {metric.value}
+                                  </Typography>
+                                  {metric.helper ? (
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: "text.secondary",
+                                        display: "block",
+                                        mt: 0.25,
+                                        lineHeight: 1.4,
+                                      }}
+                                    >
+                                      {metric.helper}
+                                    </Typography>
+                                  ) : null}
+                                </Box>
+                              );
+                            })}
+                          </Box>
+                        );
+                      })()}
                       <Accordion disableGutters className="chat-workspace-section">
                         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                           <Typography variant="body2">Technical details</Typography>
@@ -2500,7 +3020,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     </Stack>
                   </Box>
                 </Grid2>
-              ))}
+                );
+              })}
             </Grid2>
           )}
           {developerModeEnabled && stableExperimentItems.length > 0 ? (

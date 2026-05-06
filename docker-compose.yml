@@ -57,6 +57,38 @@ services:
         else
           echo "Reusing existing Postgres password from agentark-secrets volume."
         fi
+        if [ ! -s /run/secrets/agentark_master_key ]; then
+          head -c 32 /dev/urandom | od -An -tx1 | tr -d '[:space:]' > /run/secrets/agentark_master_key
+          chmod 0444 /run/secrets/agentark_master_key
+          echo "Generated AgentArk encryption master secret in agentark-secrets volume."
+        else
+          chmod 0444 /run/secrets/agentark_master_key
+          echo "Reusing existing AgentArk encryption master secret from agentark-secrets volume."
+        fi
+        sync_agentark_postgres_password() {
+          (
+            set +e
+            pg_user="$${POSTGRES_USER:-agentark}"
+            pg_db="$${POSTGRES_DB:-agentark}"
+            for _ in $(seq 1 120); do
+              if pg_isready -q -U "$$pg_user" -d "$$pg_db" >/dev/null 2>&1; then
+                pg_pw="$$(cat /run/secrets/pg_pw 2>/dev/null)"
+                if [ -n "$$pg_pw" ]; then
+                  gosu postgres psql -v ON_ERROR_STOP=1 -U "$$pg_user" -d "$$pg_db" -v role="$$pg_user" -v password="$$pg_pw" >/dev/null 2>&1 <<'SQL'
+        SELECT format('ALTER ROLE %I WITH LOGIN PASSWORD %L', :'role', :'password') \gexec
+        SQL
+                  if [ "$$?" -eq 0 ]; then
+                    echo "Synchronized Postgres role password with agentark-secrets volume."
+                    exit 0
+                  fi
+                fi
+              fi
+              sleep 1
+            done
+            echo "WARNING: Postgres role password could not be synchronized with agentark-secrets volume." >&2
+          ) &
+        }
+        sync_agentark_postgres_password
         exec docker-entrypoint.sh "$0" "$@"
     command:
       - postgres
@@ -81,7 +113,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U ${AGENTARK_POSTGRES_USER:-agentark} -d ${AGENTARK_POSTGRES_DB:-agentark}",
+          "PGPASSWORD=\"$$(cat /run/secrets/pg_pw)\" psql -h 127.0.0.1 -U ${AGENTARK_POSTGRES_USER:-agentark} -d ${AGENTARK_POSTGRES_DB:-agentark} -tAc 'select 1' >/dev/null",
         ]
       interval: 2s
       timeout: 2s
@@ -109,12 +141,20 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "8990:8990"
+      - "127.0.0.1:8990:8990"
       - "127.0.0.1:8992:8992"
       - "127.0.0.1:${AGENTARK_BROWSER_HANDOFF_PORT:-6080}:6080"
     volumes:
-      - agentark-data:/app/data
-      - agentark-config:/app/config
+      - type: volume
+        source: agentark-data
+        target: /app/data
+        volume:
+          nocopy: true
+      - type: volume
+        source: agentark-config
+        target: /app/config
+        volume:
+          nocopy: true
       - agentark-secrets:/run/secrets:ro
       - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
     depends_on:
@@ -156,7 +196,6 @@ services:
       - AGENTARK_TUNNEL=${AGENTARK_TUNNEL:-false}
       - AGENTARK_LAN_HELPER_URL=${AGENTARK_LAN_HELPER_URL:-}
       - AGENTARK_LAN_HELPER_TOKEN=${AGENTARK_LAN_HELPER_TOKEN:-}
-      - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
     networks:
       - agent-network
     healthcheck:
@@ -192,7 +231,11 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
-      - agentark-data:/app/data
+      - type: volume
+        source: agentark-data
+        target: /app/data
+        volume:
+          nocopy: true
     environment:
       - RUST_LOG=info,hyper=warn,reqwest=warn
       - AGENTARK_STACK_ROLE=embeddings
@@ -238,8 +281,16 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
-      - agentark-data:/app/data
-      - agentark-config:/app/config
+      - type: volume
+        source: agentark-data
+        target: /app/data
+        volume:
+          nocopy: true
+      - type: volume
+        source: agentark-config
+        target: /app/config
+        volume:
+          nocopy: true
       - agentark-secrets:/run/secrets:ro
       - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
       - /var/run/docker.sock:/var/run/docker.sock
@@ -274,7 +325,6 @@ services:
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
       - DOCKER_HOST=unix:///var/run/docker.sock
       - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
-      - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
     networks:
       - agent-network
     healthcheck:
@@ -302,8 +352,16 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
-      - agentark-data:/app/data
-      - agentark-config:/app/config
+      - type: volume
+        source: agentark-data
+        target: /app/data
+        volume:
+          nocopy: true
+      - type: volume
+        source: agentark-config
+        target: /app/config
+        volume:
+          nocopy: true
       - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
     environment:
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
@@ -339,10 +397,10 @@ volumes:
     name: agentark-config
   agentark-postgres-data:
     name: agentark-postgres-data
-  # Holds the generated Postgres password file (/run/secrets/pg_pw). Docker-managed;
-  # never touches the host filesystem. `docker compose down -v` removes it and
-  # triggers a fresh password on next start (which also requires wiping
-  # agentark-postgres-data to match).
+  # Holds generated install secrets (/run/secrets/pg_pw and
+  # /run/secrets/agentark_master_key). Docker-managed; never touches the host
+  # filesystem. `docker compose down -v` removes it and triggers fresh secrets on
+  # next start, so wipe it together with AgentArk data/config/Postgres volumes.
   agentark-secrets:
     name: agentark-secrets
 networks:

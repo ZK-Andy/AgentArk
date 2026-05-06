@@ -155,6 +155,38 @@ pub(super) fn should_warn_for_direct_control_plane_exposure(
     deployment_mode == DeploymentMode::InternetFacing && !bind_addr_is_loopback(bind_addr)
 }
 
+pub(super) fn validate_control_plane_listener_posture(
+    deployment_mode: DeploymentMode,
+    bind_addr: &str,
+    direct_tls_enabled: bool,
+) -> Result<()> {
+    if deployment_mode != DeploymentMode::InternetFacing {
+        return Ok(());
+    }
+
+    let bind_addr = bind_addr.trim();
+    if bind_addr.is_empty() || bind_addr_is_loopback(bind_addr) {
+        return Ok(());
+    }
+
+    if !direct_tls_enabled {
+        anyhow::bail!(
+            "AgentArk blocked an unsafe public control-plane listener at '{}'. Use the default localhost install or AgentArk remote access so the public connection is HTTPS-protected.",
+            bind_addr
+        );
+    }
+
+    bind_addr.parse::<SocketAddr>().map_err(|error| {
+        anyhow::anyhow!(
+            "Direct HTTPS control plane listener '{}' must be a concrete socket address: {}",
+            bind_addr,
+            error
+        )
+    })?;
+
+    Ok(())
+}
+
 pub(super) fn validate_public_app_listener_posture(
     deployment_mode: DeploymentMode,
     public_app_bind_addr: Option<&str>,

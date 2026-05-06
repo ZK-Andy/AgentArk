@@ -40,6 +40,10 @@ pub enum StreamEvent {
         name: String,
         content: String,
     },
+    /// Structured plan for the current execution branch
+    PlanGenerated {
+        plan: crate::core::ExecutionPlan,
+    },
     /// Status update for a single plan step
     PlanStepUpdate {
         plan_id: String,

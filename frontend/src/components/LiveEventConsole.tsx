@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Box, Button, Card, CardContent, Chip, Stack, Typography } from "@mui/material";
 import type { TraceOperationalEvent, TraceSummary } from "../types";
 import { formatChannelSource } from "./channelLabels";
+import { formatUiTime } from "../lib/dateFormat";
 
 type Props = {
   history: TraceSummary[];
@@ -37,9 +38,11 @@ function formatLabel(value?: string | null, fallback = "Unknown"): string {
 
 function shortTimestamp(value?: string | null): string {
   if (!value) return "--";
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return "--";
-  return parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return formatUiTime(value, {
+    fallback: "--",
+    includeSeconds: true,
+    hour12: false,
+  });
 }
 
 function formatDuration(value?: number | null): string {

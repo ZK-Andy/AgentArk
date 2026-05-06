@@ -114,27 +114,44 @@ fn startup_deployment_mode(config_dir: &Path) -> core::config::DeploymentMode {
     core::config::load_bootstrap_deployment_mode(config_dir)
 }
 
-fn startup_master_password_secret() -> Option<String> {
-    std::env::var("AGENTARK_MASTER_PASSWORD")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/run/secrets/agentark_master_key")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
+fn startup_master_password_secret() -> Result<Option<String>> {
+    crypto::master::MasterPasswordManager::read_install_master_secret()
+}
+
+fn docker_stack_requires_install_master_secret() -> bool {
+    crypto::master::MasterPasswordManager::docker_stack_requires_install_master_secret()
+}
+
+fn missing_install_master_secret_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "AgentArk Docker installs require the install-managed encryption secret at {}. Recreate the bundled compose stack; for this pre-release local data, run compose down -v before starting again.",
+        crypto::master::INSTALL_MASTER_SECRET_PATH
+    )
+}
+
+fn legacy_keyfile_bootstrap_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "This data still uses legacy keyfile bootstrap encryption. This pre-release build now uses the install-managed encryption secret at {}; run compose down -v before starting again.",
+        crypto::master::INSTALL_MASTER_SECRET_PATH
+    )
+}
+
+fn mismatched_install_master_secret_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "The install-managed encryption secret at {} did not unlock existing encryption metadata. Restore the matching agentark-secrets volume or run compose down -v for a fresh pre-release install.",
+        crypto::master::INSTALL_MASTER_SECRET_PATH
+    )
 }
 
 fn resolve_background_service_key(
     config_dir: &Path,
     data_dir: &Path,
     deployment_mode: core::config::DeploymentMode,
-    is_first_run: bool,
+    _is_first_run: bool,
 ) -> Result<std::sync::Arc<crate::crypto::KeyManager>> {
     let master_mgr = crypto::master::MasterPasswordManager::new(config_dir, data_dir);
-    let startup_master_password = startup_master_password_secret();
+    let startup_master_password = startup_master_password_secret()?;
+    let install_secret_required = docker_stack_requires_install_master_secret();
 
     if master_mgr.is_password_set() {
         if let Some(password) = startup_master_password.as_deref() {
@@ -148,9 +165,17 @@ fn resolve_background_service_key(
         if deployment_mode == core::config::DeploymentMode::InternetFacing
             && master_mgr.is_bootstrap_password_active()?
         {
-            anyhow::bail!(
-                "Internet-facing deployments do not allow bootstrap/keyfile-derived encryption. Set an operator-managed master password first, then restart."
-            );
+            return Err(legacy_keyfile_bootstrap_error());
+        }
+
+        if install_secret_required {
+            if master_mgr.is_bootstrap_password_active()? {
+                return Err(legacy_keyfile_bootstrap_error());
+            }
+            if startup_master_password.is_none() {
+                return Err(missing_install_master_secret_error());
+            }
+            return Err(mismatched_install_master_secret_error());
         }
 
         if let Some(password) = master_mgr.bootstrap_password_if_active()? {
@@ -159,25 +184,18 @@ fn resolve_background_service_key(
         }
 
         anyhow::bail!(
-            "Background services require AGENTARK_MASTER_PASSWORD or /run/secrets/agentark_master_key when a master password is configured."
+            "Background services require the install-managed encryption secret at {} when a master password is configured.",
+            crypto::master::INSTALL_MASTER_SECRET_PATH
         );
     }
 
-    if deployment_mode == core::config::DeploymentMode::InternetFacing {
-        let password = startup_master_password.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Internet-facing deployments require AGENTARK_MASTER_PASSWORD or /run/secrets/agentark_master_key on startup. Bootstrap/keyfile encryption is disabled for this mode."
-            )
-        })?;
-        tracing::info!("Initializing master password from provided startup secret");
-        return master_mgr.set_password(&password);
+    if let Some(password) = startup_master_password.as_deref() {
+        tracing::info!("Initializing master password from install-managed startup secret");
+        return master_mgr.initialize_startup_password_if_needed(password);
     }
 
-    if is_first_run {
-        if let Some(password) = startup_master_password {
-            tracing::info!("Initializing master password from provided startup secret");
-            return master_mgr.set_password(&password);
-        }
+    if deployment_mode == core::config::DeploymentMode::InternetFacing || install_secret_required {
+        return Err(missing_install_master_secret_error());
     }
 
     if let Some(key) = master_mgr.initialize_bootstrap_password_if_needed()? {
@@ -273,6 +291,7 @@ pub(crate) fn render_cli_chat_onboarding_message(
 
 fn cli_chat_request_hints() -> core::RequestExecutionHints {
     core::RequestExecutionHints {
+        turn_timing_id: None,
         caller_principal: Some(actions::ActionCallerPrincipal::local_admin("cli")),
         execution_surface: actions::ActionExecutionSurface::Chat,
         direct_user_intent: true,
@@ -284,6 +303,7 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         attachments: Vec::new(),
         saved_user_facts_context: None,
         arkorbit_context: None,
+        accepted_suggestion_context: None,
     }
 }
 
@@ -333,11 +353,25 @@ fn print_unix_cli_banner_with_color(mode: &str, color: Option<&str>) {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct HumanReadableUtcLogTime;
+struct HumanReadableLocalLogTime;
 
-impl FormatTime for HumanReadableUtcLogTime {
+impl FormatTime for HumanReadableLocalLogTime {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
-        write!(w, "{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"))
+        let configured_tz = std::env::var("AGENTARK_LOG_TIMEZONE")
+            .ok()
+            .or_else(|| std::env::var("TZ").ok())
+            .and_then(|value| value.trim().parse::<chrono_tz::Tz>().ok());
+        if let Some(tz) = configured_tz {
+            write!(
+                w,
+                "{}",
+                chrono::Utc::now()
+                    .with_timezone(&tz)
+                    .format("%Y-%m-%d %H:%M:%S %Z")
+            )
+        } else {
+            write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"))
+        }
     }
 }
 
@@ -370,7 +404,7 @@ pub async fn run() -> Result<()> {
         .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
-                .with_timer(HumanReadableUtcLogTime)
+                .with_timer(HumanReadableLocalLogTime)
                 .with_target(false)
                 .with_thread_ids(false)
                 .with_thread_names(false),
@@ -462,7 +496,8 @@ pub async fn run() -> Result<()> {
 
     // Resolve master password to unified encryption key.
     let master_mgr = crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
-    let startup_master_password = startup_master_password_secret();
+    let startup_master_password = startup_master_password_secret()?;
+    let install_secret_required = docker_stack_requires_install_master_secret();
 
     let unified_key = if master_mgr.is_password_set() {
         let mut unlocked_key = None;
@@ -481,9 +516,16 @@ pub async fn run() -> Result<()> {
             if deployment_mode == core::config::DeploymentMode::InternetFacing
                 && master_mgr.is_bootstrap_password_active()?
             {
-                anyhow::bail!(
-                    "Internet-facing deployments do not allow bootstrap/keyfile-derived encryption. Set an operator-managed master password first, then restart."
-                );
+                return Err(legacy_keyfile_bootstrap_error());
+            }
+            if install_secret_required {
+                if master_mgr.is_bootstrap_password_active()? {
+                    return Err(legacy_keyfile_bootstrap_error());
+                }
+                if startup_master_password.is_none() {
+                    return Err(missing_install_master_secret_error());
+                }
+                return Err(mismatched_install_master_secret_error());
             }
         }
 
@@ -502,9 +544,7 @@ pub async fn run() -> Result<()> {
 
         if unlocked_key.is_none() {
             if deployment_mode == core::config::DeploymentMode::InternetFacing && args.headless {
-                anyhow::bail!(
-                    "Internet-facing headless deployments require AGENTARK_MASTER_PASSWORD or /run/secrets/agentark_master_key at startup."
-                );
+                return Err(missing_install_master_secret_error());
             }
             if !args.headless {
                 println!("Master password required.");
@@ -522,28 +562,22 @@ pub async fn run() -> Result<()> {
         }
 
         unlocked_key
-    } else if deployment_mode == core::config::DeploymentMode::InternetFacing {
-        let password = startup_master_password.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Internet-facing deployments require AGENTARK_MASTER_PASSWORD or /run/secrets/agentark_master_key on startup. Bootstrap/keyfile encryption is disabled for this mode."
-            )
-        })?;
-        tracing::info!("Initializing master password from provided startup secret");
-        Some(master_mgr.set_password(&password)?)
+    } else if let Some(password) = startup_master_password.as_deref() {
+        tracing::info!("Initializing master password from install-managed startup secret");
+        Some(master_mgr.initialize_startup_password_if_needed(password)?)
+    } else if deployment_mode == core::config::DeploymentMode::InternetFacing
+        || install_secret_required
+    {
+        return Err(missing_install_master_secret_error());
     } else if is_first_run {
-        if let Some(password) = startup_master_password {
-            tracing::info!("Initializing master password from provided startup secret");
-            Some(master_mgr.set_password(&password)?)
-        } else {
-            match master_mgr.initialize_bootstrap_password_if_needed()? {
-                Some(key) => {
-                    tracing::info!(
-                        "Initialized per-install bootstrap encryption password. Set a custom master password in Security settings."
-                    );
-                    Some(key)
-                }
-                None => None,
+        match master_mgr.initialize_bootstrap_password_if_needed()? {
+            Some(key) => {
+                tracing::info!(
+                    "Initialized per-install bootstrap encryption password. Set a custom master password in Security settings."
+                );
+                Some(key)
             }
+            None => None,
         }
     } else {
         // No master password exists; always initialize a bootstrap password so data is
@@ -813,6 +847,14 @@ fn render_cli_stream_event(
                 println!("\x1b[32m[done]\x1b[0m {}: {}", name, content.trim());
             }
         }
+        core::StreamEvent::PlanGenerated { plan } => {
+            finish_cli_inline_response(state)?;
+            println!(
+                "\x1b[35m[plan]\x1b[0m {} step{}",
+                plan.steps.len(),
+                if plan.steps.len() == 1 { "" } else { "s" }
+            );
+        }
         core::StreamEvent::PlanStepUpdate {
             step_id,
             step_title,
@@ -1016,20 +1058,19 @@ fn describe_cli_pulse_remediation(finding: &crate::sentinel::DoctorFinding) -> O
                 }
             })
         }
-        Some(crate::sentinel::DoctorRemediationSpec::ManagedAppOperation {
-            app_id,
-            operation,
-        }) => Some(match operation {
-            crate::sentinel::DoctorManagedAppOperation::CompilePythonRequirements => {
-                format!("Compile pinned Python requirements for app {}", app_id)
-            }
-            crate::sentinel::DoctorManagedAppOperation::GenerateCargoLockfile => {
-                format!("Generate Cargo.lock for app {}", app_id)
-            }
-            crate::sentinel::DoctorManagedAppOperation::RemoveNpmInstallHooks => {
-                format!("Remove npm install lifecycle hooks from app {}", app_id)
-            }
-        }),
+        Some(crate::sentinel::DoctorRemediationSpec::ManagedAppOperation { app_id, operation }) => {
+            Some(match operation {
+                crate::sentinel::DoctorManagedAppOperation::CompilePythonRequirements => {
+                    format!("Compile pinned Python requirements for app {}", app_id)
+                }
+                crate::sentinel::DoctorManagedAppOperation::GenerateCargoLockfile => {
+                    format!("Generate Cargo.lock for app {}", app_id)
+                }
+                crate::sentinel::DoctorManagedAppOperation::RemoveNpmInstallHooks => {
+                    format!("Remove npm install lifecycle hooks from app {}", app_id)
+                }
+            })
+        }
         Some(crate::sentinel::DoctorRemediationSpec::ShellCommand { command }) => {
             let normalized = command.trim();
             if normalized.is_empty() {

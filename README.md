@@ -86,17 +86,17 @@ Your data stays with you. Your secrets are encrypted. You keep the final say on 
 
 > Note: AgentArk currently runs as one global workspace. Project-specific workspaces and project-scoped UI/API behavior are intentionally deferred to phase 2.
 
-| | |
-|:--|:--|
-| **Command layer** | Chat, plans, approvals, and direct work requests |
-| **Memory layer** | Facts, preferences, user data, provenance, rollback, and checks |
-| **Automation layer** | Tasks, watchers, routines, schedules, and follow-ups |
-| **Agent layer** | Specialist agents, delegation, swarm work, and routing |
-| **App layer** | Generated tools, reusable skills, and managed apps |
+|                       |                                                                                           |
+| :-------------------- | :---------------------------------------------------------------------------------------- |
+| **Command layer**     | Chat, plans, approvals, and direct work requests                                          |
+| **Memory layer**      | Facts, preferences, user data, provenance, rollback, and checks                           |
+| **Automation layer**  | Tasks, watchers, routines, schedules, and follow-ups                                      |
+| **Agent layer**       | Specialist agents, delegation, swarm work, and routing                                    |
+| **App layer**         | Generated tools, reusable skills, and managed apps                                        |
 | **Integration layer** | Gmail, Calendar, Telegram, WhatsApp, Slack, webhooks, APIs, MCP servers, and custom packs |
-| **Device layer** | Companion device pairing, scoped grants, and high-risk command approvals |
-| **Safety layer** | Sandboxing, secrets, policy checks, action review, and trace history |
-| **Evolution layer** | ArkMemory, ArkReflect, ArkSentinel, ArkEvolve, and ArkPulse working together |
+| **Device layer**      | Companion device pairing, scoped grants, and high-risk command approvals                  |
+| **Safety layer**      | Sandboxing, secrets, policy checks, action review, and trace history                      |
+| **Evolution layer**   | ArkMemory, ArkReflect, ArkSentinel, ArkEvolve, and ArkPulse working together              |
 
 ---
 
@@ -132,13 +132,16 @@ Postgres | Documents | Secrets | Traces | Audit Logs
 
 ArkCore is the operating layer inside AgentArk that keeps memory, follow-up work, learning, and health checks connected instead of treating them as separate tools.
 
-| System | What it does |
-|:--|:--|
-| **ArkMemory** | Reviews current memory, staged changes, provenance, health, and checks. It reconciles session evidence into durable memory with source attribution, review, rollback, and retention-managed audit history. |
-| **ArkReflect** | Turns selected days, weeks, or months into a visual retrospective with semantic clusters, narrative summary, source coverage, working-style rhythm, background-agent activity, and examples. It reads cached derived work units by default and refreshes in background so the UI and API do not block on heavy clustering. Its optional Daily Digest is off by default, runs only after quiet windows, and sends nothing when the day had no meaningful activity. |
-| **ArkSentinel** | Spots follow-ups, routine work, and unattended issues, then suggests or handles the next step when policy allows it. |
-| **ArkEvolve** | Gives plain-language status for what AgentArk learned, what improved, what is still being tested, and what needs review before promotion. |
-| **ArkPulse** | Runs system health checks across runtime, config, integrations, security posture, storage, and automation reliability, then surfaces actionable findings. |
+| System                                        | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| :-------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **[ArkMemory](assets/docs/arkmemory.md)**     | Reviews current memory, staged changes, provenance, health, and checks. It reconciles session evidence into durable memory with source attribution, review, rollback, and retention-managed audit history.                                                                                                                                                                                                                                                        |
+| **[ArkReflect](assets/docs/arkreflect.md)**   | Turns selected days, weeks, or months into a visual retrospective with semantic clusters, narrative summary, source coverage, working-style rhythm, background-agent activity, and examples. It reads cached derived work units by default and refreshes in background so the UI and API do not block on heavy clustering. Its optional Daily Digest is off by default, runs only after quiet windows, and sends nothing when the day had no meaningful activity. |
+| **[ArkSentinel](assets/docs/arksentinel.md)** | Spots follow-ups, routine work, and unattended issues, then suggests or handles the next step when policy allows it.                                                                                                                                                                                                                                                                                                                                              |
+| **[ArkEvolve](assets/docs/arkevolve.md)**     | Gives plain-language status for what AgentArk learned, what improved, what is still being tested, and what needs review before promotion.                                                                                                                                                                                                                                                                                                                         |
+| **[ArkPulse](assets/docs/arkpulse.md)**       | Runs system health checks across runtime, config, integrations, security posture, storage, and automation reliability, then surfaces actionable findings.                                                                                                                                                                                                                                                                                                         |
+| **[ArkOrbit](assets/docs/arkorbit.md)**       | Canvas-style workspace where the agent builds and live-updates widgets, files, and inline tools alongside a chat surface — a sandboxed orbit-agent runtime separate from main chat.                                                                                                                                                                                                                                                                               |
+
+> **Deep dives:** [ArkMemory](assets/docs/arkmemory.md) · [ArkReflect](assets/docs/arkreflect.md) · [ArkSentinel](assets/docs/arksentinel.md) · [ArkEvolve](assets/docs/arkevolve.md) · [ArkPulse](assets/docs/arkpulse.md) · [ArkOrbit](assets/docs/arkorbit.md) - each is a standalone technical reference covering the data model, pipeline, HTTP API, UI surface, and known limits.
 
 ---
 
@@ -166,9 +169,9 @@ irm https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.
 
 The Windows installer checks WSL 2 and Docker Desktop, offers to install Docker Desktop with `winget` when it is missing, starts Docker Desktop when it is installed but stopped, and then asks which AgentArk install method to use:
 
-| Choice | What it does | Best for |
-|:--|:--|:--|
-| Fast install | Downloads the published AgentArk image and starts Docker Compose | Most users |
+| Choice       | What it does                                                                                       | Best for                                                                                                            |
+| :----------- | :------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------ |
+| Fast install | Downloads the published AgentArk image and starts Docker Compose                                   | Most users                                                                                                          |
 | Source build | Clones the AgentArk release checkout and builds the local `agentark:dev` image with Docker Compose | Users who do not want to pull the AgentArk image from GHCR, or who want to inspect/build the release source locally |
 
 Source build does not pull the published AgentArk runtime image from GHCR. It still downloads Docker build base images and package dependencies needed to compile the local image.
@@ -192,6 +195,8 @@ Backups are written under `/app/data/backups` as timestamped artifacts:
 
 AgentArk creates the backup directory itself. If backup creation fails, ArkPulse raises a critical data-safety finding and notifies the user; users should not be asked to create the backup folder manually.
 
+For full install recovery, also keep an operator volume backup from `./scripts/start.sh backup` or `scripts\start.bat backup`. The automatic managed backup intentionally does not copy the raw `agentark-secrets` volume into `/app/data/backups`; that volume contains install-managed encryption material and should be exported only as part of an intentional, access-controlled backup.
+
 **Low-memory systems (2-4 GB RAM):** add the low-memory override to reduce Postgres and service footprint:
 
 ```bash
@@ -206,15 +211,15 @@ For operator inspection, GEPA reads recent evidence from `experience_runs`. Its 
 
 These numbers are for the supported Docker Compose install. They were measured from a local `agentark:dev` source build on April 18, 2026; exact values vary by platform, Docker cache state, enabled runtime features, model/provider choice, and active jobs.
 
-| Item | Current expectation |
-|:--|:--|
-| Full AgentArk Docker image | `agentark:dev` measured at **3.07 GB**. Published full-runtime linux/amd64 images should be in the same range; run `docker image ls agentark:dev` or `docker image ls ghcr.io/agentark-ai/agentark` for the exact local size. |
-| Bundled ArkEvolve GEPA runtime | Adds the small `/app/bridges/gepa_optimizer` bridge plus a Python venv with DSPy and model-client dependencies. Expect roughly **120-250 MB** additional uncompressed image size, varying with Python dependency versions. |
-| AgentArk process startup | **5-10 ms measured** for the Rust binary command startup inside the rebuilt container. This excludes Docker Compose dependency ordering and Postgres health checks. |
-| Full local rebuild | About **12 minutes** on the measured Docker Desktop build with warm dependency caches. The Rust release binary compile dominated the build at **11m 38s**; frontend production build was about **11s**. Clean Docker/Cargo/npm caches can be longer. |
-| Docker stack ready after image exists | **47.3 seconds measured** from stopped containers to all services healthy with `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait` on Docker Desktop using the local `agentark:dev` image. This includes Postgres, workspace, executor, control, dependency ordering, and healthcheck intervals. Clean pulls/builds are not included. |
-| Idle container memory after fresh start | About **0.5 GB** across the default stack in a local fresh-start measurement. Browser sessions, generated apps, research, local embeddings, and active automations add to this. |
-| Low-memory mode | Use `docker-compose.lowmem.yml` on 2-4 GB systems. It caps Postgres at 512 MiB, control at 512 MiB, embeddings at 512 MiB, executor at 512 MiB, workspace at 256 MiB, and reduces Postgres buffers and DB pool sizes. |
+| Item                                    | Current expectation                                                                                                                                                                                                                                                                                                                                             |
+| :-------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Full AgentArk Docker image              | `agentark:dev` measured at **3.07 GB**. Published full-runtime linux/amd64 images should be in the same range; run `docker image ls agentark:dev` or `docker image ls ghcr.io/agentark-ai/agentark` for the exact local size.                                                                                                                                   |
+| Bundled ArkEvolve GEPA runtime          | Adds the small `/app/bridges/gepa_optimizer` bridge plus a Python venv with DSPy and model-client dependencies. Expect roughly **120-250 MB** additional uncompressed image size, varying with Python dependency versions.                                                                                                                                      |
+| AgentArk process startup                | **5-10 ms measured** for the Rust binary command startup inside the rebuilt container. This excludes Docker Compose dependency ordering and Postgres health checks.                                                                                                                                                                                             |
+| Full local rebuild                      | About **12 minutes** on the measured Docker Desktop build with warm dependency caches. The Rust release binary compile dominated the build at **11m 38s**; frontend production build was about **11s**. Clean Docker/Cargo/npm caches can be longer.                                                                                                            |
+| Docker stack ready after image exists   | **47.3 seconds measured** from stopped containers to all services healthy with `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait` on Docker Desktop using the local `agentark:dev` image. This includes Postgres, workspace, executor, control, dependency ordering, and healthcheck intervals. Clean pulls/builds are not included. |
+| Idle container memory after fresh start | About **0.5 GB** across the default stack in a local fresh-start measurement. Browser sessions, generated apps, research, local embeddings, and active automations add to this.                                                                                                                                                                                 |
+| Low-memory mode                         | Use `docker-compose.lowmem.yml` on 2-4 GB systems. It caps Postgres at 512 MiB, control at 512 MiB, embeddings at 512 MiB, executor at 512 MiB, workspace at 256 MiB, and reduces Postgres buffers and DB pool sizes.                                                                                                                                           |
 
 ### Optional: run your own SearXNG backend
 
@@ -260,8 +265,8 @@ Review the script before piping to a shell. For the strongest verification story
 
 ### Published container image
 
-| Image | Includes | Size (linux/amd64) |
-|:--|:--|:--|
+| Image                                 | Includes                                                                                                                | Size (linux/amd64)                                                                            |
+| :------------------------------------ | :---------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------- |
 | `ghcr.io/agentark-ai/agentark:latest` | Full runtime with Playwright, cloudflared, tailscale, Lightpanda, Docker CLI, Google Workspace CLI, and WhatsApp bridge | ~3.1 GB for current full-runtime linux/amd64 builds; Docker reports the exact size after pull |
 
 ```bash
@@ -301,12 +306,12 @@ you ➜ what can you do?
 agentark ➜ I can help with...
 ```
 
-| Action | How |
-|:--|:--|
-| Run a quick health check | `agentark --pulse` |
-| Exercise the operator chat path | `agentark --chat` inside a configured runtime |
-| Inspect CLI startup behavior | start the binary from the same environment used by the Docker runtime |
-| Exit CLI chat | `Ctrl+D` or `/exit` |
+| Action                          | How                                                                   |
+| :------------------------------ | :-------------------------------------------------------------------- |
+| Run a quick health check        | `agentark --pulse`                                                    |
+| Exercise the operator chat path | `agentark --chat` inside a configured runtime                         |
+| Inspect CLI startup behavior    | start the binary from the same environment used by the Docker runtime |
+| Exit CLI chat                   | `Ctrl+D` or `/exit`                                                   |
 
 The CLI does not replace Mission Control. Some capabilities depend on the web control plane, browser session handoff, approval UI, app management, and Docker Compose service wiring.
 
@@ -333,10 +338,14 @@ Native host builds are mainly for development and diagnostics:
 
 ```bash
 # Rust 1.75+
-export AGENTARK_DATABASE_URL=postgres://agentark:agentark@localhost:5432/agentark
+AGENTARK_PG_PASSWORD="$(docker exec agentark-postgres sh -c 'cat /run/secrets/pg_pw')"
+export AGENTARK_DATABASE_URL="postgres://agentark:${AGENTARK_PG_PASSWORD}@localhost:${AGENTARK_POSTGRES_PORT:-5432}/agentark"
+unset AGENTARK_PG_PASSWORD
 cargo build --release
 ./target/release/agentark --headless
 ```
+
+The Compose stack generates a per-install Postgres password in the `agentark-secrets` Docker volume and mounts it at `/run/secrets/pg_pw`. If you use your own development Postgres instead of the Compose database, set `AGENTARK_DATABASE_URL` to that database's credentials.
 
 Native source builds do not include the bundled Docker runtime, so AgentArk disables Lightpanda there instead of expecting users to install it separately. Use Docker Compose for the default fully bundled search stack.
 
@@ -359,6 +368,7 @@ Built-in remote access is toggleable from Settings. Cloudflare Quick Tunnel is t
 ./scripts/start.sh stop                         # stop
 docker compose down -v                          # stop and full reset
 ./scripts/start.sh logs                         # follow logs
+./scripts/start.sh backup                       # backup data, config, Postgres, and install secrets
 ```
 
 ---
@@ -367,21 +377,21 @@ docker compose down -v                          # stop and full reset
 
 ### Feature comparison
 
-| Capability | AgentArk | OpenClaw | Agent Zero | Hermes Agent |
-|:--|:--|:--|:--|:--|
-| **Primary scope** | Self-improving personal AI Agent OS for chat, memory, tasks, apps, integrations, devices, and audit, with ArkEvolve turning completed work, corrections, tool outcomes, and benchmarks into reviewed memory, procedures, prompt/classifier/specialist updates, routing/strategy policy, and skill candidates | Any-OS gateway that connects chat apps to AI agents | General-purpose autonomous computer assistant | Self-improving terminal agent with a built-in learning loop that creates skills from experience and builds a user model across sessions |
-| **UI / control plane** | Mission Control web UI, approvals, settings, trace, apps, and CLI | Browser Control UI served by the gateway | Web UI with interactive streamed output | Full TUI with multiline editing, slash-command autocomplete, interrupt-and-redirect, and streaming tool output; no web dashboard |
-| **Memory** | ArkMemory with episodic, semantic, procedural memory, provenance, review, rollback, and retention | Memory core plus optional dreaming/background consolidation | Vector/FAISS memory, knowledge base, project memory, and memory dashboard | Agent-curated memory with periodic nudges, FTS5 full-text session search with LLM summarization, and Honcho dialectic user modeling |
-| **Background work** | ArkSentinel with tasks, watchers, routines, schedules, and follow-up loops | Cron jobs, dreaming schedules, gateway events, nodes | Planning/scheduling and autonomous workflows | Built-in cron scheduler that delivers daily reports, nightly backups, and weekly audits to any connected platform in natural language |
-| **Health / operations** | ArkPulse health checks across runtime, config, integrations, security posture, storage, and automation reliability | Gateway health, event log, node status, and cron visibility | Web UI session state, memory dashboard, and container status | `hermes doctor` diagnostic plus `/compress`, `/usage`, and `/insights` slash commands |
-| **Learning / adaptation** | ArkEvolve with self-tune, experience consolidation, heuristic reflection, procedural pattern induction, skill impact tracking, routing-policy benchmarks, prompt/classifier/specialist prompt evolution, tests on past examples, limited live rollout, change history, review, and rollback | No reviewed self-editing agent loop documented | No reviewed self-editing agent loop documented | Agent-authored skills that self-improve during use, plus Atropos RL environments and trajectory compression for training future tool-calling models |
-| **Messaging / channels** | Web, CLI, Telegram, WhatsApp, Slack, webhooks, MCP, and custom channels | Discord, Google Chat, iMessage, Matrix, Teams, Signal, Slack, Telegram, WhatsApp, Zalo, WebChat, and nodes | Web UI first; external API, MCP, and A2A connectivity | Telegram, Discord, Slack, WhatsApp, Signal, CLI, and Home Assistant through a single gateway, with voice memo transcription |
-| **Execution isolation** | WASM sandbox, Docker runtime, approval gates, guarded action review, and execution proofs | Managed browser profile, pairing, node scopes, and exec approvals | Dockerized Linux environment | Six pluggable terminal backends: local, Docker, SSH, Daytona, Singularity, and Modal |
-| **Security / trust model** | Cross-layer capability vocabulary, scoped grants, semantic action review, signed action integrity, approval escalation, abuse throttling, output guards, secret redaction, and security events | Gateway auth, browser/device pairing, node scopes, and exec approval controls | Docker isolation plus user-configurable prompts/tools; docs warn it can perform dangerous computer actions | Command approval, DM pairing, and container isolation |
-| **Audit / accountability** | Trace history, approval records, security logs, execution proofs, action review snapshots, companion audit chain, and rollback-aware memory provenance | Gateway logs, live event log, cron run history, and routed conversation history | Session logs, memory dashboard, and saved Web UI output | FTS5 session search and conversation history through the memory layer; dedicated execution trace not documented |
-| **Extensibility** | Skills, extension packs, plugins, MCP servers, custom messaging channels, and companion devices | Skills, plugins, MCP server/client, browser profiles, nodes, and channel plugins | Tools, instruments, skills, extensions, MCP, and A2A | 40+ built-in tools, agent-authored self-improving skills, and MCP server integration |
-| **Multi-agent** | Specialist agents, delegation, routing, and swarms | Agent sessions and routed harnesses; node-backed capabilities | Subordinate agents and A2A | Isolated subagents spawned for parallel workstreams |
-| **Device / app layer** | Generated apps, app runtime, companion-device grants, and scoped approvals | Mobile/headless nodes with pairing and command surfaces | Operates a Docker computer; companion-device grant system not documented | Runs on Linux, macOS, WSL2, and Android via Termux; Home Assistant integration via gateway; managed app runtime not documented |
+| Capability                 | AgentArk                                                                                                                                                                                                                                                                                                     | OpenClaw                                                                                                   | Agent Zero                                                                                                 | Hermes Agent                                                                                                                                        |
+| :------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Primary scope**          | Self-improving personal AI Agent OS for chat, memory, tasks, apps, integrations, devices, and audit, with ArkEvolve turning completed work, corrections, tool outcomes, and benchmarks into reviewed memory, procedures, prompt/classifier/specialist updates, routing/strategy policy, and skill candidates | Any-OS gateway that connects chat apps to AI agents                                                        | General-purpose autonomous computer assistant                                                              | Self-improving terminal agent with a built-in learning loop that creates skills from experience and builds a user model across sessions             |
+| **UI / control plane**     | Mission Control web UI, approvals, settings, trace, apps, and CLI                                                                                                                                                                                                                                            | Browser Control UI served by the gateway                                                                   | Web UI with interactive streamed output                                                                    | Full TUI with multiline editing, slash-command autocomplete, interrupt-and-redirect, and streaming tool output; no web dashboard                    |
+| **Memory**                 | ArkMemory with episodic, semantic, procedural memory, provenance, review, rollback, and retention                                                                                                                                                                                                            | Memory core plus optional dreaming/background consolidation                                                | Vector/FAISS memory, knowledge base, project memory, and memory dashboard                                  | Agent-curated memory with periodic nudges, FTS5 full-text session search with LLM summarization, and Honcho dialectic user modeling                 |
+| **Background work**        | ArkSentinel with tasks, watchers, routines, schedules, and follow-up loops                                                                                                                                                                                                                                   | Cron jobs, dreaming schedules, gateway events, nodes                                                       | Planning/scheduling and autonomous workflows                                                               | Built-in cron scheduler that delivers daily reports, nightly backups, and weekly audits to any connected platform in natural language               |
+| **Health / operations**    | ArkPulse health checks across runtime, config, integrations, security posture, storage, and automation reliability                                                                                                                                                                                           | Gateway health, event log, node status, and cron visibility                                                | Web UI session state, memory dashboard, and container status                                               | `hermes doctor` diagnostic plus `/compress`, `/usage`, and `/insights` slash commands                                                               |
+| **Learning / adaptation**  | ArkEvolve with self-tune, experience consolidation, heuristic reflection, procedural pattern induction, skill impact tracking, routing-policy benchmarks, prompt/classifier/specialist prompt evolution, tests on past examples, limited live rollout, change history, review, and rollback                  | No reviewed self-editing agent loop documented                                                             | No reviewed self-editing agent loop documented                                                             | Agent-authored skills that self-improve during use, plus Atropos RL environments and trajectory compression for training future tool-calling models |
+| **Messaging / channels**   | Web, CLI, Telegram, WhatsApp, Slack, webhooks, MCP, and custom channels                                                                                                                                                                                                                                      | Discord, Google Chat, iMessage, Matrix, Teams, Signal, Slack, Telegram, WhatsApp, Zalo, WebChat, and nodes | Web UI first; external API, MCP, and A2A connectivity                                                      | Telegram, Discord, Slack, WhatsApp, Signal, CLI, and Home Assistant through a single gateway, with voice memo transcription                         |
+| **Execution isolation**    | WASM sandbox, Docker runtime, approval gates, guarded action review, and execution proofs                                                                                                                                                                                                                    | Managed browser profile, pairing, node scopes, and exec approvals                                          | Dockerized Linux environment                                                                               | Six pluggable terminal backends: local, Docker, SSH, Daytona, Singularity, and Modal                                                                |
+| **Security / trust model** | Cross-layer capability vocabulary, scoped grants, semantic action review, signed action integrity, approval escalation, abuse throttling, output guards, secret redaction, and security events                                                                                                               | Gateway auth, browser/device pairing, node scopes, and exec approval controls                              | Docker isolation plus user-configurable prompts/tools; docs warn it can perform dangerous computer actions | Command approval, DM pairing, and container isolation                                                                                               |
+| **Audit / accountability** | Trace history, approval records, security logs, execution proofs, action review snapshots, companion audit chain, and rollback-aware memory provenance                                                                                                                                                       | Gateway logs, live event log, cron run history, and routed conversation history                            | Session logs, memory dashboard, and saved Web UI output                                                    | FTS5 session search and conversation history through the memory layer; dedicated execution trace not documented                                     |
+| **Extensibility**          | Skills, extension packs, plugins, MCP servers, custom messaging channels, and companion devices                                                                                                                                                                                                              | Skills, plugins, MCP server/client, browser profiles, nodes, and channel plugins                           | Tools, instruments, skills, extensions, MCP, and A2A                                                       | 40+ built-in tools, agent-authored self-improving skills, and MCP server integration                                                                |
+| **Multi-agent**            | Specialist agents, delegation, routing, and swarms                                                                                                                                                                                                                                                           | Agent sessions and routed harnesses; node-backed capabilities                                              | Subordinate agents and A2A                                                                                 | Isolated subagents spawned for parallel workstreams                                                                                                 |
+| **Device / app layer**     | Generated apps, app runtime, companion-device grants, and scoped approvals                                                                                                                                                                                                                                   | Mobile/headless nodes with pairing and command surfaces                                                    | Operates a Docker computer; companion-device grant system not documented                                   | Runs on Linux, macOS, WSL2, and Android via Termux; Home Assistant integration via gateway; managed app runtime not documented                      |
 
 > **On "self-improving":** AgentArk and Hermes Agent use the phrase for different systems. AgentArk's self-evolve loop is broader and more controlled: completed or corrected runs become memory, lessons, and procedural patterns; ArkEvolve proposes changes to prompts, request classification, specialist prompts, tool/routing strategy, routing policy, and skills; review candidates are gate-checked before approval, while prompt and policy candidates are benchmarked before limited live rollout; changes keep history, impact signals, automatic stops for clear prompt regressions, and rollback or disable paths where supported. Hermes' main docs show a strong learning loop centered on agent-managed skills, bounded persistent memory, session search, and user modeling; they do not show a comparable multi-surface approval-and-rollout system. Same word, different mechanism and scope.
 
@@ -391,24 +401,24 @@ In short: choose OpenClaw when the main job is routing many chat apps into agent
 
 ### Footprint snapshot
 
-| Item | AgentArk |
-|:--|:--|
-| **Process startup** | **5-10 ms measured** for the Rust binary command startup inside the rebuilt container |
-| **Docker stack ready** | **47.3 seconds measured** from stopped containers to all services healthy on Docker Desktop with the local image already built |
-| **Idle RAM** | About **0.5 GB** after fresh Docker start |
-| **Image size** | **3.07 GB measured** for `agentark:dev` |
-| **Runtime shape** | Full Docker Compose stack with web UI, Postgres, WASM sandbox, browser tooling, Docker app runtime support, tunnel tooling, companion-device support, and memory systems |
+| Item                   | AgentArk                                                                                                                                                                 |
+| :--------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Process startup**    | **5-10 ms measured** for the Rust binary command startup inside the rebuilt container                                                                                    |
+| **Docker stack ready** | **47.3 seconds measured** from stopped containers to all services healthy on Docker Desktop with the local image already built                                           |
+| **Idle RAM**           | About **0.5 GB** after fresh Docker start                                                                                                                                |
+| **Image size**         | **3.07 GB measured** for `agentark:dev`                                                                                                                                  |
+| **Runtime shape**      | Full Docker Compose stack with web UI, Postgres, WASM sandbox, browser tooling, Docker app runtime support, tunnel tooling, companion-device support, and memory systems |
 
 ### Footprint comparison
 
 These competitor values are published requirements or vendor/project claims, not same-machine benchmarks. AgentArk values are measured from the local Docker Desktop rebuild described above.
 
-| Project | Startup / setup | RAM or host guidance | Package / runtime shape | Source |
-|:--|:--|:--|:--|:--|
-| **AgentArk** | **5-10 ms measured** process startup | About **0.5 GB** idle containers after fresh start | **3.07 GB measured** full Docker image | Local Docker Desktop measurement |
-| **OpenClaw** | Official docs say install/onboarding is about **5 minutes** | Official docs list Node 24 or Node 22.14+ and macOS/Linux/Windows; public requirement guides commonly list **4-8 GB RAM** host guidance, with Mac mini guides recommending **8 GB minimum / 16 GB recommended** | Node/Gateway install, optional Docker/local model setup | [OpenClaw install docs](https://docs.openclaw.ai/install), [OpenClaw getting started](https://docs.openclaw.ai/start/getting-started), [OpenClaw requirements guide](https://www.openclawcenter.com/requirements), [Mac mini guide](https://www.openclawcenter.com/install/mac-mini) |
-| **Agent Zero** | Docker quick start documented; no official RAM/startup benchmark found | Dockerized Linux environment; host usage depends on tools, browser, memory, and selected models | Docker image with Web UI, memory, browser tools, MCP, A2A, and extensible tools | [Agent Zero GitHub](https://github.com/agent0ai/agent-zero), [Agent Zero architecture](https://www.agent-zero.ai/p/architecture/) |
-| **Hermes Agent** | Bash installer documented (`curl \| bash`); no official startup benchmark found | README positions it to run on anything "from a $5 VPS to a GPU cluster" with nearly-free idle cost on serverless; no published RAM benchmark | Single install with six pluggable terminal backends (local, Docker, SSH, Daytona, Singularity, Modal) across Linux, macOS, WSL2, and Android/Termux | [Hermes Agent GitHub](https://github.com/NousResearch/hermes-agent) |
+| Project          | Startup / setup                                                                 | RAM or host guidance                                                                                                                                                                                            | Package / runtime shape                                                                                                                             | Source                                                                                                                                                                                                                                                                               |
+| :--------------- | :------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **AgentArk**     | **5-10 ms measured** process startup                                            | About **0.5 GB** idle containers after fresh start                                                                                                                                                              | **3.07 GB measured** full Docker image                                                                                                              | Local Docker Desktop measurement                                                                                                                                                                                                                                                     |
+| **OpenClaw**     | Official docs say install/onboarding is about **5 minutes**                     | Official docs list Node 24 or Node 22.14+ and macOS/Linux/Windows; public requirement guides commonly list **4-8 GB RAM** host guidance, with Mac mini guides recommending **8 GB minimum / 16 GB recommended** | Node/Gateway install, optional Docker/local model setup                                                                                             | [OpenClaw install docs](https://docs.openclaw.ai/install), [OpenClaw getting started](https://docs.openclaw.ai/start/getting-started), [OpenClaw requirements guide](https://www.openclawcenter.com/requirements), [Mac mini guide](https://www.openclawcenter.com/install/mac-mini) |
+| **Agent Zero**   | Docker quick start documented; no official RAM/startup benchmark found          | Dockerized Linux environment; host usage depends on tools, browser, memory, and selected models                                                                                                                 | Docker image with Web UI, memory, browser tools, MCP, A2A, and extensible tools                                                                     | [Agent Zero GitHub](https://github.com/agent0ai/agent-zero), [Agent Zero architecture](https://www.agent-zero.ai/p/architecture/)                                                                                                                                                    |
+| **Hermes Agent** | Bash installer documented (`curl \| bash`); no official startup benchmark found | README positions it to run on anything "from a $5 VPS to a GPU cluster" with nearly-free idle cost on serverless; no published RAM benchmark                                                                    | Single install with six pluggable terminal backends (local, Docker, SSH, Daytona, Singularity, Modal) across Linux, macOS, WSL2, and Android/Termux | [Hermes Agent GitHub](https://github.com/NousResearch/hermes-agent)                                                                                                                                                                                                                  |
 
 ### Cost
 
@@ -443,39 +453,39 @@ You choose the trade-off at runtime. The core stays the same.
 
 ### Core
 
-| | |
-|:--|:--|
-| **Sub-Agent Orchestration** | Researcher, Coder, Analyst, Writer, Validator - auto-selected per task |
-| **Self-Evolve Engine** | Prompt evolution, policy tuning, strategy learning, and routing benchmarks |
-| **Self-Tune** | Learns your style from local history, tracks tool success rates, adjusts autonomy |
-| **ArkMemory** | Current memory, provenance, review, rollback, and three-tier memory across episodic conversations, semantic facts, and procedural actions |
-| **ArkReflect** | Local day/week/month panorama showing where work clustered across chat, ArkOrbit, apps, goals, watchers, memory, Sentinel, ArkPulse, ArkEvolve, usage, and learned workflows |
-| **Live App Deployment** | Deploy static or dynamic apps from chat - Node, Python, HTML, and more |
-| **Goal Autopilot** | Goal → plan → scheduled execution → recurring progress reports |
-| **Predictive Nudges** | Early warnings for missed deadlines, overdue pressure, recommended next actions |
-| **Background Learning** | Periodic reflection, memory consolidation, and pattern induction |
+|                             |                                                                                                                                                                              |
+| :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Sub-Agent Orchestration** | Researcher, Coder, Analyst, Writer, Validator - auto-selected per task                                                                                                       |
+| **Self-Evolve Engine**      | Prompt evolution, policy tuning, strategy learning, and routing benchmarks                                                                                                   |
+| **Self-Tune**               | Learns your style from local history, tracks tool success rates, adjusts autonomy                                                                                            |
+| **ArkMemory**               | Current memory, provenance, review, rollback, and three-tier memory across episodic conversations, semantic facts, and procedural actions                                    |
+| **ArkReflect**              | Local day/week/month panorama showing where work clustered across chat, ArkOrbit, apps, goals, watchers, memory, Sentinel, ArkPulse, ArkEvolve, usage, and learned workflows |
+| **Live App Deployment**     | Deploy static or dynamic apps from chat - Node, Python, HTML, and more                                                                                                       |
+| **Goal Autopilot**          | Goal → plan → scheduled execution → recurring progress reports                                                                                                               |
+| **Predictive Nudges**       | Early warnings for missed deadlines, overdue pressure, recommended next actions                                                                                              |
+| **Background Learning**     | Periodic reflection, memory consolidation, and pattern induction                                                                                                             |
 
 ### Security
 
-| | |
-|:--|:--|
-| **AES-256-GCM + Argon2id** | Secrets encrypted at rest; master-password mode derives keys with Argon2id |
-| **Action Security Guard** | Integrity signing, static analysis, permissions, injection scanning |
-| **Prompt Protection** | Injection detection, leakage prevention, output redaction |
-| **Sandboxed Execution** | WASM (Wasmtime) + Docker isolation with automatic rollback |
-| **Execution Proofs** | Verifiable records of what the agent actually did |
-| **10-Layer Hardening** | API key auth, localhost bind, CORS, rate limiting, Docker socket proxy, optional TLS |
+|                            |                                                                                      |
+| :------------------------- | :----------------------------------------------------------------------------------- |
+| **AES-256-GCM + Argon2id** | Secrets encrypted at rest; master-password mode derives keys with Argon2id           |
+| **Action Security Guard**  | Integrity signing, static analysis, permissions, injection scanning                  |
+| **Prompt Protection**      | Injection detection, leakage prevention, output redaction                            |
+| **Sandboxed Execution**    | WASM (Wasmtime) + Docker isolation with automatic rollback                           |
+| **Execution Proofs**       | Verifiable records of what the agent actually did                                    |
+| **10-Layer Hardening**     | API key auth, localhost bind, CORS, rate limiting, Docker socket proxy, optional TLS |
 
 ### Integrations
 
-| | |
-|:--|:--|
-| **Channels** | Telegram, WhatsApp (Baileys + Cloud API), Web UI |
-| **LLM Providers** | Ollama, Anthropic, OpenAI, OpenRouter, any OpenAI-compatible API |
-| **Connectors** | GitHub, Notion, Twitter/X, Google Places, 1Password, Twilio, Shopify |
-| **MCP Servers** | HTTP JSON-RPC + stdio transports, hot-reload, encrypted credentials |
-| **Media** | Image gen (DALL-E, Stability, Fal, Replicate), Video gen (Runway, Luma), Audio (Whisper) |
-| **Utilities** | PDF generation, expense tracking, invoice creation, daily briefing, weekly review |
+|                   |                                                                                          |
+| :---------------- | :--------------------------------------------------------------------------------------- |
+| **Channels**      | Telegram, WhatsApp (Baileys + Cloud API), Web UI                                         |
+| **LLM Providers** | Ollama, Anthropic, OpenAI, OpenRouter, any OpenAI-compatible API                         |
+| **Connectors**    | GitHub, Notion, Twitter/X, Google Places, 1Password, Twilio, Shopify                     |
+| **MCP Servers**   | HTTP JSON-RPC + stdio transports, hot-reload, encrypted credentials                      |
+| **Media**         | Image gen (DALL-E, Stability, Fal, Replicate), Video gen (Runway, Luma), Audio (Whisper) |
+| **Utilities**     | PDF generation, expense tracking, invoice creation, daily briefing, weekly review        |
 
 ### Autonomy Control Plane
 
@@ -495,24 +505,26 @@ You choose the trade-off at runtime. The core stays the same.
 ### First-time setup
 
 **Web UI:**
+
 1. Open **http://localhost:8990**
 2. Go to **Settings** → pick your **LLM Provider** → enter credentials
 3. Set **Bot Name** and **Personality** → Save → start chatting
 
 **CLI:**
+
 1. Run `agentark --setup` → pick your model/provider
 2. Run `agentark --chat`
 
 ### LLM providers
 
-| Provider | Base URL | Example models |
-|:--|:--|:--|
-| **Ollama** (local) | `http://localhost:11434` | `llama3.2`, `qwen2.5`, `mistral` |
-| **OpenRouter** | `https://openrouter.ai/api/v1` | `glm-4`, `qwen/qwen-2.5-72b-instruct` |
-| **Anthropic** | built-in | `claude-sonnet-4-20250514` |
-| **OpenAI** | built-in | `gpt-4o`, `gpt-4-turbo` |
+| Provider                   | Base URL                                  | Example models                                                  |
+| :------------------------- | :---------------------------------------- | :-------------------------------------------------------------- |
+| **Ollama** (local)         | `http://localhost:11434`                  | `llama3.2`, `qwen2.5`, `mistral`                                |
+| **OpenRouter**             | `https://openrouter.ai/api/v1`            | `glm-4`, `qwen/qwen-2.5-72b-instruct`                           |
+| **Anthropic**              | built-in                                  | `claude-sonnet-4-20250514`                                      |
+| **OpenAI**                 | built-in                                  | `gpt-4o`, `gpt-4-turbo`                                         |
 | **Hugging Face Inference** | `https://api-inference.huggingface.co/v1` | `meta-llama/Llama-3.1-8B-Instruct`, `Qwen/Qwen2.5-72B-Instruct` |
-| **OpenAI-compatible** | your URL | any compatible model |
+| **OpenAI-compatible**      | your URL                                  | any compatible model                                            |
 
 ### Telegram bot (optional)
 
@@ -523,20 +535,21 @@ You choose the trade-off at runtime. The core stays the same.
 
 ### Environment variables
 
-| Variable | Default | Description |
-|:--|:--|:--|
-| `AGENTARK_CONFIG` | `/app/config` | Configuration directory |
-| `AGENTARK_DATA` | `/app/data` | Data directory |
-| `AGENTARK_BIND` | `127.0.0.1:8990` | HTTP bind address |
-| `AGENTARK_DEBUG` | `false` | Enable debug logging |
-| `AGENTARK_DATABASE_URL` | _(set by Compose)_ | PostgreSQL connection string |
-| `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| Variable                | Default            | Description                                  |
+| :---------------------- | :----------------- | :------------------------------------------- |
+| `AGENTARK_CONFIG`       | `/app/config`      | Configuration directory                      |
+| `AGENTARK_DATA`         | `/app/data`        | Data directory                               |
+| `AGENTARK_BIND`         | `127.0.0.1:8990`   | HTTP bind address                            |
+| `AGENTARK_DEBUG`        | `false`            | Enable debug logging                         |
+| `AGENTARK_DATABASE_URL` | _(set by Compose)_ | PostgreSQL connection string                 |
+| `RUST_LOG`              | `info`             | Log level (`debug`, `info`, `warn`, `error`) |
 
 ### Default stack notes
 
 - Docker Compose starts Postgres and all internal services automatically
 - Local embeddings run in an isolated sidecar with `BAAI/bge-small-en-v1.5` by default; external OpenAI-compatible endpoints supported
 - User-installed skills live under `/app/data`; app/runtime data stays under Docker volumes
+- Backups must keep `agentark-secrets` together with `agentark-postgres-data` and `agentark-config`; it contains the install-managed encryption secret required to unlock encrypted local data
 - Keep Docker volumes attached when updating - `docker compose down -v` is a full reset
 
 ---
@@ -547,12 +560,12 @@ AES-256-GCM encryption at rest. Argon2id key derivation in master-password mode.
 
 AgentArk stores API keys, OAuth tokens, and custom secrets in encrypted `settings:*` KV records. Memory content, integration credentials, and secret-backed placeholders all use the same encrypted storage path. Secrets are resolved at execution time and never appear in LLM-visible tool-call arguments or traces.
 
-| Layer | Properties |
-|:--|:--|
-| **Data at rest** | AES-256-GCM with Argon2id key derivation |
-| **Data in transit** | HTTPS/TLS when configured, or behind a reverse proxy |
+| Layer                 | Properties                                                |
+| :-------------------- | :-------------------------------------------------------- |
+| **Data at rest**      | AES-256-GCM with Argon2id key derivation                  |
+| **Data in transit**   | HTTPS/TLS when configured, or behind a reverse proxy      |
 | **Runtime isolation** | Sandboxing, approvals, guarded actions, execution history |
-| **Auditability** | Execution proofs, security logs, approval records |
+| **Auditability**      | Execution proofs, security logs, approval records         |
 
 ### Permission disclosures
 
@@ -580,13 +593,13 @@ Full details: [SECURITY.md](SECURITY.md) and [VERIFY.md](VERIFY.md)
 
 ## Why Rust?
 
-| | |
-|:--|:--|
-| **Performance** | Tokio async runtime, `Arc<RwLock<T>>` concurrency - no GIL bottleneck |
-| **Security** | `Zeroizing` auto-clears secrets from memory; zero `unsafe` blocks in the codebase |
-| **Type Safety** | Enums, traits, and compile-time guarantees catch bugs before production |
-| **Single Binary** | One compiled binary + Docker - no dependency hell |
-| **WASM Sandboxing** | Wasmtime integration is natural in Rust |
+|                     |                                                                                   |
+| :------------------ | :-------------------------------------------------------------------------------- |
+| **Performance**     | Tokio async runtime, `Arc<RwLock<T>>` concurrency - no GIL bottleneck             |
+| **Security**        | `Zeroizing` auto-clears secrets from memory; zero `unsafe` blocks in the codebase |
+| **Type Safety**     | Enums, traits, and compile-time guarantees catch bugs before production           |
+| **Single Binary**   | One compiled binary + Docker - no dependency hell                                 |
+| **WASM Sandboxing** | Wasmtime integration is natural in Rust                                           |
 
 ---
 
@@ -648,6 +661,7 @@ ArkReflect Daily Digest can be enabled in Settings. When enabled, AgentArk prepa
 AGENTARK_DEBUG=true ./scripts/start.sh              # full debug
 RUST_LOG=info,agentark=debug ./scripts/start.sh     # agent internals only
 ```
+
 </details>
 
 ---
@@ -705,19 +719,19 @@ skills/             # Built-in skill definitions
 
 For documentation generators such as DeepWiki, these are the main product concepts and source areas to index first.
 
-| Area | Start here | Notes |
-|:--|:--|:--|
-| Product shell | `frontend/src/App.tsx`, `frontend/src/components/NativeWorkspace.tsx`, `frontend/src/styles.css` | Navigation, responsive shell, Mission Control, Chat, ArkMemory, ArkReflect, ArkSentinel, ArkEvolve, ArkPulse, and settings surfaces |
-| API surface | `src/channels/http.rs`, `src/channels/http/*` | HTTP routes, settings, integrations, companion devices, model control, webhooks, ArkReflect, ArkPulse, ArkSentinel, and ArkMemory panels |
-| Agent runtime | `src/core/agent.rs`, `src/core/agent/*`, `src/runtime/mod.rs` | Tool planning, execution loop, approvals, sandboxing, task routing, generated apps, action traces, and response delivery |
-| Memory and learning | `src/core/learning.rs`, `src/core/memory_dedup.rs`, `src/storage/entities/experience_item.rs` | User facts, preferences, ArkMemory views, semantic deduplication, provenance, review, rollback, and consolidation |
-| ArkReflect | `src/channels/http/reflect_control.rs`, `src/storage/entities/semantic_work_unit.rs`, `frontend/src/components/pages/ArkReflectPage.tsx` | Cached local retrospectives, derived semantic work units, day/week/month clustering, source coverage, related-history lookup, and Panorama UI |
-| ArkSentinel | `src/sentinel.rs`, `src/channels/http/sentinel_panel.rs`, `src/core/autonomy.rs` | Follow-up scanning, routine detection, health findings, proposals, scheduled work, and automation nudges |
-| ArkEvolve | `src/core/self_evolve/*`, `src/core/agent/tool_execution.rs` | Prompt, policy, classifier, and specialist evolution with canaries, replay evaluation, promotion gates, and rollback |
-| ArkPulse | `src/sentinel.rs`, `src/core/observability.rs`, `src/core/release_updates.rs` | Runtime health checks, remediation hints, operational findings, update status, and system readiness surfaces |
-| Integrations and packs | `src/extension_packs/mod.rs`, `src/channels/http/integrations.rs`, `frontend/src/components/IntegrationsPanel.tsx` | Extension packs, messaging channels, OAuth/setup wizards, custom APIs, MCP, webhooks, install/delete cleanup, and secrets handling |
-| Companion devices | `src/core/companion.rs`, `src/channels/http/companion_control.rs`, `frontend/src/components/CompanionDevicesPanel.tsx` | Pairing, scoped grants, high-risk approvals, audit trail, device commands, and queued actions |
-| Storage and secrets | `src/storage/*`, `src/core/config.rs`, `src/core/secrets.rs`, `src/storage/encrypted.rs` | Postgres entities, schema setup, encrypted config, secret storage, retention, cleanup, and audit data |
+| Area                   | Start here                                                                                                                               | Notes                                                                                                                                         |
+| :--------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- |
+| Product shell          | `frontend/src/App.tsx`, `frontend/src/components/NativeWorkspace.tsx`, `frontend/src/styles.css`                                         | Navigation, responsive shell, Mission Control, Chat, ArkMemory, ArkReflect, ArkSentinel, ArkEvolve, ArkPulse, and settings surfaces           |
+| API surface            | `src/channels/http.rs`, `src/channels/http/*`                                                                                            | HTTP routes, settings, integrations, companion devices, model control, webhooks, ArkReflect, ArkPulse, ArkSentinel, and ArkMemory panels      |
+| Agent runtime          | `src/core/agent.rs`, `src/core/agent/*`, `src/runtime/mod.rs`                                                                            | Tool planning, execution loop, approvals, sandboxing, task routing, generated apps, action traces, and response delivery                      |
+| Memory and learning    | `src/core/learning.rs`, `src/core/memory_dedup.rs`, `src/storage/entities/experience_item.rs`                                            | User facts, preferences, ArkMemory views, semantic deduplication, provenance, review, rollback, and consolidation                             |
+| ArkReflect             | `src/channels/http/reflect_control.rs`, `src/storage/entities/semantic_work_unit.rs`, `frontend/src/components/pages/ArkReflectPage.tsx` | Cached local retrospectives, derived semantic work units, day/week/month clustering, source coverage, related-history lookup, and Panorama UI |
+| ArkSentinel            | `src/sentinel.rs`, `src/channels/http/sentinel_panel.rs`, `src/core/autonomy.rs`                                                         | Follow-up scanning, routine detection, health findings, proposals, scheduled work, and automation nudges                                      |
+| ArkEvolve              | `src/core/self_evolve/*`, `src/core/agent/tool_execution.rs`                                                                             | Prompt, policy, classifier, and specialist evolution with canaries, replay evaluation, promotion gates, and rollback                          |
+| ArkPulse               | `src/sentinel.rs`, `src/core/observability.rs`, `src/core/release_updates.rs`                                                            | Runtime health checks, remediation hints, operational findings, update status, and system readiness surfaces                                  |
+| Integrations and packs | `src/extension_packs/mod.rs`, `src/channels/http/integrations.rs`, `frontend/src/components/IntegrationsPanel.tsx`                       | Extension packs, messaging channels, OAuth/setup wizards, custom APIs, MCP, webhooks, install/delete cleanup, and secrets handling            |
+| Companion devices      | `src/core/companion.rs`, `src/channels/http/companion_control.rs`, `frontend/src/components/CompanionDevicesPanel.tsx`                   | Pairing, scoped grants, high-risk approvals, audit trail, device commands, and queued actions                                                 |
+| Storage and secrets    | `src/storage/*`, `src/core/config.rs`, `src/core/secrets.rs`, `src/storage/encrypted.rs`                                                 | Postgres entities, schema setup, encrypted config, secret storage, retention, cleanup, and audit data                                         |
 
 Key flows worth documenting:
 
@@ -730,14 +744,6 @@ Key flows worth documenting:
 - ArkEvolve review candidate -> past-example test -> approval or rejection -> apply or leave unchanged.
 - ArkEvolve prompt/policy candidate -> benchmark -> limited live rollout or promotion -> stop, disable, or rollback where supported.
 
-### Guidelines
-
-- **PRs over issues** - code speaks louder than feature requests
-- **One concern per PR** - keep changes focused and reviewable
-- **Tests for new features** - add to `tests/` when adding functionality
-- **No secrets in code** - use `SecureConfigManager` for anything sensitive
-- **Format before push** - `cargo fmt` and `cd frontend && npx prettier --write src/`
-
 ---
 
 ## Acknowledgments
@@ -746,77 +752,77 @@ AgentArk stands on the shoulders of a large open-source ecosystem. None of this 
 
 **Core runtime**
 
-| Project | Used for |
-|:--|:--|
-| [Rust](https://www.rust-lang.org/) | Core language - memory safety, performance, fearless concurrency |
-| [Tokio](https://tokio.rs/) | Async runtime powering all concurrent operations |
-| [Hyper](https://hyper.rs/) + [Axum](https://github.com/tokio-rs/axum) + [Tower](https://github.com/tower-rs/tower) | HTTP stack, server, router, middleware |
-| [Tokio-Tungstenite](https://github.com/snapview/tokio-tungstenite) | WebSocket implementation (channels + companion devices) |
-| [Reqwest](https://github.com/seanmonstar/reqwest) | HTTP client for every outbound API call |
-| [Serde](https://serde.rs/) + [serde_json](https://github.com/serde-rs/json) + [TOML](https://github.com/toml-rs/toml) | Serialization across the entire codebase |
-| [Tracing](https://github.com/tokio-rs/tracing) | Structured logging and diagnostics |
-| [Clap](https://github.com/clap-rs/clap) | CLI argument parsing |
-| [Anyhow](https://github.com/dtolnay/anyhow) + [Thiserror](https://github.com/dtolnay/thiserror) | Error handling |
+| Project                                                                                                               | Used for                                                         |
+| :-------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------- |
+| [Rust](https://www.rust-lang.org/)                                                                                    | Core language - memory safety, performance, fearless concurrency |
+| [Tokio](https://tokio.rs/)                                                                                            | Async runtime powering all concurrent operations                 |
+| [Hyper](https://hyper.rs/) + [Axum](https://github.com/tokio-rs/axum) + [Tower](https://github.com/tower-rs/tower)    | HTTP stack, server, router, middleware                           |
+| [Tokio-Tungstenite](https://github.com/snapview/tokio-tungstenite)                                                    | WebSocket implementation (channels + companion devices)          |
+| [Reqwest](https://github.com/seanmonstar/reqwest)                                                                     | HTTP client for every outbound API call                          |
+| [Serde](https://serde.rs/) + [serde_json](https://github.com/serde-rs/json) + [TOML](https://github.com/toml-rs/toml) | Serialization across the entire codebase                         |
+| [Tracing](https://github.com/tokio-rs/tracing)                                                                        | Structured logging and diagnostics                               |
+| [Clap](https://github.com/clap-rs/clap)                                                                               | CLI argument parsing                                             |
+| [Anyhow](https://github.com/dtolnay/anyhow) + [Thiserror](https://github.com/dtolnay/thiserror)                       | Error handling                                                   |
 
 **Storage, data, and scheduling**
 
-| Project | Used for |
-|:--|:--|
-| [PostgreSQL](https://www.postgresql.org/) + [pgvector](https://github.com/pgvector/pgvector) | Primary database and vector embedding store |
-| [SeaORM](https://www.sea-ql.org/SeaORM/) + [SQLx](https://github.com/launchbadge/sqlx) | Database ORM and query layer |
-| [Chrono](https://github.com/chronotope/chrono) + [chrono-tz](https://github.com/chronotope/chrono-tz) | Time and timezone handling |
-| [cron](https://github.com/zslayton/cron) + [tokio-cron-scheduler](https://github.com/mvniekerk/tokio-cron-scheduler) | Task scheduling and watchers |
-| [FastEmbed](https://github.com/Anush008/fastembed-rs) | Local embedding generation for memory and search |
-| [pdf-extract](https://github.com/jrmuizel/pdf-extract) | PDF text extraction for documents |
+| Project                                                                                                              | Used for                                         |
+| :------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- |
+| [PostgreSQL](https://www.postgresql.org/) + [pgvector](https://github.com/pgvector/pgvector)                         | Primary database and vector embedding store      |
+| [SeaORM](https://www.sea-ql.org/SeaORM/) + [SQLx](https://github.com/launchbadge/sqlx)                               | Database ORM and query layer                     |
+| [Chrono](https://github.com/chronotope/chrono) + [chrono-tz](https://github.com/chronotope/chrono-tz)                | Time and timezone handling                       |
+| [cron](https://github.com/zslayton/cron) + [tokio-cron-scheduler](https://github.com/mvniekerk/tokio-cron-scheduler) | Task scheduling and watchers                     |
+| [FastEmbed](https://github.com/Anush008/fastembed-rs)                                                                | Local embedding generation for memory and search |
+| [pdf-extract](https://github.com/jrmuizel/pdf-extract)                                                               | PDF text extraction for documents                |
 
 **Security and cryptography**
 
-| Project | Used for |
-|:--|:--|
-| [Ring](https://github.com/briansmith/ring) + [Rustls](https://github.com/rustls/rustls) | TLS and general-purpose cryptography |
-| [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) + [x25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) | Device pairing and signed identities |
-| [AES-GCM](https://github.com/RustCrypto/AEADs) + [Argon2](https://github.com/RustCrypto/password-hashes) | Secret-at-rest encryption and password hashing |
-| [SHA-2](https://github.com/RustCrypto/hashes) + [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) | Hashing for integrity and content addressing |
-| [Zeroize](https://github.com/iqlusioninc/crates/tree/main/zeroize) | Wiping secrets from memory |
+| Project                                                                                                                                          | Used for                                       |
+| :----------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------- |
+| [Ring](https://github.com/briansmith/ring) + [Rustls](https://github.com/rustls/rustls)                                                          | TLS and general-purpose cryptography           |
+| [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) + [x25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) | Device pairing and signed identities           |
+| [AES-GCM](https://github.com/RustCrypto/AEADs) + [Argon2](https://github.com/RustCrypto/password-hashes)                                         | Secret-at-rest encryption and password hashing |
+| [SHA-2](https://github.com/RustCrypto/hashes) + [BLAKE3](https://github.com/BLAKE3-team/BLAKE3)                                                  | Hashing for integrity and content addressing   |
+| [Zeroize](https://github.com/iqlusioninc/crates/tree/main/zeroize)                                                                               | Wiping secrets from memory                     |
 
 **Execution, automation, and integrations**
 
-| Project | Used for |
-|:--|:--|
-| [Wasmtime](https://wasmtime.dev/) | WebAssembly sandbox for safe code execution |
-| [Docker](https://www.docker.com/) + [Bollard](https://github.com/fussybeaver/bollard) | Container runtime and Rust Docker client |
-| [Playwright](https://playwright.dev/) | Interactive browser automation and operator handoff |
-| [Lightpanda](https://github.com/lightpanda-io/browser) | Fast headless browser for content extraction |
-| [russh](https://github.com/warp-tech/russh) | SSH client for remote-action flows |
-| [SearXNG](https://github.com/searxng/searxng) | Self-hosted metasearch (optional research backend) |
-| [Model Context Protocol](https://modelcontextprotocol.io/) | Open standard for pluggable tool surfaces |
-| [Cloudflared](https://github.com/cloudflare/cloudflared) | Public-link remote access via Cloudflare Tunnel |
-| [Tailscale](https://tailscale.com/) | Private tailnet access with end-to-end encryption |
+| Project                                                                               | Used for                                            |
+| :------------------------------------------------------------------------------------ | :-------------------------------------------------- |
+| [Wasmtime](https://wasmtime.dev/)                                                     | WebAssembly sandbox for safe code execution         |
+| [Docker](https://www.docker.com/) + [Bollard](https://github.com/fussybeaver/bollard) | Container runtime and Rust Docker client            |
+| [Playwright](https://playwright.dev/)                                                 | Interactive browser automation and operator handoff |
+| [Lightpanda](https://github.com/lightpanda-io/browser)                                | Fast headless browser for content extraction        |
+| [russh](https://github.com/warp-tech/russh)                                           | SSH client for remote-action flows                  |
+| [SearXNG](https://github.com/searxng/searxng)                                         | Self-hosted metasearch (optional research backend)  |
+| [Model Context Protocol](https://modelcontextprotocol.io/)                            | Open standard for pluggable tool surfaces           |
+| [Cloudflared](https://github.com/cloudflare/cloudflared)                              | Public-link remote access via Cloudflare Tunnel     |
+| [Tailscale](https://tailscale.com/)                                                   | Private tailnet access with end-to-end encryption   |
 
 **Messaging channels and bots**
 
-| Project | Used for |
-|:--|:--|
-| [Teloxide](https://github.com/teloxide/teloxide) | Telegram bot framework |
+| Project                                                                                                                       | Used for                   |
+| :---------------------------------------------------------------------------------------------------------------------------- | :------------------------- |
+| [Teloxide](https://github.com/teloxide/teloxide)                                                                              | Telegram bot framework     |
 | Community channel SDKs (Slack, Discord, Matrix, WhatsApp, Signal, iMessage, Google Chat, Teams, LINE, WeChat, QQ, and others) | Messaging-channel adapters |
 
 **Frontend and visualization**
 
-| Project | Used for |
-|:--|:--|
-| [React](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/) | Web UI foundation |
-| [Vite](https://vitejs.dev/) | Frontend build and dev server |
-| [MUI](https://mui.com/) + [Emotion](https://emotion.sh/) | Component library and CSS-in-JS |
-| [TanStack Query](https://tanstack.com/query) | Server-state management and data fetching |
-| [Zustand](https://github.com/pmndrs/zustand) | Client-state management |
-| [ECharts](https://echarts.apache.org/) + [echarts-for-react](https://github.com/hustcc/echarts-for-react) | Charts and visualizations |
-| [react-markdown](https://github.com/remarkjs/react-markdown) + [remark-gfm](https://github.com/remarkjs/remark-gfm) | Markdown rendering in chat |
-| [Lucide](https://lucide.dev/) | Icon set |
+| Project                                                                                                             | Used for                                  |
+| :------------------------------------------------------------------------------------------------------------------ | :---------------------------------------- |
+| [React](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)                                         | Web UI foundation                         |
+| [Vite](https://vitejs.dev/)                                                                                         | Frontend build and dev server             |
+| [MUI](https://mui.com/) + [Emotion](https://emotion.sh/)                                                            | Component library and CSS-in-JS           |
+| [TanStack Query](https://tanstack.com/query)                                                                        | Server-state management and data fetching |
+| [Zustand](https://github.com/pmndrs/zustand)                                                                        | Client-state management                   |
+| [ECharts](https://echarts.apache.org/) + [echarts-for-react](https://github.com/hustcc/echarts-for-react)           | Charts and visualizations                 |
+| [react-markdown](https://github.com/remarkjs/react-markdown) + [remark-gfm](https://github.com/remarkjs/remark-gfm) | Markdown rendering in chat                |
+| [Lucide](https://lucide.dev/)                                                                                       | Icon set                                  |
 
 **Native GUI (optional feature)**
 
-| Project | Used for |
-|:--|:--|
+| Project                                                                | Used for                  |
+| :--------------------------------------------------------------------- | :------------------------ |
 | [egui](https://www.egui.rs/) + [eframe](https://github.com/emilk/egui) | Native desktop GUI option |
 
 If we missed a project that's load-bearing for AgentArk, please open a PR - we want to thank everyone.

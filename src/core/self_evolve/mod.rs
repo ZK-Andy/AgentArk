@@ -10,7 +10,9 @@ pub mod agent;
 pub mod coding_guidelines;
 pub mod gepa_bridge;
 pub mod policy_evolution;
+pub mod promotion_gate;
 pub mod prompt_evolution;
+pub(crate) mod prompt_fragment_evolution;
 pub mod replay_gate;
 pub mod routing_canonical_evolution;
 pub mod security_review;
@@ -23,6 +25,7 @@ pub use agent::{SelfEvolveAgent, SelfEvolveConfig};
 pub use policy_evolution::{
     PolicyEvolutionConfig, PolicyEvolutionEngine, ROUTING_COMPLEXITY_POLICY_KEY,
 };
+pub use promotion_gate::{PromotionGateReason, PromotionGateReport};
 pub use prompt_evolution::{
     PromptBundleDiffSummary, PromptBundleProfile, PromptEvolutionConfig, PromptEvolutionEngine,
     PromptEvolutionResult, PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY, PROMPT_BUNDLE_CANARY_STATE_KEY,

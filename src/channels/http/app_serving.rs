@@ -382,18 +382,18 @@ pub(super) async fn list_apps(State(state): State<AppState>) -> Json<serde_json:
             apps.push(row);
             continue;
         };
-        let access_guard_enabled = obj
-            .get("access_guard_enabled")
+        let expose_public = obj
+            .get("expose_public")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         obj.insert(
             "url".to_string(),
-            serde_json::Value::String(app_root_url_for_state(&state, &app_id)),
+            serde_json::Value::String(app_root_url_for_state(&state, &app_id, expose_public)),
         );
         obj.insert(
             "access_url".to_string(),
             serde_json::Value::String(
-                app_access_url_for_state(&state, &app_id, access_guard_enabled).await,
+                app_access_url_for_state(&state, &app_id, expose_public).await,
             ),
         );
         if !obj
@@ -497,6 +497,147 @@ pub(super) fn rewrite_external_proxy_urls_for_public_apps(content: &str, app_id:
     rewritten
 }
 
+pub(super) fn app_mount_base_path(app_id: &str) -> String {
+    format!("/apps/{}/", urlencoding::encode(app_id))
+}
+
+pub(super) fn rewrite_root_relative_app_urls(content: &str, app_id: &str) -> String {
+    static ROOT_ATTR_RE: OnceLock<Regex> = OnceLock::new();
+    let re = ROOT_ATTR_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b(src|href|action)\s*=\s*(['"])(/(?:[^/'"][^'"]*)?)['"]"#)
+            .expect("valid root-relative app attribute regex")
+    });
+    let app_base = app_mount_base_path(app_id);
+    re.replace_all(content, |caps: &regex::Captures<'_>| {
+        let attr = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let quote = caps.get(2).map(|m| m.as_str()).unwrap_or("\"");
+        let path = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
+        if path == "/apps" || path.starts_with("/apps/") || path.starts_with(&app_base) {
+            return caps
+                .get(0)
+                .map(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string();
+        }
+        format!(
+            "{}={}{}{}{}",
+            attr,
+            quote,
+            app_base,
+            path.trim_start_matches('/'),
+            quote
+        )
+    })
+    .to_string()
+}
+
+fn rebase_root_relative_app_path(path: &str, app_base: &str) -> Option<String> {
+    if path == "/apps" || path.starts_with("/apps/") || path.starts_with(app_base) {
+        return None;
+    }
+    if !path.starts_with('/') || path.starts_with("//") {
+        return None;
+    }
+    Some(format!("{}{}", app_base, path.trim_start_matches('/')))
+}
+
+pub(super) fn rewrite_root_relative_srcset_urls(content: &str, app_id: &str) -> String {
+    static SRCSET_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SRCSET_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\bsrcset\s*=\s*(['"])([^'"]*)['"]"#)
+            .expect("valid srcset attribute regex")
+    });
+    let app_base = app_mount_base_path(app_id);
+    re.replace_all(content, |caps: &regex::Captures<'_>| {
+        let quote = caps.get(1).map(|m| m.as_str()).unwrap_or("\"");
+        let raw_srcset = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let rewritten = raw_srcset
+            .split(',')
+            .map(|candidate| {
+                let trimmed = candidate.trim();
+                if trimmed.is_empty() {
+                    return String::new();
+                }
+                let mut parts = trimmed.splitn(2, char::is_whitespace);
+                let url = parts.next().unwrap_or_default();
+                let descriptor = parts.next().unwrap_or_default().trim();
+                let rebased = rebase_root_relative_app_path(url, &app_base)
+                    .unwrap_or_else(|| url.to_string());
+                if descriptor.is_empty() {
+                    rebased
+                } else {
+                    format!("{} {}", rebased, descriptor)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("srcset={}{}{}", quote, rewritten, quote)
+    })
+    .to_string()
+}
+
+pub(super) fn rewrite_root_relative_css_urls(content: &str, app_id: &str) -> String {
+    static CSS_URL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = CSS_URL_RE.get_or_init(|| {
+        Regex::new(r#"(?i)url\(\s*(['"]?)(/(?:[^/'")][^'")]*)?)(['"]?)\s*\)"#)
+            .expect("valid root-relative css url regex")
+    });
+    let app_base = app_mount_base_path(app_id);
+    re.replace_all(content, |caps: &regex::Captures<'_>| {
+        let quote = caps
+            .get(1)
+            .filter(|m| !m.as_str().is_empty())
+            .or_else(|| caps.get(3).filter(|m| !m.as_str().is_empty()))
+            .map(|m| m.as_str())
+            .unwrap_or_default();
+        let path = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        if path == "/apps" || path.starts_with("/apps/") || path.starts_with(&app_base) {
+            return caps
+                .get(0)
+                .map(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string();
+        }
+        format!(
+            "url({}{}{}{})",
+            quote,
+            app_base,
+            path.trim_start_matches('/'),
+            quote
+        )
+    })
+    .to_string()
+}
+
+pub(super) fn transform_app_text_response(
+    response_headers: &HeaderMap,
+    response_body: &[u8],
+    app_id: &str,
+    request_headers: &HeaderMap,
+) -> Vec<u8> {
+    let content_type = response_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !should_upgrade_insecure_links(content_type) {
+        return response_body.to_vec();
+    }
+    let mut rewritten = String::from_utf8_lossy(response_body).into_owned();
+    rewritten = rewrite_external_proxy_urls_for_public_apps(&rewritten, app_id);
+    let lower_content_type = content_type.to_ascii_lowercase();
+    if lower_content_type.starts_with("text/html") {
+        rewritten = rewrite_root_relative_app_urls(&rewritten, app_id);
+        rewritten = rewrite_root_relative_srcset_urls(&rewritten, app_id);
+        rewritten = inject_app_runtime_fetch_shims(&rewritten, app_id);
+    } else if lower_content_type.starts_with("text/css") {
+        rewritten = rewrite_root_relative_css_urls(&rewritten, app_id);
+    }
+    if is_secure_origin_request(request_headers) {
+        rewritten = upgrade_http_links_for_secure_origin(&rewritten);
+    }
+    rewritten.into_bytes()
+}
+
 pub(super) fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
     if content.contains("__agentarkLlmProxyShimApplied") {
         return content.to_string();
@@ -507,6 +648,7 @@ pub(super) fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> Str
   if (window.__agentarkLlmProxyShimApplied) return;
   window.__agentarkLlmProxyShimApplied = true;
   const APP_ID = "{app_id}";
+  const APP_BASE_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/";
   const PROXY_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/llm/chat";
   const PUBLIC_FETCH_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/http/fetch";
 
@@ -524,6 +666,19 @@ pub(super) fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> Str
       return candidate ? new URL(candidate, window.location.href).toString() : "";
     }} catch (_) {{
       return extractUrl(input);
+    }}
+  }};
+  const rebaseSameOriginAppUrl = (url) => {{
+    try {{
+      const absolute = new URL(String(url || ""), window.location.href);
+      if (absolute.origin !== window.location.origin) return "";
+      const path = absolute.pathname || "/";
+      if (!path.startsWith("/")) return "";
+      if (path === "/apps" || path.startsWith("/apps/") || path.startsWith(APP_BASE_PATH)) return "";
+      if (path === "/") return APP_BASE_PATH + absolute.search + absolute.hash;
+      return APP_BASE_PATH + path.replace(/^\/+/, "") + absolute.search + absolute.hash;
+    }} catch (_) {{
+      return "";
     }}
   }};
   const shouldProxyPublicRead = (url, method) => {{
@@ -586,6 +741,16 @@ pub(super) fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> Str
       )
         .toString()
         .toUpperCase();
+      const rebasedAppUrl = rebaseSameOriginAppUrl(targetUrl || absoluteTargetUrl);
+      if (rebasedAppUrl) {{
+        let rebasedInput = rebasedAppUrl;
+        try {{
+          if (typeof Request !== "undefined" && input instanceof Request) {{
+            rebasedInput = new Request(rebasedAppUrl, input);
+          }}
+        }} catch (_) {{}}
+        return nativeFetch(rebasedInput, init);
+      }}
       if (shouldProxyPublicRead(absoluteTargetUrl || targetUrl, inferredMethod)) {{
         const proxyReadInit = {{
           method: inferredMethod,
@@ -625,7 +790,11 @@ pub(super) fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> Str
     xhrProto.open = function(method, url) {{
       const args = Array.prototype.slice.call(arguments);
       const targetUrl = toAbsoluteUrl(url);
-      if (shouldProxyPublicRead(targetUrl, method)) {{
+      const rebasedAppUrl = rebaseSameOriginAppUrl(url || targetUrl);
+      if (rebasedAppUrl) {{
+        args[1] = rebasedAppUrl;
+        this.__agentarkPublicFetchProxy = false;
+      }} else if (shouldProxyPublicRead(targetUrl, method)) {{
         args[1] = PUBLIC_FETCH_PATH + "?url=" + encodeURIComponent(targetUrl);
         this.__agentarkPublicFetchProxy = true;
       }} else {{
@@ -2187,15 +2356,8 @@ pub(super) async fn public_proxy_raw(
 
 pub(super) fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
     query.and_then(|q| {
-        url::form_urlencoded::parse(q.as_bytes())
-            .find_map(|(k, v)| if k == key { Some(v.into_owned()) } else { None })
-    })
-}
-
-pub(super) fn extract_query_param_any(query: Option<&str>, keys: &[&str]) -> Option<String> {
-    query.and_then(|q| {
         url::form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| {
-            if keys.iter().any(|candidate| k == *candidate) {
+            if k == key {
                 Some(v.into_owned())
             } else {
                 None
@@ -2278,25 +2440,71 @@ pub(super) fn build_absolute_app_url(
     }
 }
 
-pub(super) fn app_root_url_for_state(state: &AppState, app_id: &str) -> String {
-    build_absolute_app_url(state.public_app_base_url.as_deref(), app_id, "", None)
+async fn app_access_cookie_should_be_secure(state: &AppState, headers: &HeaderMap) -> bool {
+    if state.cookie_secure_default {
+        return true;
+    }
+    if state.server_role == HttpServerRole::PublicApps
+        && state
+            .public_app_base_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|url| url.starts_with("https://"))
+    {
+        return true;
+    }
+    let tunnel_url = {
+        let tunnel = state.tunnel.read().await;
+        tunnel.url.clone()
+    };
+    request_matches_active_tunnel(headers, tunnel_url.as_deref())
+}
+
+fn extract_app_guard_password_from_form(body: &[u8]) -> Option<String> {
+    url::form_urlencoded::parse(body)
+        .find_map(|(key, value)| (key == "password").then(|| value.into_owned()))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn app_base_url_for_exposure(state: &AppState, expose_public: bool) -> Option<&str> {
+    expose_public
+        .then_some(state.public_app_base_url.as_deref())
+        .flatten()
+}
+
+pub(super) fn app_root_url_for_state(
+    state: &AppState,
+    app_id: &str,
+    expose_public: bool,
+) -> String {
+    build_absolute_app_url(
+        app_base_url_for_exposure(state, expose_public),
+        app_id,
+        "",
+        None,
+    )
 }
 
 pub(super) async fn app_access_url_for_state(
     state: &AppState,
     app_id: &str,
-    access_guard_enabled: bool,
+    expose_public: bool,
 ) -> String {
-    let relative = if access_guard_enabled {
+    let relative = if expose_public {
+        state
+            .app_registry
+            .issue_public_access_url(app_id)
+            .await
+            .unwrap_or_else(|| build_app_url(app_id, "", None))
+    } else {
         state
             .app_registry
             .issue_access_url(app_id)
             .await
             .unwrap_or_else(|| build_app_url(app_id, "", None))
-    } else {
-        build_app_url(app_id, "", None)
     };
-    match state.public_app_base_url.as_deref() {
+    match app_base_url_for_exposure(state, expose_public) {
         Some(base) if !base.trim().is_empty() => {
             format!("{}{}", base.trim_end_matches('/'), relative)
         }
@@ -2316,6 +2524,80 @@ pub(super) fn is_hop_by_hop_header(header_name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+pub(super) fn should_forward_app_proxy_response_header(header_name: &HeaderName) -> bool {
+    let lower = header_name.as_str().to_ascii_lowercase();
+    if is_hop_by_hop_header(&lower) {
+        return false;
+    }
+    matches!(
+        lower.as_str(),
+        "accept-ranges"
+            | "cache-control"
+            | "content-disposition"
+            | "content-language"
+            | "content-range"
+            | "content-type"
+            | "etag"
+            | "expires"
+            | "last-modified"
+            | "vary"
+    )
+}
+
+fn sanitize_app_proxy_location(value: &HeaderValue, app_id: &str) -> Option<HeaderValue> {
+    let raw = value.to_str().ok()?.trim();
+    if raw.is_empty() || raw.starts_with("//") {
+        return None;
+    }
+    if raw.starts_with('/') {
+        let app_prefix = format!("/apps/{}", app_id);
+        let location = if raw == app_prefix || raw.starts_with(&format!("{}/", app_prefix)) {
+            raw.to_string()
+        } else {
+            format!("{}{}", app_prefix, raw)
+        };
+        return HeaderValue::from_str(&location).ok();
+    }
+    if let Ok(parsed) = reqwest::Url::parse(raw) {
+        let host = parsed.host_str().unwrap_or_default();
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !is_local_or_private_host_for_upgrade(host)
+        {
+            return None;
+        }
+        let mut location = format!("/apps/{}{}", app_id, parsed.path());
+        if let Some(query) = parsed.query().filter(|query| !query.is_empty()) {
+            location.push('?');
+            location.push_str(query);
+        }
+        if let Some(fragment) = parsed.fragment().filter(|fragment| !fragment.is_empty()) {
+            location.push('#');
+            location.push_str(fragment);
+        }
+        return HeaderValue::from_str(&location).ok();
+    }
+    HeaderValue::from_str(raw).ok()
+}
+
+pub(super) fn apply_app_proxy_response_headers(
+    mut builder: axum::http::response::Builder,
+    response_headers: &HeaderMap,
+    app_id: &str,
+) -> axum::http::response::Builder {
+    for (name, value) in response_headers {
+        if name == header::LOCATION {
+            if let Some(location) = sanitize_app_proxy_location(value, app_id) {
+                builder = builder.header(header::LOCATION, location);
+            }
+            continue;
+        }
+        if should_forward_app_proxy_response_header(name) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
 }
 
 pub(super) fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
@@ -2545,14 +2827,29 @@ pub(super) async fn serve_app_file_inner(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // Check app existence first so unknown IDs return 404 instead of auth form.
+    let Some(app_dir) = state.app_registry.get_dir(app_id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !state.app_registry.is_enabled(app_id).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This app is disabled. Start it again from the Apps page.",
+        )
+            .into_response();
+    }
+
+    let local_access_guard_enabled = state.app_registry.access_guard_enabled(app_id).await;
+    let expose_public = state.app_registry.expose_public(app_id).await;
     if state.server_role == HttpServerRole::ControlPlane
+        && expose_public
         && internet_facing_apps_should_be_isolated(
             state.deployment_mode,
             state.public_app_bind_addr.as_deref(),
         )
     {
         let target = build_absolute_app_url(
-            state.public_app_base_url.as_deref(),
+            app_base_url_for_exposure(state, expose_public),
             app_id,
             path,
             uri.query(),
@@ -2570,31 +2867,20 @@ pub(super) async fn serve_app_file_inner(
         )
             .into_response();
     }
-
-    // Check app existence first so unknown IDs return 404 instead of auth form.
-    let Some(app_dir) = state.app_registry.get_dir(app_id).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !state.app_registry.is_enabled(app_id).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "This app is disabled. Start it again from the Apps page.",
-        )
-            .into_response();
+    if state.server_role == HttpServerRole::PublicApps {
+        if !expose_public {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if !state.app_registry.public_access_guard_enabled(app_id).await {
+            return app_public_exposure_requires_guard_response(app_id, path, &headers);
+        }
     }
-
-    let access_guard_enabled = state.app_registry.access_guard_enabled(app_id).await;
-    if state.server_role == HttpServerRole::PublicApps && !access_guard_enabled {
-        return app_public_exposure_requires_guard_response(app_id, path, &headers);
-    }
+    let access_guard_enabled =
+        state.server_role == HttpServerRole::PublicApps || local_access_guard_enabled;
+    let normalized_path = path.trim_start_matches('/');
     let cookie_name = format!("ark_app_{}", app_id);
     let grant_from_query = if access_guard_enabled {
         extract_query_param(uri.query(), "grant")
-    } else {
-        None
-    };
-    let password_from_query = if access_guard_enabled {
-        extract_query_param_any(uri.query(), &["password", "key"])
     } else {
         None
     };
@@ -2642,28 +2928,12 @@ pub(super) async fn serve_app_file_inner(
             Some(key) => state.app_registry.verify_key(app_id, key).await,
             None => false,
         };
-        let password_valid = match password_from_query.as_deref() {
-            Some(password) => state.app_registry.verify_key(app_id, password).await,
-            None => false,
-        };
 
-        if !query_valid && !cookie_valid && !header_valid && !password_valid {
-            return app_access_denied_response(app_id, path, &headers);
-        }
-
-        // First successful password or bootstrap entry: set cookie and redirect to a clean URL.
-        if (query_valid || password_valid)
-            && !cookie_valid
-            && !header_valid
-            && method == Method::GET
-            && !is_ws_request
+        // First successful bootstrap grant: set cookie and redirect to a clean URL.
+        if query_valid && !cookie_valid && !header_valid && method == Method::GET && !is_ws_request
         {
             if let Some(session_token) = state.app_registry.create_access_session(app_id).await {
-                let request_proto = headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("http");
-                let secure_attr = if request_proto.eq_ignore_ascii_case("https") {
+                let secure_attr = if app_access_cookie_should_be_secure(state, &headers).await {
                     "; Secure"
                 } else {
                     ""
@@ -2682,6 +2952,48 @@ pub(super) async fn serve_app_file_inner(
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
         }
+
+        if !query_valid && !cookie_valid && !header_valid {
+            if method == Method::POST && !is_ws_request && normalized_path.is_empty() {
+                let body_bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large")
+                            .into_response();
+                    }
+                };
+                let form_valid = match extract_app_guard_password_from_form(&body_bytes) {
+                    Some(password) => state.app_registry.verify_key(app_id, &password).await,
+                    None => false,
+                };
+                if form_valid {
+                    if let Some(session_token) =
+                        state.app_registry.create_access_session(app_id).await
+                    {
+                        let secure_attr =
+                            if app_access_cookie_should_be_secure(state, &headers).await {
+                                "; Secure"
+                            } else {
+                                ""
+                            };
+                        let cookie = format!(
+                            "{}={}; Path=/apps/{}; HttpOnly; SameSite=Lax; Max-Age=604800{}",
+                            cookie_name, session_token, app_id, secure_attr
+                        );
+                        let clean_query =
+                            strip_query_params(uri.query(), &["grant", "password", "key"]);
+                        let clean_url = build_app_url(app_id, path, clean_query.as_deref());
+                        return Response::builder()
+                            .status(StatusCode::SEE_OTHER)
+                            .header(header::SET_COOKIE, cookie)
+                            .header(header::LOCATION, clean_url)
+                            .body(axum::body::Body::empty())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                }
+            }
+            return app_access_denied_response(app_id, path, &headers);
+        }
     }
 
     let is_static = state.app_registry.is_static(app_id).await;
@@ -2692,7 +3004,6 @@ pub(super) async fn serve_app_file_inner(
     } else {
         uri.query().map(|q| q.to_string())
     };
-    let normalized_path = path.trim_start_matches('/');
     if normalized_path.eq_ignore_ascii_case("__agentark/llm/chat") {
         if method != Method::POST {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -2864,15 +3175,20 @@ pub(super) async fn serve_app_file_inner(
                     match resp.bytes().await {
                         Ok(response_body) => {
                             let mut builder = Response::builder().status(status);
-                            for (name, value) in &response_headers {
-                                if !is_hop_by_hop_header(name.as_str()) {
-                                    builder = builder.header(name, value);
-                                }
-                            }
+                            builder = apply_app_proxy_response_headers(
+                                builder,
+                                &response_headers,
+                                app_id,
+                            );
                             let response_body = if method == Method::HEAD {
                                 axum::body::Body::empty()
                             } else {
-                                axum::body::Body::from(response_body)
+                                axum::body::Body::from(transform_app_text_response(
+                                    &response_headers,
+                                    response_body.as_ref(),
+                                    app_id,
+                                    &headers,
+                                ))
                             };
                             return builder
                                 .body(response_body)
@@ -3020,15 +3336,17 @@ pub(super) async fn serve_app_file_inner(
                 match resp.bytes().await {
                     Ok(response_body) => {
                         let mut builder = Response::builder().status(status);
-                        for (name, value) in &response_headers {
-                            if !is_hop_by_hop_header(name.as_str()) {
-                                builder = builder.header(name, value);
-                            }
-                        }
+                        builder =
+                            apply_app_proxy_response_headers(builder, &response_headers, app_id);
                         let response_body = if method == Method::HEAD {
                             axum::body::Body::empty()
                         } else {
-                            axum::body::Body::from(response_body)
+                            axum::body::Body::from(transform_app_text_response(
+                                &response_headers,
+                                response_body.as_ref(),
+                                app_id,
+                                &headers,
+                            ))
                         };
                         builder
                             .body(response_body)
@@ -3041,6 +3359,12 @@ pub(super) async fn serve_app_file_inner(
                 (StatusCode::SERVICE_UNAVAILABLE, "App server not responding").into_response()
             }
         }
+    } else if !is_static {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "App runtime is not accepting connections yet.",
+        )
+            .into_response();
     } else if is_static {
         if method != Method::GET && method != Method::HEAD {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -3094,15 +3418,16 @@ pub(super) async fn serve_app_file_inner(
                 let content_type = guess_app_content_type(filename);
                 let mut response_bytes = bytes;
                 if should_upgrade_insecure_links(&content_type) {
-                    let mut rewritten = String::from_utf8_lossy(&response_bytes).into_owned();
-                    rewritten = rewrite_external_proxy_urls_for_public_apps(&rewritten, app_id);
-                    if content_type.to_ascii_lowercase().starts_with("text/html") {
-                        rewritten = inject_app_runtime_fetch_shims(&rewritten, app_id);
+                    let mut response_headers = HeaderMap::new();
+                    if let Ok(value) = HeaderValue::from_str(&content_type) {
+                        response_headers.insert(header::CONTENT_TYPE, value);
                     }
-                    if is_secure_origin_request(&headers) {
-                        rewritten = upgrade_http_links_for_secure_origin(&rewritten);
-                    }
-                    response_bytes = rewritten.into_bytes();
+                    response_bytes = transform_app_text_response(
+                        &response_headers,
+                        &response_bytes,
+                        app_id,
+                        &headers,
+                    );
                 }
                 if method == Method::HEAD {
                     (
@@ -3255,7 +3580,7 @@ pub(super) fn app_access_denied_page(app_id: &str) -> Response {
 <div class="eyebrow">AgentArk App Guard</div>
 <h1>Access Password Required</h1>
 <p>This app is protected. Enter the access password to continue.</p>
-<form method="GET" action="/apps/{app_id}/">
+<form method="POST" action="/apps/{app_id}/">
 <label for="password">Access password</label>
 <input id="password" type="password" name="password" placeholder="Enter access password" autocomplete="current-password" autofocus required>
 <button type="submit">Unlock</button>
@@ -3344,6 +3669,55 @@ mod tests {
     fn app_guard_does_not_return_html_for_stylesheet_request() {
         let headers = axum::http::HeaderMap::new();
         assert!(!should_render_app_guard_document("styles.css", &headers));
+    }
+
+    #[test]
+    fn root_relative_html_urls_are_rebased_to_app_mount() {
+        let html = r#"<a href="/">Home</a><script src="/app.js"></script><form action="/api/save"></form><img srcset="/small.png 1x, /large.png 2x"><link href="/apps/other/style.css">"#;
+        let rewritten = rewrite_root_relative_srcset_urls(
+            &rewrite_root_relative_app_urls(html, "demo-app"),
+            "demo-app",
+        );
+
+        assert!(rewritten.contains(r#"href="/apps/demo-app/""#));
+        assert!(rewritten.contains(r#"src="/apps/demo-app/app.js""#));
+        assert!(rewritten.contains(r#"action="/apps/demo-app/api/save""#));
+        assert!(rewritten
+            .contains(r#"srcset="/apps/demo-app/small.png 1x, /apps/demo-app/large.png 2x""#));
+        assert!(rewritten.contains(r#"href="/apps/other/style.css""#));
+    }
+
+    #[test]
+    fn root_relative_css_urls_are_rebased_to_app_mount() {
+        let css = r#".logo{background:url("/assets/logo.png")}.home{mask:url('/')}.external{background:url("//cdn.example/app.png")}"#;
+        let rewritten = rewrite_root_relative_css_urls(css, "demo-app");
+
+        assert!(rewritten.contains(r#"url("/apps/demo-app/assets/logo.png")"#));
+        assert!(rewritten.contains(r#"url('/apps/demo-app/')"#));
+        assert!(rewritten.contains(r#"url("//cdn.example/app.png")"#));
+    }
+
+    #[test]
+    fn html_transform_injects_runtime_fetch_rebase_shim() {
+        let mut response_headers = axum::http::HeaderMap::new();
+        response_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        let request_headers = axum::http::HeaderMap::new();
+        let body =
+            br#"<html><head></head><body><script>fetch('/api/papers')</script></body></html>"#;
+        let rewritten = String::from_utf8(transform_app_text_response(
+            &response_headers,
+            body,
+            "demo-app",
+            &request_headers,
+        ))
+        .expect("html transform should remain utf8");
+
+        assert!(rewritten.contains("APP_BASE_PATH"));
+        assert!(rewritten.contains("rebaseSameOriginAppUrl"));
+        assert!(rewritten.contains("fetch('/api/papers')"));
     }
 }
 
@@ -3445,7 +3819,8 @@ pub(super) async fn update_app_access_guard(
     {
         Ok(access_key) => {
             trigger_arkpulse_after_app_change(&state, "app_access_guard_update").await;
-            let access_url = app_access_url_for_state(&state, &app_id, request.enabled).await;
+            let expose_public = state.app_registry.expose_public(&app_id).await;
+            let access_url = app_access_url_for_state(&state, &app_id, expose_public).await;
             let access_password = if request.enabled {
                 access_key.clone()
             } else {
@@ -3460,6 +3835,7 @@ pub(super) async fn update_app_access_guard(
                     "access_key": if request.enabled { access_key } else { String::new() },
                     "access_password": access_password,
                     "access_url": access_url,
+                    "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
                 })),
             )
                 .into_response()
@@ -3467,10 +3843,7 @@ pub(super) async fn update_app_access_guard(
         Err(e) => {
             let status = if e.to_string() == "App not found" {
                 StatusCode::NOT_FOUND
-            } else if e.to_string().contains("Access password")
-                || e.to_string()
-                    .contains("Public apps must keep App Guard enabled")
-            {
+            } else if e.to_string().contains("Access password") {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -3688,10 +4061,15 @@ pub(super) async fn restart_app(
                     .get("access_guard_enabled")
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false);
-                let app_url =
-                    build_absolute_app_url(state.public_app_base_url.as_deref(), &app_id, "", None);
-                let app_access_url =
-                    app_access_url_for_state(&state, &app_id, access_guard_enabled).await;
+                let expose_public = if let Some(value) =
+                    raw.get("expose_public").and_then(|value| value.as_bool())
+                {
+                    value
+                } else {
+                    state.app_registry.expose_public(&app_id).await
+                };
+                let app_url = app_root_url_for_state(&state, &app_id, expose_public);
+                let app_access_url = app_access_url_for_state(&state, &app_id, expose_public).await;
                 return Json(serde_json::json!({
                     "status": "restarted",
                     "type": raw.get("mode").cloned().unwrap_or_else(|| serde_json::json!("dynamic")),
@@ -3700,8 +4078,10 @@ pub(super) async fn restart_app(
                     "url": app_url,
                     "access_url": app_access_url,
                     "access_guard_enabled": access_guard_enabled,
+                    "expose_public": expose_public,
                     "port": raw.get("port").cloned().unwrap_or(serde_json::Value::Null),
                     "runtime_preference": raw.get("runtime_mode").cloned().unwrap_or_else(|| serde_json::json!("executor")),
+                    "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
                     "details": payload,
                 }))
                 .into_response();
@@ -3763,11 +4143,16 @@ pub(super) async fn restart_app(
                 .collect()
         })
         .unwrap_or_default();
+    let expose_public = meta
+        .get("expose_public")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let access_guard_enabled = meta
         .get("access_guard_enabled")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let access_key = if access_guard_enabled {
+    let public_access_guard_enabled = access_guard_enabled || expose_public;
+    let access_key = if public_access_guard_enabled {
         state
             .app_registry
             .access_key(&app_id)
@@ -3825,7 +4210,9 @@ pub(super) async fn restart_app(
         .await;
     }
 
-    if meta.get("access_guard_enabled").is_none() || meta.get("access_key").is_some() {
+    if meta.get("access_guard_enabled").and_then(|v| v.as_bool()) != Some(access_guard_enabled)
+        || meta.get("access_key").is_some()
+    {
         meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
         if let Some(obj) = meta.as_object_mut() {
             obj.remove("access_key");
@@ -3919,6 +4306,7 @@ pub(super) async fn restart_app(
                     "required_secrets": required_secret_keys.clone(),
                     "required_env": required_secret_keys,
                     "required_config": required_config_keys,
+                    "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
                     "message": "Missing required inputs. Use the secure credential form in chat or Settings for sensitive values; provide config for non-sensitive values."
                 })),
             )
@@ -3941,6 +4329,30 @@ pub(super) async fn restart_app(
         .await
         {
             Ok(runtime_handle) => {
+                let mut runtime_handle = runtime_handle;
+                let app_dir_for_diagnostics = app_dir.clone();
+                if let Err(wait_error) =
+                    crate::actions::app::wait_for_runtime_port_open(&app_id, port, &None).await
+                {
+                    crate::actions::app::stop_dynamic_runtime_handle(&app_id, &mut runtime_handle)
+                        .await;
+                    let logs = crate::actions::app::read_local_runtime_log_tail(
+                        &app_dir_for_diagnostics,
+                        4096,
+                    )
+                    .await;
+                    let detail = if logs.is_empty() {
+                        wait_error.to_string()
+                    } else {
+                        format!("{}. Recent runtime logs:\n{}", wait_error, logs)
+                    };
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "error": detail })),
+                    )
+                        .into_response();
+                }
+
                 let (child, container_id) = match runtime_handle {
                     crate::actions::app::DynamicRuntimeHandle::Container(container_id) => {
                         (None, Some(container_id))
@@ -3949,7 +4361,6 @@ pub(super) async fn restart_app(
                         (Some(*child), None)
                     }
                 };
-                let app_dir_for_diagnostics = app_dir.clone();
                 state
                     .app_registry
                     .register_dynamic(
@@ -3971,32 +4382,9 @@ pub(super) async fn restart_app(
                         },
                     )
                     .await;
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                if !state.app_registry.runtime_is_alive(&app_id).await {
-                    let logs = crate::actions::app::read_local_runtime_log_tail(
-                        &app_dir_for_diagnostics,
-                        4096,
-                    )
-                    .await;
-                    let detail = if logs.is_empty() {
-                        "App process stopped shortly after restart.".to_string()
-                    } else {
-                        format!(
-                            "App process stopped shortly after restart. Recent runtime logs:\n{}",
-                            logs
-                        )
-                    };
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({ "error": detail })),
-                    )
-                        .into_response();
-                }
                 trigger_arkpulse_after_app_change(&state, "app_restart").await;
-                let app_url =
-                    build_absolute_app_url(state.public_app_base_url.as_deref(), &app_id, "", None);
-                let app_access_url =
-                    app_access_url_for_state(&state, &app_id, access_guard_enabled).await;
+                let app_url = app_root_url_for_state(&state, &app_id, expose_public);
+                let app_access_url = app_access_url_for_state(&state, &app_id, expose_public).await;
                 Json(serde_json::json!({
                     "status": "restarted",
                     "type": "dynamic",
@@ -4007,8 +4395,11 @@ pub(super) async fn restart_app(
                     "access_key": access_key,
                     "access_password": access_key,
                     "access_guard_enabled": access_guard_enabled,
+                    "public_access_guard_enabled": public_access_guard_enabled,
+                    "expose_public": expose_public,
                     "port": port,
                     "runtime_preference": runtime_preference.as_str(),
+                    "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
                 }))
                 .into_response()
             }
@@ -4039,9 +4430,8 @@ pub(super) async fn restart_app(
             )
             .await;
         trigger_arkpulse_after_app_change(&state, "app_restart").await;
-        let app_url =
-            build_absolute_app_url(state.public_app_base_url.as_deref(), &app_id, "", None);
-        let app_access_url = app_access_url_for_state(&state, &app_id, access_guard_enabled).await;
+        let app_url = app_root_url_for_state(&state, &app_id, expose_public);
+        let app_access_url = app_access_url_for_state(&state, &app_id, expose_public).await;
         Json(serde_json::json!({
             "status": "restarted",
             "type": "static",
@@ -4052,7 +4442,10 @@ pub(super) async fn restart_app(
             "access_key": access_key,
             "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
+            "public_access_guard_enabled": public_access_guard_enabled,
+            "expose_public": expose_public,
             "runtime_preference": runtime_preference.as_str(),
+            "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
         }))
         .into_response()
     }

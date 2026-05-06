@@ -2,7 +2,7 @@ use super::config::{ModelCapabilityTier, ModelCostTier};
 use super::llm::{LlmClient, LlmResponse, LlmStreamFailure, LlmStreamFailureKind};
 use crate::actions::ActionDef;
 use crate::core::PromptMemory;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -460,6 +460,11 @@ impl ExecutionSupervisor {
         {
             return FailureKind::Authentication;
         }
+        if lower.contains("model_not_found")
+            || lower.contains("does not exist or you do not have access")
+        {
+            return FailureKind::Configuration;
+        }
         if lower.contains("missing api key")
             || lower.contains("not configured")
             || lower.contains("base url is required")
@@ -877,24 +882,39 @@ pub async fn execute_supervised_transport_chat_stream_with_policy(
     actions: &[ActionDef],
     timeout_ms: Option<u64>,
     token_tx: tokio::sync::mpsc::Sender<crate::core::agent::StreamEvent>,
+    app_delivery_stream: bool,
     policy: &crate::security::ModelPrivacyConfig,
     allow_sensitive_context: bool,
 ) -> Result<LlmResponse> {
     let history: Vec<crate::core::agent::ConversationMessage> = Vec::new();
     let response = if let Some(timeout_ms) = timeout_ms.filter(|value| *value > 0) {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            llm.chat_with_history_stream_for_helper(
-                system_prompt,
-                user_message,
-                &history,
-                memories,
-                actions,
-                token_tx,
-                policy,
-                allow_sensitive_context,
-            ),
-        )
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+            if app_delivery_stream {
+                llm.chat_with_history_stream_for_app_delivery(
+                    system_prompt,
+                    user_message,
+                    &history,
+                    memories,
+                    actions,
+                    token_tx,
+                    policy,
+                    allow_sensitive_context,
+                )
+                .await
+            } else {
+                llm.chat_with_history_stream_for_helper(
+                    system_prompt,
+                    user_message,
+                    &history,
+                    memories,
+                    actions,
+                    token_tx,
+                    policy,
+                    allow_sensitive_context,
+                )
+                .await
+            }
+        })
         .await
         {
             Ok(result) => result,
@@ -910,17 +930,31 @@ pub async fn execute_supervised_transport_chat_stream_with_policy(
             }
         }
     } else {
-        llm.chat_with_history_stream_for_helper(
-            system_prompt,
-            user_message,
-            &history,
-            memories,
-            actions,
-            token_tx,
-            policy,
-            allow_sensitive_context,
-        )
-        .await
+        if app_delivery_stream {
+            llm.chat_with_history_stream_for_app_delivery(
+                system_prompt,
+                user_message,
+                &history,
+                memories,
+                actions,
+                token_tx,
+                policy,
+                allow_sensitive_context,
+            )
+            .await
+        } else {
+            llm.chat_with_history_stream_for_helper(
+                system_prompt,
+                user_message,
+                &history,
+                memories,
+                actions,
+                token_tx,
+                policy,
+                allow_sensitive_context,
+            )
+            .await
+        }
     };
 
     response.map_err(|error| {
@@ -1044,6 +1078,17 @@ mod tests {
                 "supervised_chat_failed(kind=transient_transport, request_kind=agent_turn_loop_v1, model=m): provider stream stalled"
             ),
             FailureKind::TransientTransport
+        );
+    }
+
+    #[test]
+    fn classify_failure_treats_provider_model_not_found_as_configuration() {
+        let supervisor = ExecutionSupervisor::default();
+        assert_eq!(
+            supervisor.classify_failure(
+                r#"OpenAI API error (404 Not Found): {"message":"Model zai-glm-4.7 does not exist or you do not have access to it.","type":"not_found_error","param":"model","code":"model_not_found"}"#
+            ),
+            FailureKind::Configuration
         );
     }
 

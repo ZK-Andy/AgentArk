@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
@@ -26,6 +26,11 @@ use crate::core::prompt_policy::{
 };
 use crate::core::task_router::{AgentExecResult, RoutingDecision};
 use crate::core::{DelegationStatus, FailureKind};
+
+use super::promotion_gate::{
+    promotion_gate_report, render_legacy_promotion_gate, PromotionGateCheck,
+    PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
+};
 
 pub const PROMPT_BUNDLE_PROFILE_KEY: &str = "prompt_bundle_profile_v1";
 pub const PROMPT_BUNDLE_PROFILE_CANARY_KEY: &str = "prompt_bundle_profile_canary_v1";
@@ -164,6 +169,8 @@ pub struct PromptEvolutionResult {
     pub candidate_source: Option<String>,
     pub optimized_surfaces: Vec<String>,
     pub promotion_gate: String,
+    pub promotion_gate_summary: String,
+    pub promotion_gate_report: PromotionGateReport,
     pub promoted_prompt_bundle: Option<PromptBundleProfile>,
     pub lineage_entry_id: String,
     pub lineage_archive_path: String,
@@ -440,8 +447,10 @@ impl PromptEvolutionEngine {
 
         let promotion_checks =
             prompt_promotion_checks(&self.config, &baseline_eval, &best_eval, &best_stats);
-        let promoted = promotion_checks.values().all(|passed| *passed);
+        let promoted = promotion_checks.iter().all(|check| check.passed);
         let promotion_gate = render_prompt_promotion_gate(&promotion_checks);
+        let promotion_gate_report = promotion_gate_report(&promotion_checks);
+        let promotion_gate_summary = promotion_gate_report.summary.clone();
         let notes = build_prompt_notes(
             &baseline_eval,
             &best_eval,
@@ -521,6 +530,8 @@ impl PromptEvolutionEngine {
             candidate_source: Some(best_candidate.source),
             optimized_surfaces,
             promotion_gate,
+            promotion_gate_summary,
+            promotion_gate_report,
             promoted_prompt_bundle: if promoted {
                 Some(best_candidate.bundle)
             } else {
@@ -606,6 +617,13 @@ impl PromptEvolutionEngine {
             candidate_source: None,
             optimized_surfaces: Vec::new(),
             promotion_gate: "rejected: no valid prompt bundle mutations".to_string(),
+            promotion_gate_summary:
+                "Not promoted: no distinct prompt bundle changes were available to test."
+                    .to_string(),
+            promotion_gate_report: PromotionGateReport::rejected(vec![PromotionGateReason::new(
+                "no_valid_prompt_bundle_mutations",
+                "no distinct prompt bundle changes were available to test",
+            )]),
             promoted_prompt_bundle: None,
             lineage_entry_id: entry_id,
             lineage_archive_path: self.archive_path().display().to_string(),
@@ -2026,30 +2044,80 @@ fn build_prompt_notes(
     notes
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptPromotionCheck {
+    ScoreNotWorse,
+    MinScoreGain,
+    WinsGtLosses,
+    SignTest,
+    RouterInvalidJsonNotWorse,
+    PromptEfficiencyNotMateriallyWorse,
+}
+
+impl PromotionGateCheck for PromptPromotionCheck {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ScoreNotWorse => "score_not_worse",
+            Self::MinScoreGain => "min_score_gain",
+            Self::WinsGtLosses => "wins_gt_losses",
+            Self::SignTest => "sign_test",
+            Self::RouterInvalidJsonNotWorse => "router_invalid_json_not_worse",
+            Self::PromptEfficiencyNotMateriallyWorse => "prompt_efficiency_not_materially_worse",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ScoreNotWorse => "candidate score was below the stable prompt bundle",
+            Self::MinScoreGain => "score improvement was below the promotion threshold",
+            Self::WinsGtLosses => "candidate did not win more benchmark cases than it lost",
+            Self::SignTest => "statistical confidence is not high enough yet",
+            Self::RouterInvalidJsonNotWorse => "router JSON reliability got worse",
+            Self::PromptEfficiencyNotMateriallyWorse => {
+                "prompt size increased more than the efficiency guardrail allows"
+            }
+        }
+    }
+}
+
 fn prompt_promotion_checks(
     config: &PromptEvolutionConfig,
     baseline_eval: &BundleEvaluation,
     candidate_eval: &BundleEvaluation,
     stats: &PairedStats,
-) -> HashMap<&'static str, bool> {
-    let mut checks = HashMap::new();
-    checks.insert(
-        "score_not_worse",
-        candidate_eval.combined_score >= baseline_eval.combined_score,
-    );
-    checks.insert("min_score_gain", stats.score_gain >= config.min_score_gain);
-    checks.insert("wins_gt_losses", stats.wins > stats.losses);
-    checks.insert("sign_test", stats.p_value <= config.max_sign_test_p_value);
-    checks.insert(
-        "router_invalid_json_not_worse",
-        candidate_eval.router_invalid_json_rate
-            <= baseline_eval.router_invalid_json_rate + f64::EPSILON,
-    );
-    checks.insert(
-        "prompt_efficiency_not_materially_worse",
-        prompt_efficiency_not_materially_worse(config, baseline_eval, candidate_eval, stats),
-    );
-    checks
+) -> Vec<PromotionGateCheckResult<PromptPromotionCheck>> {
+    vec![
+        PromotionGateCheckResult {
+            check: PromptPromotionCheck::ScoreNotWorse,
+            passed: candidate_eval.combined_score >= baseline_eval.combined_score,
+        },
+        PromotionGateCheckResult {
+            check: PromptPromotionCheck::MinScoreGain,
+            passed: stats.score_gain >= config.min_score_gain,
+        },
+        PromotionGateCheckResult {
+            check: PromptPromotionCheck::WinsGtLosses,
+            passed: stats.wins > stats.losses,
+        },
+        PromotionGateCheckResult {
+            check: PromptPromotionCheck::SignTest,
+            passed: stats.p_value <= config.max_sign_test_p_value,
+        },
+        PromotionGateCheckResult {
+            check: PromptPromotionCheck::RouterInvalidJsonNotWorse,
+            passed: candidate_eval.router_invalid_json_rate
+                <= baseline_eval.router_invalid_json_rate + f64::EPSILON,
+        },
+        PromotionGateCheckResult {
+            check: PromptPromotionCheck::PromptEfficiencyNotMateriallyWorse,
+            passed: prompt_efficiency_not_materially_worse(
+                config,
+                baseline_eval,
+                candidate_eval,
+                stats,
+            ),
+        },
+    ]
 }
 
 fn prompt_efficiency_not_materially_worse(
@@ -2072,25 +2140,10 @@ fn prompt_efficiency_not_materially_worse(
             <= config.max_cache_sensitive_token_regression_ratio
 }
 
-fn render_prompt_promotion_gate(checks: &HashMap<&str, bool>) -> String {
-    let ordered = [
-        "score_not_worse",
-        "min_score_gain",
-        "wins_gt_losses",
-        "sign_test",
-        "router_invalid_json_not_worse",
-        "prompt_efficiency_not_materially_worse",
-    ];
-    let failed = ordered
-        .iter()
-        .copied()
-        .filter(|key| !checks.get(key).copied().unwrap_or(false))
-        .collect::<Vec<_>>();
-    if failed.is_empty() {
-        "passed".to_string()
-    } else {
-        format!("rejected: {}", failed.join(", "))
-    }
+fn render_prompt_promotion_gate(
+    checks: &[PromotionGateCheckResult<PromptPromotionCheck>],
+) -> String {
+    render_legacy_promotion_gate(checks)
 }
 
 fn paired_stats(baseline_scores: &[f64], candidate_scores: &[f64]) -> PairedStats {
@@ -2463,6 +2516,17 @@ mod tests {
         }
     }
 
+    fn prompt_check_passed(
+        checks: &[PromotionGateCheckResult<PromptPromotionCheck>],
+        check: PromptPromotionCheck,
+    ) -> bool {
+        checks
+            .iter()
+            .find(|result| result.check == check)
+            .map(|result| result.passed)
+            .unwrap_or(false)
+    }
+
     #[test]
     fn prompt_bundle_efficiency_tracks_static_and_cache_sensitive_size() {
         let bundle = PromptBundleProfile::default();
@@ -2488,7 +2552,10 @@ mod tests {
 
         let checks = prompt_promotion_checks(&config, &baseline, &candidate, &stats);
 
-        assert!(!checks["prompt_efficiency_not_materially_worse"]);
+        assert!(!prompt_check_passed(
+            &checks,
+            PromptPromotionCheck::PromptEfficiencyNotMateriallyWorse,
+        ));
     }
 
     #[test]
@@ -2505,6 +2572,9 @@ mod tests {
 
         let checks = prompt_promotion_checks(&config, &baseline, &candidate, &stats);
 
-        assert!(checks["prompt_efficiency_not_materially_worse"]);
+        assert!(prompt_check_passed(
+            &checks,
+            PromptPromotionCheck::PromptEfficiencyNotMateriallyWorse,
+        ));
     }
 }

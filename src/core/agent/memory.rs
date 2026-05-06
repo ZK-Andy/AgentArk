@@ -1,7 +1,7 @@
 use super::action_selection::format_recent_dialogue_for_fast_path;
 use super::*;
 use crate::storage::entities::user_preference::{
-    MemorySensitivity, classify_saved_memory_sensitivity, normalize_memory_sensitivity,
+    classify_saved_memory_sensitivity, normalize_memory_sensitivity, MemorySensitivity,
 };
 
 const USER_MEMORY_CAPTURE_PENDING_STATUS: &str = "pending_consolidation";
@@ -4983,8 +4983,7 @@ impl Agent {
     }
 
     pub(super) fn kick_deferred_user_memory_capture_processing(&self) {
-        USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED
-            .store(true, std::sync::atomic::Ordering::Release);
+        USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
         let semaphore = USER_MEMORY_CAPTURE_DRAIN_SEMAPHORE.clone();
         let Ok(permit) = semaphore.try_acquire_owned() else {
             return;
@@ -5104,9 +5103,7 @@ impl Agent {
             .drain_deferred_user_memory_capture_candidates_unlocked()
             .await;
         drop(permit);
-        if USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if USER_MEMORY_CAPTURE_DRAIN_WAKE_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
             self.kick_deferred_user_memory_capture_processing();
         }
         handled

@@ -11,6 +11,7 @@ import {
 } from "./pageHelpers";
 import { humanTs } from "./workspaceUiBits";
 import { humanizeStatusLabel } from "./workspaceCore";
+import { formatUiDateOnly, formatUiTime } from "../../lib/dateFormat";
 
 export function formatTraceDuration(durationMs: unknown): string {
   const ms = num(durationMs, -1);
@@ -333,6 +334,15 @@ export function stringList(value: unknown): string[] {
   return value.map((item) => str(item, "").trim()).filter(Boolean);
 }
 
+export function promotionGateSummary(data: JsonRecord): string {
+  const report = asRecord(data.promotion_gate_report);
+  return (
+    str(report.summary, "").trim() ||
+    str(data.promotion_gate_summary, "").trim() ||
+    str(data.promotion_gate, "").trim()
+  );
+}
+
 export function percentageLabel(value: unknown, digits = 1): string {
   const parsed = num(value, Number.NaN);
   if (!Number.isFinite(parsed)) return "";
@@ -590,7 +600,7 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
           `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
         );
       if (candidateSource) chips.push(candidateSource);
-      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      rationale = `Gate: ${promotionGateSummary(data) || "unknown"}`;
       if (num(data.wins, -1) >= 0 || num(data.losses, -1) >= 0) {
         evidence.push(
           `Wins/Losses: ${num(data.wins, 0)} / ${num(data.losses, 0)}`,
@@ -659,7 +669,7 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
           `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
         );
       if (candidateSource) chips.push(candidateSource);
-      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      rationale = `Gate: ${promotionGateSummary(data) || "unknown"}`;
       if (routerChanged.length)
         evidence.push(`Router changes: ${routerChanged.join(", ")}`);
       if (primaryResponseChanged.length)
@@ -749,7 +759,7 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
           `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
         );
       if (candidateSource) chips.push(candidateSource);
-      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      rationale = `Gate: ${promotionGateSummary(data) || "unknown"}`;
       if (changedItems.length)
         evidence.push(`Changed: ${changedItems.join(", ")}`);
       if (changePreview.length)
@@ -915,11 +925,10 @@ export function buildTraceTrendBuckets(range: TraceRange): TraceBucket[] {
   const buckets: TraceBucket[] = [];
   for (let i = 0; i < bucketCount; i++) {
     const ts = now - spanMs + (i + 1) * bucketMs;
-    const d = new Date(ts);
     const label =
       hours <= 24
-        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-        : d.toLocaleDateString([], { month: "short", day: "numeric" });
+        ? formatUiTime(ts, { fallback: "-", hour12: false })
+        : formatUiDateOnly(ts, { fallback: "-" });
     buckets.push({ label, ts });
   }
   return buckets;
@@ -1227,6 +1236,7 @@ export function evolutionSurfaceAudienceLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (normalized === "routing policy") return "Reply routing";
   if (normalized === "main prompt bundle") return "Main replies";
+  if (normalized === "prompt fragments") return "Adaptive prompt guidance";
   if (normalized === "request classifier") return "Request understanding";
   if (normalized === "specialist prompts") return "Specialist helpers";
   return value || "Experiment";
@@ -1238,6 +1248,8 @@ export function evolutionSurfaceSummary(value: string): string {
     return "Tests how often the assistant should answer directly versus handing work off.";
   if (normalized === "main prompt bundle")
     return "Tests a different set of reply instructions for the main assistant response.";
+  if (normalized === "prompt fragments")
+    return "Tests a different selectable guidance set for the current turn context.";
   if (normalized === "request classifier")
     return "Tests a different way to classify incoming requests before choosing a path.";
   if (normalized === "specialist prompts")
@@ -1251,6 +1263,8 @@ export function evolutionSurfaceBenefit(value: string): string {
     return "Can reduce unnecessary handoffs and keep simple requests faster.";
   if (normalized === "main prompt bundle")
     return "Can make replies clearer, more reliable, or less repetitive.";
+  if (normalized === "prompt fragments")
+    return "Can keep the active prompt smaller and more relevant to the work being done.";
   if (normalized === "request classifier")
     return "Can improve how quickly the assistant recognizes the right handling path.";
   if (normalized === "specialist prompts")
@@ -1264,6 +1278,8 @@ export function evolutionSurfaceStableSummary(value: string): string {
     return "Reply routing is using the current stable logic.";
   if (normalized === "main prompt bundle")
     return "Main replies are using the current stable prompt bundle.";
+  if (normalized === "prompt fragments")
+    return "Adaptive prompt guidance is using the current stable fragment bundle.";
   if (normalized === "request classifier")
     return "Request understanding is using the current stable classifier.";
   if (normalized === "specialist prompts")
@@ -1275,10 +1291,17 @@ export function evolutionExperimentStatusText(item: {
   gate: string;
   last: string;
   enabled: boolean;
+  replayGateReasons?: JsonRecord[];
 }): string {
   const gate = str(item.gate, "").trim();
   const last = str(item.last, "").trim();
+  const reasonCount = Array.isArray(item.replayGateReasons)
+    ? item.replayGateReasons.length
+    : 0;
   if (!item.enabled) return "No active experiment is running here.";
+  if (reasonCount > 0) {
+    return "Current gate checks still need evidence before promotion.";
+  }
   if (gate && gate !== "-") return `Current gate signal: ${gate}.`;
   if (last && !/^no .* runs yet$/i.test(last)) return last;
   return "This experiment is running against the current stable behavior.";

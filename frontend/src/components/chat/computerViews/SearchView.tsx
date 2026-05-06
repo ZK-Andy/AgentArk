@@ -5,6 +5,8 @@ import Typography from "@mui/material/Typography";
 import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
 
 import type { ChatStepCard } from "../types";
+import { extractSurfaceBody } from "../dispatch";
+import { buildReadableToolPresentation } from "./presentation";
 
 export interface SearchViewProps {
   card: ChatStepCard;
@@ -21,20 +23,27 @@ function splitResults(body: string): string[] {
 
 function pickBody(card: ChatStepCard): string {
   return (
-    card.payloadView?.body ||
     card.rawDetailFull ||
     card.detailFull ||
+    card.detail ||
+    card.summary ||
+    card.payloadView?.body ||
     ""
   );
 }
 
 export function SearchView({ card }: SearchViewProps) {
-  const body = pickBody(card);
-  const query =
-    (card.detail || "").split(/\r?\n/)[0]?.trim() ||
-    card.summary ||
-    card.label;
-  const results = splitResults(body);
+  const presentation = buildReadableToolPresentation(card);
+  const structuredBody = extractSurfaceBody(card);
+  const body = structuredBody || (presentation.isStructured ? presentation.body : pickBody(card));
+  const query = presentation.query || presentation.title || card.label;
+  const results = presentation.isStructured
+    ? presentation.rows.length > 0
+      ? presentation.rows
+      : presentation.summary
+        ? [presentation.summary]
+        : []
+    : splitResults(body);
   return (
     <Box className="cview cview-search">
       <Box className="cview-search-head">

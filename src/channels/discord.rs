@@ -784,11 +784,14 @@ async fn send_message_to_destination(
         .unwrap_or(false)
         || !config.webhook_url.trim().is_empty();
 
-    if used_webhook {
-        send_via_webhook(&config, destination, text).await
-    } else {
-        send_via_bot(&config, destination, text).await
+    for chunk in super::outbound_split::split_for_provider_safe_channel("discord", text) {
+        if used_webhook {
+            send_via_webhook(&config, destination, &chunk).await?;
+        } else {
+            send_via_bot(&config, destination, &chunk).await?;
+        }
     }
+    Ok(())
 }
 
 /// Send a Discord message using the configured proactive notification destination.

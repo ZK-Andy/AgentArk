@@ -6,7 +6,8 @@ import Typography from "@mui/material/Typography";
 import Link from "@mui/material/Link";
 
 import type { ChatStepCard } from "../types";
-import { extractUrl } from "../dispatch";
+import { extractSurfaceBody, extractUrl } from "../dispatch";
+import { buildReadableToolPresentation } from "./presentation";
 
 export interface BrowseViewProps {
   card: ChatStepCard;
@@ -14,18 +15,22 @@ export interface BrowseViewProps {
 
 function pickSnapshot(card: ChatStepCard): string {
   return (
-    card.payloadView?.body ||
     card.rawDetailFull ||
     card.detailFull ||
     card.detail ||
     card.summary ||
+    card.payloadView?.body ||
     ""
   );
 }
 
 export function BrowseView({ card }: BrowseViewProps) {
   const url = extractUrl(card);
-  const snapshot = pickSnapshot(card);
+  const presentation = buildReadableToolPresentation(card);
+  const structuredSnapshot = extractSurfaceBody(card);
+  const snapshot = structuredSnapshot || (presentation.isStructured
+    ? presentation.body
+    : pickSnapshot(card));
   return (
     <Box className="cview cview-browse">
       <Box className="cview-browse-head">

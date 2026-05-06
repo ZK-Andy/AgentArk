@@ -10,6 +10,8 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+use super::promotion_gate::PromotionGateReason;
+
 pub const TOOL_STRATEGY_PROFILE_KEY: &str = "tool_strategy_profile_v1";
 pub const TOOL_STRATEGY_PROFILE_CANARY_KEY: &str = "tool_strategy_profile_canary_v1";
 pub const TOOL_STRATEGY_CANARY_STATE_KEY: &str = "tool_strategy_canary_state_v1";
@@ -110,6 +112,8 @@ pub struct ReplayEvaluationResult {
     pub losses: usize,
     pub p_value: f64,
     pub reason: String,
+    #[serde(default)]
+    pub reasons: Vec<PromotionGateReason>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +332,16 @@ pub fn evaluate_experience_canary_by_prompt_version(
     } else {
         "passed".to_string()
     };
+    let reasons = replay_gate_reasons(
+        eligible,
+        true,
+        success_gain,
+        min_success_gain,
+        wins,
+        losses,
+        p_value,
+        max_sign_test_p_value,
+    );
 
     ReplayEvaluationResult {
         eligible,
@@ -341,6 +355,7 @@ pub fn evaluate_experience_canary_by_prompt_version(
         losses,
         p_value,
         reason,
+        reasons,
     }
 }
 
@@ -444,6 +459,16 @@ pub fn evaluate_experience_canary_by_metadata_version(
     } else {
         "passed".to_string()
     };
+    let reasons = replay_gate_reasons(
+        eligible,
+        true,
+        success_gain,
+        min_success_gain,
+        wins,
+        losses,
+        p_value,
+        max_sign_test_p_value,
+    );
 
     ReplayEvaluationResult {
         eligible,
@@ -457,6 +482,209 @@ pub fn evaluate_experience_canary_by_metadata_version(
         losses,
         p_value,
         reason,
+        reasons,
+    }
+}
+
+pub fn evaluate_trace_prompt_telemetry_canary_by_version(
+    traces: &[crate::storage::ExecutionTraceSummaryRow],
+    metadata_key: &str,
+    baseline_version: &str,
+    candidate_version: &str,
+    min_samples_per_version: usize,
+    min_success_gain: f64,
+    max_sign_test_p_value: f64,
+) -> ReplayEvaluationResult {
+    let samples = prompt_telemetry_samples_from_traces(traces, metadata_key);
+    let baseline_rows = samples
+        .iter()
+        .filter(|sample| sample.version == baseline_version)
+        .collect::<Vec<_>>();
+    let candidate_rows = samples
+        .iter()
+        .filter(|sample| sample.version == candidate_version)
+        .collect::<Vec<_>>();
+
+    let baseline = compute_trace_prompt_telemetry_metrics(&baseline_rows);
+    let candidate = compute_trace_prompt_telemetry_metrics(&candidate_rows);
+
+    let mut paired_deltas: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    for row in &baseline_rows {
+        let key = (row.channel.clone(), row.request_mode.clone());
+        let entry = paired_deltas.entry(key).or_insert((0.0, 0.0));
+        entry.0 += if row.success { 1.0 } else { 0.0 };
+    }
+    for row in &candidate_rows {
+        let key = (row.channel.clone(), row.request_mode.clone());
+        let entry = paired_deltas.entry(key).or_insert((0.0, 0.0));
+        entry.1 += if row.success { 1.0 } else { 0.0 };
+    }
+
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+    for ((_channel, _mode), (baseline_score, candidate_score)) in paired_deltas {
+        if baseline_score == 0.0 && candidate_score == 0.0 {
+            continue;
+        }
+        if candidate_score > baseline_score {
+            wins += 1;
+        } else if candidate_score < baseline_score {
+            losses += 1;
+        }
+    }
+
+    let p_value = one_sided_sign_test_p_value(wins, losses);
+    let success_gain = candidate.success_rate - baseline.success_rate;
+    let eligible =
+        baseline.samples >= min_samples_per_version && candidate.samples >= min_samples_per_version;
+    let latency_guard_ok = match (baseline.p95_latency_ms, candidate.p95_latency_ms) {
+        (Some(b), Some(c)) if b > 0 => (c as f64) <= (b as f64 * 1.15),
+        _ => true,
+    };
+    let promote = eligible
+        && success_gain >= min_success_gain
+        && wins > losses
+        && p_value <= max_sign_test_p_value
+        && latency_guard_ok;
+
+    let reason = if !eligible {
+        format!(
+            "insufficient prompt telemetry samples (baseline={}, candidate={}, min={})",
+            baseline.samples, candidate.samples, min_samples_per_version
+        )
+    } else if !latency_guard_ok {
+        "candidate prompt-fragment latency regression exceeds 15% p95 threshold".to_string()
+    } else if success_gain < min_success_gain {
+        format!(
+            "prompt telemetry success gain {:.4} below threshold {:.4}",
+            success_gain, min_success_gain
+        )
+    } else if wins <= losses {
+        format!("wins={} not greater than losses={}", wins, losses)
+    } else if p_value > max_sign_test_p_value {
+        format!(
+            "p-value {:.4} above threshold {:.4}",
+            p_value, max_sign_test_p_value
+        )
+    } else {
+        "passed".to_string()
+    };
+    let reasons = replay_gate_reasons(
+        eligible,
+        latency_guard_ok,
+        success_gain,
+        min_success_gain,
+        wins,
+        losses,
+        p_value,
+        max_sign_test_p_value,
+    );
+
+    ReplayEvaluationResult {
+        eligible,
+        promote,
+        baseline_version: baseline_version.to_string(),
+        candidate_version: candidate_version.to_string(),
+        baseline,
+        candidate,
+        success_gain,
+        wins,
+        losses,
+        p_value,
+        reason,
+        reasons,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PromptTelemetryTraceSample {
+    version: String,
+    channel: String,
+    request_mode: String,
+    success: bool,
+    latency_ms: Option<i64>,
+}
+
+fn prompt_telemetry_samples_from_traces(
+    traces: &[crate::storage::ExecutionTraceSummaryRow],
+    metadata_key: &str,
+) -> Vec<PromptTelemetryTraceSample> {
+    let mut samples = Vec::new();
+    for trace in traces {
+        let steps = serde_json::from_str::<Vec<crate::core::ExecutionStep>>(&trace.steps_json)
+            .unwrap_or_default();
+        let success = !steps.iter().any(|step| step.step_type == "error");
+        for step in steps {
+            let Some(data) = step.data else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+                continue;
+            };
+            let Some(object) = value.as_object() else {
+                continue;
+            };
+            let trace_kind = object
+                .get("trace_kind")
+                .and_then(|value| value.as_str())
+                .map(str::trim);
+            if trace_kind != Some("prompt_telemetry") {
+                continue;
+            }
+            let Some(version) = object
+                .get(metadata_key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            samples.push(PromptTelemetryTraceSample {
+                version: version.to_string(),
+                channel: trace.channel.clone(),
+                request_mode: object
+                    .get("request_mode")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("agent_loop")
+                    .to_string(),
+                success,
+                latency_ms: trace.duration_ms.map(i64::from),
+            });
+        }
+    }
+    samples
+}
+
+fn compute_trace_prompt_telemetry_metrics(
+    rows: &[&PromptTelemetryTraceSample],
+) -> ReplayVersionMetrics {
+    let samples = rows.len();
+    let successes = rows.iter().filter(|row| row.success).count();
+    let success_rate = if samples == 0 {
+        0.0
+    } else {
+        successes as f64 / samples as f64
+    };
+    let mut latencies = rows
+        .iter()
+        .filter_map(|row| row.latency_ms)
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
+    let p95_latency_ms = if latencies.is_empty() {
+        None
+    } else {
+        let idx = (((latencies.len() as f64) * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(latencies.len().saturating_sub(1));
+        Some(latencies[idx])
+    };
+    ReplayVersionMetrics {
+        samples,
+        successes,
+        success_rate: round4(success_rate),
+        p95_latency_ms,
     }
 }
 
@@ -540,6 +768,16 @@ fn evaluate_two_sets(
     } else {
         "passed".to_string()
     };
+    let reasons = replay_gate_reasons(
+        eligible,
+        latency_guard_ok,
+        success_gain,
+        min_success_gain,
+        wins,
+        losses,
+        p_value,
+        max_sign_test_p_value,
+    );
 
     ReplayEvaluationResult {
         eligible,
@@ -553,7 +791,53 @@ fn evaluate_two_sets(
         losses,
         p_value,
         reason,
+        reasons,
     }
+}
+
+fn replay_gate_reasons(
+    eligible: bool,
+    latency_guard_ok: bool,
+    success_gain: f64,
+    min_success_gain: f64,
+    wins: usize,
+    losses: usize,
+    p_value: f64,
+    max_sign_test_p_value: f64,
+) -> Vec<PromotionGateReason> {
+    if !eligible {
+        return vec![PromotionGateReason::new(
+            "min_samples_per_version",
+            "stable and experiment do not both have enough samples yet",
+        )];
+    }
+
+    let mut reasons = Vec::new();
+    if !latency_guard_ok {
+        reasons.push(PromotionGateReason::new(
+            "latency_guard",
+            "experiment latency regressed beyond the guardrail",
+        ));
+    }
+    if success_gain < min_success_gain {
+        reasons.push(PromotionGateReason::new(
+            "min_success_gain",
+            "measured success lift is below the promotion threshold",
+        ));
+    }
+    if wins <= losses {
+        reasons.push(PromotionGateReason::new(
+            "wins_gt_losses",
+            "experiment did not win more comparable cases than it lost",
+        ));
+    }
+    if p_value > max_sign_test_p_value {
+        reasons.push(PromotionGateReason::new(
+            "sign_test",
+            "statistical confidence is not high enough yet",
+        ));
+    }
+    reasons
 }
 
 fn compute_metrics(

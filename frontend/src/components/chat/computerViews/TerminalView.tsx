@@ -4,7 +4,9 @@ import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
 
 import type { ChatStepCard } from "../types";
-import { extractCommand } from "../dispatch";
+import { extractCommand, extractSurfaceBody } from "../dispatch";
+import { surfaceFromCard } from "../surface";
+import { buildReadableToolPresentation } from "./presentation";
 
 export interface TerminalViewProps {
   card: ChatStepCard;
@@ -14,6 +16,11 @@ export interface TerminalViewProps {
 type TerminalTone = "idle" | "run" | "ok" | "fail";
 
 function pickTone(card: ChatStepCard, live: boolean): TerminalTone {
+  const status = surfaceFromCard(card)?.status;
+  if (status === "error") return "fail";
+  if (status === "done") return "ok";
+  if (status === "running" || status === "waiting" || status === "pending")
+    return live ? "run" : "idle";
   const k = (card.kind || "").toLowerCase();
   if (k.includes("issue") || k.includes("error") || k.includes("fail")) return "fail";
   if (k.includes("done") || k.includes("complete") || k.includes("success")) return "ok";
@@ -23,11 +30,11 @@ function pickTone(card: ChatStepCard, live: boolean): TerminalTone {
 
 function pickBody(card: ChatStepCard): string {
   return (
-    card.payloadView?.body ||
     card.rawDetailFull ||
     card.detailFull ||
     card.detail ||
     card.summary ||
+    card.payloadView?.body ||
     ""
   );
 }
@@ -41,7 +48,9 @@ const TONE_LABEL: Record<TerminalTone, string> = {
 
 export function TerminalView({ card, live = false }: TerminalViewProps) {
   const command = extractCommand(card);
-  const body = pickBody(card);
+  const presentation = buildReadableToolPresentation(card);
+  const structuredBody = extractSurfaceBody(card);
+  const body = structuredBody || (presentation.isStructured ? presentation.body : pickBody(card));
   const tone = pickTone(card, live);
   return (
     <Box className="cview cview-terminal">

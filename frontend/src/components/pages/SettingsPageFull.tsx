@@ -44,7 +44,10 @@ import {
   getTunnelProviderHelp,
 } from "../../lib/tunnelAccess";
 import {
+  detectLocalTimeZone,
   formatUiDateTime,
+  getSupportedUiTimeZones,
+  setUiTimeZoneOverride,
 } from "../../lib/dateFormat";
 import type {
   ArkPulseRemediationSpec,
@@ -93,21 +96,26 @@ import {
   truncateUiText,
 } from "./settingsPageHelpers";
 import {
-  CompanionDevicesPanel,
   IntegrationQuickstartPanel,
   IntegrationsPanel,
-  MediaSettingsPanel,
   MemoryPage,
-  ObservabilityPanel,
-  PluginSdkPanel,
-  SettingsAdvancedPanel,
-  SettingsModelsPanel,
-  SettingsSecurityPanel,
-  SettingsDataLifecyclePanel,
-  SettingsUpdatesPanel,
   TracePage,
-  WebhooksPanel,
 } from "./settingsLazyPanels";
+// Static imports for the small settings panels — bundling them with
+// SettingsPageFull eliminates the inner Suspense roundtrip when switching
+// tabs inside the Settings dialog. Tabs are then driven only by their
+// data queries, which are prefetched in parallel via prefetchSettingsTabData.
+import { CompanionDevicesPanel } from "../CompanionDevicesPanel";
+import { MediaSettingsPanel } from "./MediaSettingsPanel";
+import { ObservabilityPanel } from "../ObservabilityPanel";
+import { PluginSdkPanel } from "../PluginSdkPanel";
+import { SenderVerificationPanel } from "../SenderVerificationPanel";
+import { SettingsAdvancedPanel } from "./SettingsAdvancedPanel";
+import { SettingsDataLifecyclePanel } from "./SettingsDataLifecyclePanel";
+import { SettingsModelsPanel } from "./SettingsModelsPanel";
+import { SettingsSecurityPanel } from "./SettingsSecurityPanel";
+import { SettingsUpdatesPanel } from "./SettingsUpdatesPanel";
+import { WebhooksPanel } from "../WebhooksPanel";
 import {
   SettingsInlineCard,
   SettingsSectionIntro,
@@ -124,7 +132,6 @@ import {
   SETTINGS_BACKGROUND_STALE_TIME_MS,
   fetchArkPulseLog,
   fetchAvailableMessagingChannels,
-  fetchModels,
   fetchSecurityAbuseReviews,
   fetchSecurityStatus,
   fetchSettings,
@@ -138,12 +145,14 @@ import {
   fetchSettingsUpdateStatus,
   fetchTunnelProviders,
   fetchTunnelStatus,
+  modelsPayloadFromSettings,
   prefetchSettingsTabData,
   SETTINGS_CACHE_GC_TIME_MS,
   SETTINGS_QUERY_KEYS,
 } from "./settingsData";
 import {
   getSettingsPageMeta,
+  getSettingsTabLoadingMessage,
   resolveInitialSettingsTab,
   settingsTabSupportsSave,
   type SettingsPageProps,
@@ -274,6 +283,25 @@ type ArkPulseInlineResult = {
 };
 
 type PasswordDialogMode = "set" | "change" | "remove";
+
+function settingsUiEmbeddingsProvider(value: string): "local-hf" | "disabled" {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "disabled" || normalized === "none" || normalized === "off"
+    ? "disabled"
+    : "local-hf";
+}
+
+function embeddingsProviderHiddenFromSettingsUi(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized.length > 0 &&
+    normalized !== "local-hf" &&
+    normalized !== "local_hf" &&
+    normalized !== "disabled" &&
+    normalized !== "none" &&
+    normalized !== "off"
+  );
+}
 
 export default function SettingsPage({
   autoRefresh,
@@ -459,6 +487,7 @@ export default function SettingsPage({
     staleTime: CORE_SETTINGS_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: needsAvailableChannels && autoRefresh ? REFRESH_MS : false,
+    refetchOnWindowFocus: false,
   });
   const mediaQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.media,
@@ -467,14 +496,7 @@ export default function SettingsPage({
     staleTime: CORE_SETTINGS_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: needsMediaSettings && autoRefresh ? REFRESH_MS : false,
-  });
-  const modelsQ = useQuery({
-    queryKey: SETTINGS_QUERY_KEYS.models,
-    queryFn: fetchModels,
-    enabled: needsModelSettings,
-    staleTime: CORE_SETTINGS_STALE_TIME_MS,
-    gcTime: SETTINGS_CACHE_GC_TIME_MS,
-    refetchInterval: needsModelSettings && autoRefresh ? REFRESH_MS : false,
+    refetchOnWindowFocus: false,
   });
   const updateStatusQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.updateStatus,
@@ -528,6 +550,7 @@ export default function SettingsPage({
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
+    refetchOnWindowFocus: false,
   });
   const tunnelProvidersQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.tunnelProviders,
@@ -536,22 +559,26 @@ export default function SettingsPage({
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
+    refetchOnWindowFocus: false,
   });
+  // Security status + abuse reviews are cheap reads. Fire eagerly on settings
+  // mount so the Security tab is warm before the user clicks it. Refetch
+  // interval stays tab-gated to avoid noisy polling on unrelated tabs.
   const securityStatusQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.securityStatus,
     queryFn: fetchSecurityStatus,
-    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
+    refetchOnWindowFocus: false,
   });
   const abuseReviewsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.securityAbuseReviews,
     queryFn: fetchSecurityAbuseReviews,
-    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
+    refetchOnWindowFocus: false,
   });
   const abuseReviews = pickRecords(abuseReviewsQ.data, "reviews");
   const observabilityLogsQ = useQuery({
@@ -561,6 +588,7 @@ export default function SettingsPage({
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: observabilityTabActive && autoRefresh ? REFRESH_MS : false,
+    refetchOnWindowFocus: false,
   });
   const vaultSecretsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.secrets,
@@ -583,8 +611,26 @@ export default function SettingsPage({
           ? REFRESH_MS
           : false
       : false,
+    refetchOnWindowFocus: false,
   });
   const settings = asRecord(settingsQ.data);
+  const settingsModelsPayload = useMemo(
+    () => modelsPayloadFromSettings(settings),
+    [settings],
+  );
+  useEffect(() => {
+    if (!settingsQ.isSuccess) return;
+    queryClient.setQueryData(SETTINGS_QUERY_KEYS.models, settingsModelsPayload);
+  }, [queryClient, settingsModelsPayload, settingsQ.isSuccess]);
+  const modelsQ = {
+    data: settingsModelsPayload,
+    error: settingsQ.error,
+    isError: settingsQ.isError,
+    isFetching: settingsQ.isFetching,
+    isLoading: settingsQ.isLoading,
+    isSuccess: settingsQ.isSuccess,
+  };
+  const detectedTimezone = useMemo(() => detectLocalTimeZone(), []);
   const availableDeliveryChannels = useMemo(() => {
     const channels = pickRecords(asRecord(availableChannelsQ.data).channels);
     const rows = channels
@@ -619,7 +665,7 @@ export default function SettingsPage({
   const observabilitySettings = asRecord(settings.observability);
   const dataLifecycleSettings = asRecord(settings.data_lifecycle);
   const media = asRecord(mediaQ.data);
-  const modelsPayload = asRecord(modelsQ.data);
+  const modelsPayload = settingsModelsPayload;
   const observabilityLogsPayload = asRecord(observabilityLogsQ.data);
   const observabilityLogs = pickRecords(observabilityLogsPayload, "logs");
   const observabilityIssues = Array.isArray(observabilityLogsPayload.issues)
@@ -806,6 +852,30 @@ export default function SettingsPage({
     observability_privacy_mode: "metadata_only",
     observability_auth_token: "",
   });
+  const timezoneOptions = useMemo(() => {
+    const zones = new Set(getSupportedUiTimeZones());
+    if (form.timezone.trim()) zones.add(form.timezone.trim());
+    if (detectedTimezone) zones.add(detectedTimezone);
+    return Array.from(zones).sort((left, right) => {
+      if (left === "UTC") return -1;
+      if (right === "UTC") return 1;
+      return left.localeCompare(right);
+    });
+  }, [detectedTimezone, form.timezone]);
+  const timezoneHelperText = (() => {
+    const saved = form.timezone.trim();
+    if (!saved) {
+      return detectedTimezone
+        ? `Detected timezone: ${detectedTimezone}. Not correct? Choose one manually.`
+        : "Choose an IANA timezone such as America/New_York.";
+    }
+    if (detectedTimezone && saved !== detectedTimezone) {
+      return `Manual timezone override. This browser detected ${detectedTimezone}.`;
+    }
+    return detectedTimezone
+      ? `Using detected timezone ${detectedTimezone}.`
+      : "Saved timezone override.";
+  })();
   const selectedDailyBriefDeliveryChannel = availableDeliveryChannels.find(
     (channel) => channel.id === form.daily_brief_channel,
   );
@@ -1037,6 +1107,11 @@ export default function SettingsPage({
   }
 
   function hydrateFromServer() {
+    const serverEmbeddingsProvider = str(settings.embeddings_provider, "local-hf");
+    const uiEmbeddingsProvider =
+      settingsUiEmbeddingsProvider(serverEmbeddingsProvider);
+    const hiddenExternalEmbeddingsProvider =
+      embeddingsProviderHiddenFromSettingsUi(serverEmbeddingsProvider);
     const tgUsers = Array.isArray(settings.telegram_allowed_users)
       ? (settings.telegram_allowed_users as unknown[])
       : [];
@@ -1061,9 +1136,9 @@ export default function SettingsPage({
         settings.arkreflect_daily_digest_enabled,
       ),
       smart_routing: toBool(settings.smart_routing),
-      embeddings_provider: str(settings.embeddings_provider, "local-hf"),
-      embeddings_model: str(settings.embeddings_model, LOCAL_EMBEDDINGS_MODEL),
-      embeddings_base_url: str(settings.embeddings_base_url, ""),
+      embeddings_provider: uiEmbeddingsProvider,
+      embeddings_model: LOCAL_EMBEDDINGS_MODEL,
+      embeddings_base_url: "",
       embeddings_api_key: "",
 
       llm_provider: str(settings.llm_provider, ""),
@@ -1383,38 +1458,62 @@ export default function SettingsPage({
     };
 
     setForm(nextForm);
-    setSavedFormSnapshot(snapshotSettingsForm(nextForm));
+    setSavedFormSnapshot(
+      snapshotSettingsForm(
+        hiddenExternalEmbeddingsProvider
+          ? {
+              ...nextForm,
+              embeddings_provider: serverEmbeddingsProvider,
+              embeddings_model: str(
+                settings.embeddings_model,
+                LOCAL_EMBEDDINGS_MODEL,
+              ),
+              embeddings_base_url: str(settings.embeddings_base_url, ""),
+            }
+          : nextForm,
+      ),
+    );
 
-    setDirty(false);
+    setDirty(hiddenExternalEmbeddingsProvider);
     setError(null);
     setSuccess(null);
+    return hiddenExternalEmbeddingsProvider;
   }
 
   // Initialize form from backend once; keep defaults if backend is down.
   useEffect(() => {
     if (initialized) return;
     if (!settingsQ.isSuccess) return;
-    hydrateFromServer();
+    const dirtyAfterHydrate = hydrateFromServer();
     setInitialized(true);
-    setDirty(false);
+    setDirty(dirtyAfterHydrate);
   }, [initialized, settingsQ.isSuccess, settingsQ.dataUpdatedAt]);
 
   useEffect(() => {
     if (initialized) return;
     if (!settingsQ.data || !mediaQ.data) return;
-    hydrateFromServer();
+    const dirtyAfterHydrate = hydrateFromServer();
     setInitialized(true);
-    setDirty(false);
+    setDirty(dirtyAfterHydrate);
   }, [initialized, settingsQ.data, mediaQ.data]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!settingsQ.isSuccess) return;
+    setUiTimeZoneOverride(str(settings.timezone, "").trim() || null);
+  }, [settingsQ.isSuccess, settings.timezone]);
 
   // Safety: clear dirty once after hydration settles (handles race between effects)
   const hydrationDirtyCleared = useRef(false);
   useEffect(() => {
     if (initialized && !hydrationDirtyCleared.current) {
       hydrationDirtyCleared.current = true;
-      setDirty(false);
+      setDirty(
+        embeddingsProviderHiddenFromSettingsUi(
+          str(settings.embeddings_provider, ""),
+        ),
+      );
     }
-  }, [initialized]);
+  }, [initialized, settings.embeddings_provider]);
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -1620,6 +1719,9 @@ export default function SettingsPage({
           60,
         ),
       };
+      const embeddingsProviderForSave = settingsUiEmbeddingsProvider(
+        form.embeddings_provider,
+      );
       const payload: Record<string, unknown> = {
         bot_name: form.bot_name || "AgentArk",
         personality: form.personality || "friendly",
@@ -1633,13 +1735,10 @@ export default function SettingsPage({
         daily_brief_channel: form.daily_brief_channel || "telegram",
         arkreflect_daily_digest_enabled: form.arkreflect_daily_digest_enabled,
         smart_routing: form.smart_routing,
-        embeddings_provider: form.embeddings_provider || "local-hf",
-        embeddings_model:
-          (form.embeddings_provider || "local-hf") === "local-hf"
-            ? LOCAL_EMBEDDINGS_MODEL
-            : form.embeddings_model || LOCAL_EMBEDDINGS_MODEL,
-        embeddings_base_url: form.embeddings_base_url || null,
-        embeddings_api_key: form.embeddings_api_key || null,
+        embeddings_provider: embeddingsProviderForSave,
+        embeddings_model: LOCAL_EMBEDDINGS_MODEL,
+        embeddings_base_url: null,
+        embeddings_api_key: null,
 
         llm_provider: form.llm_provider,
         llm_model: form.llm_model,
@@ -1791,6 +1890,7 @@ export default function SettingsPage({
       setError(null);
       setSuccess("Saved settings.");
       setDirty(false);
+      setUiTimeZoneOverride(form.timezone.trim() || null);
       const savedSnapshot = parseSavedSettingsSnapshot();
       const observabilityChanged =
         !savedSnapshot ||
@@ -1869,6 +1969,7 @@ export default function SettingsPage({
         return nextForm;
       });
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      await queryClient.invalidateQueries({ queryKey: ["profile"] });
       await queryClient.invalidateQueries({ queryKey: ["settings-media"] });
       await queryClient.invalidateQueries({ queryKey: ["models"] });
       await queryClient.invalidateQueries({
@@ -2463,7 +2564,7 @@ export default function SettingsPage({
             id: modelEditingId,
             ...payload,
           },
-          { timeoutMs: 15000 },
+          { timeoutMs: 30000 },
         ),
       );
       return {
@@ -2600,6 +2701,9 @@ export default function SettingsPage({
   const hasFallbackApiKey = toBool(settings.has_fallback_api_key);
   const embeddingsHasApiKey = toBool(settings.embeddings_has_api_key);
   const embeddingsStatus = str(settings.embeddings_status, "");
+  const hiddenExternalEmbeddingsProvider = embeddingsProviderHiddenFromSettingsUi(
+    str(settings.embeddings_provider, ""),
+  );
   const embeddingsProvider = form.embeddings_provider || "local-hf";
   const telegramAllowedUsers = parseTelegramUsers(
     form.telegram_allowed_users_csv,
@@ -4031,6 +4135,7 @@ export default function SettingsPage({
 
   const tabSupportsSave = settingsTabSupportsSave(tab);
   const selectedSettingsMeta = getSettingsPageMeta(tab);
+  const settingsLoadingMessage = getSettingsTabLoadingMessage(tab);
   const selectedSettingsHeaderTitle =
     selectedSettingsMeta.title || selectedSettingsNav?.label || "Settings";
   const arkPulseHeader = (
@@ -4926,40 +5031,38 @@ export default function SettingsPage({
                       gap: 1.5,
                     }}
                   >
-                    <Autocomplete
-                      freeSolo
-                      options={[
-                        "UTC",
-                        "America/New_York",
-                        "America/Chicago",
-                        "America/Denver",
-                        "America/Los_Angeles",
-                        "America/Phoenix",
-                        "America/Toronto",
-                        "America/Vancouver",
-                        "Europe/London",
-                        "Europe/Paris",
-                        "Europe/Berlin",
-                        "Asia/Dubai",
-                        "Asia/Kolkata",
-                        "Asia/Singapore",
-                        "Asia/Tokyo",
-                        "Australia/Sydney",
-                      ]}
-                      value={form.timezone || ""}
-                      onChange={(_, v) => setField("timezone", String(v ?? ""))}
-                      inputValue={form.timezone || ""}
-                      onInputChange={(_, v) => setField("timezone", v)}
-                      renderInput={(params) => (
-                        <TextField
-                          {...params}
-                          label="Timezone"
-                          placeholder="e.g. America/New_York"
-                          fullWidth
-                          size="small"
-                        />
-                      )}
-                    />
+                    <Stack spacing={0.75}>
+                      <Autocomplete
+                        freeSolo
+                        options={timezoneOptions}
+                        value={form.timezone || ""}
+                        onChange={(_, v) => setField("timezone", String(v ?? ""))}
+                        inputValue={form.timezone || ""}
+                        onInputChange={(_, v) => setField("timezone", v)}
+                        renderInput={(params) => (
+                          <TextField
+                            {...params}
+                            label="Timezone"
+                            placeholder={detectedTimezone || "e.g. America/New_York"}
+                            helperText={timezoneHelperText}
+                            fullWidth
+                            size="small"
+                          />
+                        )}
+                      />
+                      {detectedTimezone ? (
+                        <Box>
+                          <Button
+                            size="small"
+                            variant="text"
+                            disabled={form.timezone.trim() === detectedTimezone}
+                            onClick={() => setField("timezone", detectedTimezone)}
+                          >
+                            Use detected timezone
+                          </Button>
+                        </Box>
+                      ) : null}
+                    </Stack>
                     <TextField
                       label="Email Format"
                       select
@@ -5122,11 +5225,10 @@ export default function SettingsPage({
             ) : null}
 
             {tab === 1 ? (
-              <WorkspaceLazyPanel message="Loading models...">
-                <SettingsModelsPanel
-                  modelsSectionTab={modelsSectionTab}
-                  setModelsSectionTab={setModelsSectionTab}
-                  renderSettingsSectionIntro={renderSettingsSectionIntro}
+              <SettingsModelsPanel
+                modelsSectionTab={modelsSectionTab}
+                setModelsSectionTab={setModelsSectionTab}
+                renderSettingsSectionIntro={renderSettingsSectionIntro}
                   openAddModel={openAddModel}
                   form={form}
                   setField={setField}
@@ -5145,6 +5247,9 @@ export default function SettingsPage({
                   embeddingsIsLocal={embeddingsIsLocal}
                   embeddingsIsOllama={embeddingsIsOllama}
                   embeddingsIsExternal={embeddingsIsExternal}
+                  hiddenExternalEmbeddingsProvider={
+                    hiddenExternalEmbeddingsProvider
+                  }
                   modelDialogOpen={modelDialogOpen}
                   setModelDialogOpen={setModelDialogOpen}
                   modelForm={modelForm}
@@ -5170,22 +5275,19 @@ export default function SettingsPage({
                   checkOpenaiSubscriptionOAuthStatus={
                     checkOpenaiSubscriptionOAuthStatus
                   }
-                  discoverModelsQ={discoverModelsQ}
-                  modelOptions={modelOptions}
-                  modelOptionNames={modelOptionNames}
-                  setSuccess={setSuccess}
-                />
-              </WorkspaceLazyPanel>
+                discoverModelsQ={discoverModelsQ}
+                modelOptions={modelOptions}
+                modelOptionNames={modelOptionNames}
+                setSuccess={setSuccess}
+              />
             ) : null}
             {tab === 3 ? (
-              <WorkspaceLazyPanel message="Loading media settings...">
-                <MediaSettingsPanel
-                  form={form}
-                  setField={setField}
-                  configuredProviders={configuredProviders}
-                  renderSettingsSectionIntro={renderSettingsSectionIntro}
-                />
-              </WorkspaceLazyPanel>
+              <MediaSettingsPanel
+                form={form}
+                setField={setField}
+                configuredProviders={configuredProviders}
+                renderSettingsSectionIntro={renderSettingsSectionIntro}
+              />
             ) : null}
 
             {tab === 24 ? (
@@ -5255,8 +5357,7 @@ export default function SettingsPage({
             ) : null}
 
             {tab === 4 ? (
-              <WorkspaceLazyPanel message="Loading security settings...">
-                <SettingsSecurityPanel
+              <SettingsSecurityPanel
                   renderSettingsSectionIntro={renderSettingsSectionIntro}
                   securityStatusQ={securityStatusQ}
                   hasCustomMasterPassword={hasCustomMasterPassword}
@@ -5324,16 +5425,17 @@ export default function SettingsPage({
                   resolveVaultPasswordForSensitiveOps={
                     resolveVaultPasswordForSensitiveOps
                   }
-                  form={form}
-                  setField={setField}
-                  setError={setError}
-                  setSuccess={setSuccess}
-                />
-              </WorkspaceLazyPanel>
+                form={form}
+                setField={setField}
+                setError={setError}
+                setSuccess={setSuccess}
+              />
+            ) : null}
+            {tab === 16 ? (
+              <SenderVerificationPanel autoRefresh={autoRefresh} />
             ) : null}
             {tab === 5 ? (
-              <WorkspaceLazyPanel message="Loading advanced settings...">
-                <SettingsAdvancedPanel
+              <SettingsAdvancedPanel
                   restartNotice={restartNotice}
                   renderSettingsInlineCard={renderSettingsInlineCard}
                   settingsAutonomyQ={settingsAutonomyQ}
@@ -5382,29 +5484,25 @@ export default function SettingsPage({
                   apiKeyPayload={apiKeyPayload}
                   apiKeyIssuedAtUnix={apiKeyIssuedAtUnix}
                   apiKeyExpiresAtUnix={apiKeyExpiresAtUnix}
-                  regenerateApiKeyMutation={regenerateApiKeyMutation}
-                />
-              </WorkspaceLazyPanel>
+                regenerateApiKeyMutation={regenerateApiKeyMutation}
+              />
             ) : null}
             {tab === 14 ? (
-              <WorkspaceLazyPanel message="Loading data cleanup...">
-                <SettingsDataLifecyclePanel
-                  form={form}
-                  setField={(key, value) => setField(key, value)}
-                  foreverLifecycleRules={foreverLifecycleRules}
-                  foreverLifecycleSummary={foreverLifecycleSummary}
-                  dataCleanupEnabled={dataCleanupEnabled}
-                  notificationsCleanupInputsEnabled={
-                    notificationsCleanupInputsEnabled
-                  }
-                  logsCleanupInputsEnabled={logsCleanupInputsEnabled}
-                  renderSettingsSectionIntro={renderSettingsSectionIntro}
-                />
-              </WorkspaceLazyPanel>
+              <SettingsDataLifecyclePanel
+                form={form}
+                setField={(key, value) => setField(key, value)}
+                foreverLifecycleRules={foreverLifecycleRules}
+                foreverLifecycleSummary={foreverLifecycleSummary}
+                dataCleanupEnabled={dataCleanupEnabled}
+                notificationsCleanupInputsEnabled={
+                  notificationsCleanupInputsEnabled
+                }
+                logsCleanupInputsEnabled={logsCleanupInputsEnabled}
+                renderSettingsSectionIntro={renderSettingsSectionIntro}
+              />
             ) : null}
             {tab === 25 ? (
-              <WorkspaceLazyPanel message="Loading updates...">
-                <SettingsUpdatesPanel
+              <SettingsUpdatesPanel
                   restartNotice={restartNotice}
                   renderSettingsInlineCard={renderSettingsInlineCard}
                   renderSettingsSectionIntro={renderSettingsSectionIntro}
@@ -5426,15 +5524,13 @@ export default function SettingsPage({
                     } catch (e) {
                       setError(errMessage(e));
                     }
-                  }}
-                />
-              </WorkspaceLazyPanel>
+                }}
+              />
             ) : null}
 
             {tab === 6 ? (
               <Stack spacing={2.5}>
-                <WorkspaceLazyPanel message="Loading observability...">
-                  <ObservabilityPanel
+                <ObservabilityPanel
                     values={{
                       enabled: form.observability_enabled,
                       provider: form.observability_provider,
@@ -5496,15 +5592,14 @@ export default function SettingsPage({
                       } catch {
                         // handled by mutation onError
                       }
-                    }}
-                  />
-                </WorkspaceLazyPanel>
+                  }}
+                />
               </Stack>
             ) : null}
 
             {tab === 20 ? (
               <Box className="list-shell">
-                <WorkspaceLazyPanel message="Loading channels integrations...">
+                <WorkspaceLazyPanel message={settingsLoadingMessage}>
                   <IntegrationsPanel
                     autoRefresh={autoRefresh}
                     embedded
@@ -5516,7 +5611,7 @@ export default function SettingsPage({
 
             {tab === 21 ? (
               <Box className="list-shell">
-                <WorkspaceLazyPanel message="Loading integrations...">
+                <WorkspaceLazyPanel message={settingsLoadingMessage}>
                   <IntegrationsPanel
                     autoRefresh={autoRefresh}
                     embedded
@@ -5529,12 +5624,10 @@ export default function SettingsPage({
             {tab === 22 ? (
               <Stack spacing={2}>
                 <Box className="list-shell">
-                  <WorkspaceLazyPanel message="Loading webhooks...">
-                    <WebhooksPanel autoRefresh={autoRefresh} />
-                  </WorkspaceLazyPanel>
+                  <WebhooksPanel autoRefresh={autoRefresh} />
                 </Box>
                 <Box className="list-shell">
-                  <WorkspaceLazyPanel message="Loading custom API setup...">
+                  <WorkspaceLazyPanel message={settingsLoadingMessage}>
                     <IntegrationQuickstartPanel
                       integrations={[]}
                       autoRefresh={autoRefresh}
@@ -5549,27 +5642,23 @@ export default function SettingsPage({
 
             {tab === 23 ? (
               <Box className="list-shell">
-                <WorkspaceLazyPanel message="Loading plugin SDK...">
-                  <PluginSdkPanel autoRefresh={autoRefresh} embedded />
-                </WorkspaceLazyPanel>
+                <PluginSdkPanel autoRefresh={autoRefresh} embedded />
               </Box>
             ) : null}
 
             {tab === 26 ? (
-              <WorkspaceLazyPanel message="Loading companion devices...">
-                <CompanionDevicesPanel autoRefresh={autoRefresh} />
-              </WorkspaceLazyPanel>
+              <CompanionDevicesPanel autoRefresh={autoRefresh} />
             ) : null}
 
             {tab === 11 ? (
-              <WorkspaceLazyPanel message="Loading trace...">
+              <WorkspaceLazyPanel message={settingsLoadingMessage}>
                 <TracePage autoRefresh={autoRefresh} />
               </WorkspaceLazyPanel>
             ) : null}
 
             {tab === 8 ? (
               <Box className="list-shell">
-                <WorkspaceLazyPanel message="Loading MCP integrations...">
+                <WorkspaceLazyPanel message={settingsLoadingMessage}>
                   <IntegrationsPanel
                     autoRefresh={autoRefresh}
                     embedded
@@ -5580,7 +5669,7 @@ export default function SettingsPage({
             ) : null}
 
             {tab === 12 ? (
-              <WorkspaceLazyPanel message="Loading memory...">
+              <WorkspaceLazyPanel message={settingsLoadingMessage}>
                 <MemoryPage
                   autoRefresh={autoRefresh}
                   showHeader={false}

@@ -39,15 +39,15 @@ pub use action_guard::ActionGuard;
 pub use model_hardening::protect_system_prompt;
 #[allow(unused_imports)]
 pub use model_input::{
+    render_model_input_fallback, sanitize_model_input_json, sanitize_model_input_text,
     CurrentChatPiiPolicy, ModelInputContext, ModelInputPrivacyDecision,
     ModelInputPrivacyJsonResult, ModelInputPrivacyMode, ModelInputPrivacyTextResult,
-    ModelPrivacyConfig, render_model_input_fallback, sanitize_model_input_json,
-    sanitize_model_input_text,
+    ModelPrivacyConfig,
 };
 pub use normalize::normalize_for_analysis;
 pub use outbound::{
-    OutboundPrivacyDecision, OutboundPrivacyPolicy, check_outbound_text,
-    format_outbound_privacy_block, sanitize_outbound_json,
+    check_outbound_text, format_outbound_privacy_block, sanitize_outbound_json,
+    OutboundPrivacyDecision, OutboundPrivacyPolicy,
 };
 pub use pii::redact_pii;
 pub use trust_boundary::{
@@ -268,7 +268,7 @@ fn opaque_token_shape_char(ch: char) -> bool {
 fn opaque_token_has_secret_signal(value: &str) -> bool {
     value
         .chars()
-        .any(|ch| ch.is_ascii_digit() || matches!(ch, '_' | '-' | '=' | '+'))
+        .any(|ch| ch.is_ascii_digit() || matches!(ch, '_' | '=' | '+'))
 }
 
 fn shannon_entropy_bits_per_char(value: &str) -> f64 {
@@ -874,6 +874,16 @@ mod tests {
         assert_eq!(result.text, message);
         assert!(result.text.contains("fontana-di-trevi.html"));
         assert!(result.text.contains("rialto-canal-grande.html"));
+    }
+
+    #[test]
+    fn test_secret_redaction_keeps_public_app_urls_and_hyphenated_hosts() {
+        let message =
+            "Open https://sacred-duration-season-drainage.trycloudflare.com/apps/7b7c4863/";
+        let result = redact_secret_input(message);
+
+        assert!(!result.had_secret());
+        assert_eq!(result.text, message);
     }
 
     #[test]

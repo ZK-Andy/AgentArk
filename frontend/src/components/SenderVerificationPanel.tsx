@@ -1,20 +1,36 @@
+import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
+import DoneAllRoundedIcon from "@mui/icons-material/DoneAllRounded";
+import HourglassTopRoundedIcon from "@mui/icons-material/HourglassTopRounded";
+import SaveRoundedIcon from "@mui/icons-material/SaveRounded";
+import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
+import VerifiedUserRoundedIcon from "@mui/icons-material/VerifiedUserRounded";
 import {
   Alert,
   Box,
   Button,
   Chip,
+  CircularProgress,
+  Divider,
   MenuItem,
   Stack,
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
   TextField,
-  Typography
+  Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from "react";
+import {
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
 
@@ -24,8 +40,22 @@ type SenderVerificationPanelProps = {
   autoRefresh: boolean;
 };
 
+type ChannelForm = {
+  policy: string;
+  allowed: string;
+};
+
+type ChannelKey = "slack" | "teams" | "whatsapp";
+
+const EMPTY_CHANNEL_FORM: ChannelForm = {
+  policy: "open",
+  allowed: "",
+};
+
 function asRecord(value: unknown): JsonRecord {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : {};
 }
 
 function asRecords(value: unknown): JsonRecord[] {
@@ -42,7 +72,9 @@ function toBool(value: unknown): boolean {
 
 function toStrings(value: unknown): string[] {
   return Array.isArray(value)
-    ? value.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean)
+    ? value
+        .map((item) => (typeof item === "string" ? item.trim() : ""))
+        .filter(Boolean)
     : [];
 }
 
@@ -89,52 +121,190 @@ function scopeDisplay(row: JsonRecord): string {
   return str(row.scope_label, str(row.scope_id, "-"));
 }
 
-type ChannelForm = {
-  policy: string;
-  allowed: string;
-};
+function rowKey(row: JsonRecord, index: number): string {
+  return (
+    str(row.key) ||
+    [
+      str(row.channel),
+      str(row.sender_id),
+      str(row.scope_id),
+      str(row.conversation_id),
+      String(index),
+    ].join(":")
+  );
+}
 
-const EMPTY_CHANNEL_FORM: ChannelForm = {
-  policy: "open",
-  allowed: ""
-};
+function policyLabel(policy: string): string {
+  return policy === "pairing" ? "Pairing required" : "Open";
+}
 
-export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanelProps) {
+function policyDetail(policy: string): string {
+  return policy === "pairing"
+    ? "Unknown senders wait for operator approval."
+    : "Authenticated channel senders can trigger work.";
+}
+
+function trustCount(form: ChannelForm): number {
+  return parseCsv(form.allowed).length;
+}
+
+function SummaryTile({
+  label,
+  value,
+  detail,
+  icon,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  icon: ReactNode;
+}) {
+  return (
+    <Box
+      sx={{
+        minWidth: 0,
+        p: 1.35,
+        borderRadius: 2,
+        border: "1px solid var(--ui-rgba-255-255-255-080)",
+        background: "var(--ui-rgba-255-255-255-030)",
+      }}
+    >
+      <Stack direction="row" spacing={1} sx={{ alignItems: "flex-start" }}>
+        <Box
+          sx={{
+            width: 32,
+            height: 32,
+            borderRadius: 1.5,
+            display: "grid",
+            placeItems: "center",
+            color: "var(--ui-rgba-130-247-193-920)",
+            background: "var(--ui-rgba-130-247-193-080)",
+            flexShrink: 0,
+          }}
+        >
+          {icon}
+        </Box>
+        <Stack spacing={0.2} sx={{ minWidth: 0 }}>
+          <Typography
+            variant="caption"
+            sx={{ color: "text.secondary", lineHeight: 1.2 }}
+          >
+            {label}
+          </Typography>
+          <Typography variant="h6" sx={{ lineHeight: 1.1 }}>
+            {value}
+          </Typography>
+          <Typography
+            variant="caption"
+            sx={{ color: "text.secondary", lineHeight: 1.35 }}
+          >
+            {detail}
+          </Typography>
+        </Stack>
+      </Stack>
+    </Box>
+  );
+}
+
+function EmptyState({
+  icon,
+  title,
+  body,
+}: {
+  icon: ReactNode;
+  title: string;
+  body: string;
+}) {
+  return (
+    <Box
+      sx={{
+        border: "1px dashed var(--ui-rgba-255-255-255-120)",
+        borderRadius: 2,
+        p: 2,
+        background: "var(--ui-rgba-255-255-255-020)",
+      }}
+    >
+      <Stack direction="row" spacing={1.2} sx={{ alignItems: "flex-start" }}>
+        <Box
+          sx={{
+            width: 34,
+            height: 34,
+            borderRadius: 1.5,
+            display: "grid",
+            placeItems: "center",
+            color: "var(--ui-rgba-255-220-145-900)",
+            background: "var(--ui-rgba-255-220-145-080)",
+            flexShrink: 0,
+          }}
+        >
+          {icon}
+        </Box>
+        <Stack spacing={0.25}>
+          <Typography variant="body2" sx={{ fontWeight: 700 }}>
+            {title}
+          </Typography>
+          <Typography
+            variant="body2"
+            sx={{ color: "text.secondary", maxWidth: 620 }}
+          >
+            {body}
+          </Typography>
+        </Stack>
+      </Stack>
+    </Box>
+  );
+}
+
+export function SenderVerificationPanel({
+  autoRefresh,
+}: SenderVerificationPanelProps) {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [slack, setSlack] = useState<ChannelForm>(EMPTY_CHANNEL_FORM);
   const [teams, setTeams] = useState<ChannelForm>(EMPTY_CHANNEL_FORM);
-  const [whatsapp, setWhatsapp] = useState<ChannelForm>({ policy: "pairing", allowed: "" });
+  const [whatsapp, setWhatsapp] = useState<ChannelForm>({
+    policy: "pairing",
+    allowed: "",
+  });
 
   const overviewQ = useQuery({
     queryKey: ["settings-sender-verification"],
     queryFn: () => api.rawGet("/sender-verification"),
-    refetchInterval: autoRefresh ? 8000 : false
+    refetchInterval: autoRefresh ? 8000 : false,
   });
 
   const saveSettings = useMutation({
-    mutationFn: (payload: JsonRecord) => api.rawPost("/sender-verification/settings", payload),
+    mutationFn: (payload: JsonRecord) =>
+      api.rawPost("/sender-verification/settings", payload),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["settings-sender-verification"] });
-    }
+      await queryClient.invalidateQueries({
+        queryKey: ["settings-sender-verification"],
+      });
+    },
   });
   const approveSender = useMutation({
-    mutationFn: (payload: JsonRecord) => api.rawPost("/sender-verification/approve", payload),
+    mutationFn: (payload: JsonRecord) =>
+      api.rawPost("/sender-verification/approve", payload),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["settings-sender-verification"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["settings-sender-verification"],
+      });
       await queryClient.invalidateQueries({ queryKey: ["notifications"] });
       await queryClient.invalidateQueries({ queryKey: ["notifications-count"] });
-    }
+    },
   });
   const revokeSender = useMutation({
-    mutationFn: (payload: JsonRecord) => api.rawPost("/sender-verification/revoke", payload),
+    mutationFn: (payload: JsonRecord) =>
+      api.rawPost("/sender-verification/revoke", payload),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["settings-sender-verification"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["settings-sender-verification"],
+      });
       await queryClient.invalidateQueries({ queryKey: ["notifications"] });
       await queryClient.invalidateQueries({ queryKey: ["notifications-count"] });
-    }
+    },
   });
 
   const payload = asRecord(overviewQ.data);
@@ -149,22 +319,22 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
     if (dirty) return;
     setSlack({
       policy: str(slackSettings.policy, "open"),
-      allowed: csv(toStrings(slackSettings.allowed_senders))
+      allowed: csv(toStrings(slackSettings.allowed_senders)),
     });
     setTeams({
       policy: str(teamsSettings.policy, "open"),
-      allowed: csv(toStrings(teamsSettings.allowed_senders))
+      allowed: csv(toStrings(teamsSettings.allowed_senders)),
     });
     setWhatsapp({
       policy: str(whatsappSettings.policy, "pairing"),
-      allowed: csv(toStrings(whatsappSettings.allowed_senders))
+      allowed: csv(toStrings(whatsappSettings.allowed_senders)),
     });
   }, [dirty, slackSettings, teamsSettings, whatsappSettings]);
 
   function updateChannel(
     setter: Dispatch<SetStateAction<ChannelForm>>,
     field: keyof ChannelForm,
-    value: string
+    value: string,
   ) {
     setDirty(true);
     setter((current) => ({ ...current, [field]: value }));
@@ -178,7 +348,7 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
         slack_policy: slack.policy,
         slack_allowed_senders: parseCsv(slack.allowed),
         teams_policy: teams.policy,
-        teams_allowed_senders: parseCsv(teams.allowed)
+        teams_allowed_senders: parseCsv(teams.allowed),
       };
       if (toBool(whatsappSettings.configured)) {
         payload.whatsapp_policy = whatsapp.policy;
@@ -186,7 +356,7 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
       }
       await saveSettings.mutateAsync(payload);
       setDirty(false);
-      setSuccess("Sender verification settings saved.");
+      setSuccess("Sender trust policies saved.");
     } catch (e) {
       setError(errMessage(e));
     }
@@ -203,7 +373,7 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
         scope_id: str(row.scope_id) || undefined,
         scope_label: str(row.scope_label) || undefined,
         conversation_id: str(row.conversation_id) || undefined,
-        approved_by: "settings_ui"
+        approved_by: "settings_ui",
       });
       setSuccess(`Approved ${senderDisplay(row)}.`);
     } catch (e) {
@@ -218,7 +388,7 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
       await revokeSender.mutateAsync({
         channel: str(row.channel),
         sender_id: str(row.sender_id),
-        scope_id: str(row.scope_id) || undefined
+        scope_id: str(row.scope_id) || undefined,
       });
       setSuccess(`Revoked ${senderDisplay(row)}.`);
     } catch (e) {
@@ -226,257 +396,513 @@ export function SenderVerificationPanel({ autoRefresh }: SenderVerificationPanel
     }
   }
 
-  const busy =
-    saveSettings.isPending || approveSender.isPending || revokeSender.isPending || overviewQ.isFetching;
+  const initialLoading = overviewQ.isLoading && !overviewQ.data;
+  const mutating =
+    saveSettings.isPending || approveSender.isPending || revokeSender.isPending;
+  const refreshing = overviewQ.isFetching && !initialLoading;
+
+  const channels: Array<{
+    key: ChannelKey;
+    title: string;
+    form: ChannelForm;
+    setForm: Dispatch<SetStateAction<ChannelForm>>;
+    configured: boolean;
+    description: string;
+    helper: string;
+  }> = [
+    {
+      key: "slack",
+      title: "Slack",
+      form: slack,
+      setForm: setSlack,
+      configured: toBool(slackSettings.configured),
+      description: "Workspace messages and app mentions.",
+      helper: "Comma-separated Slack user IDs.",
+    },
+    {
+      key: "teams",
+      title: "Teams",
+      form: teams,
+      setForm: setTeams,
+      configured: toBool(teamsSettings.configured),
+      description: "Teams conversations and channel posts.",
+      helper: "Comma-separated Teams or AAD sender IDs.",
+    },
+    {
+      key: "whatsapp",
+      title: "WhatsApp",
+      form: whatsapp,
+      setForm: setWhatsapp,
+      configured: toBool(whatsappSettings.configured),
+      description: "Bridge messages from phone numbers.",
+      helper: "Comma-separated trusted phone numbers.",
+    },
+  ];
+
+  const configuredCount = channels.filter((channel) => channel.configured).length;
+  const pairedCount = channels.filter(
+    (channel) => channel.form.policy === "pairing" && channel.configured,
+  ).length;
+  const trustedStaticCount = channels.reduce(
+    (count, channel) => count + trustCount(channel.form),
+    0,
+  );
 
   return (
-    <Stack spacing={2.5}>
-      <Alert severity="info">
-        Transport signatures confirm Slack, Teams, and WhatsApp webhooks came from the platform. This
-        page decides which human senders are trusted to trigger AgentArk work.
-      </Alert>
-      {error ? <Alert severity="error">{error}</Alert> : null}
-      {success ? <Alert severity="success">{success}</Alert> : null}
-      <Box className="list-shell">
+    <Stack spacing={2.25}>
+      <Box
+        className="list-shell"
+        sx={{
+          p: 2,
+          borderColor: "var(--ui-rgba-130-247-193-120) !important",
+          background:
+            "linear-gradient(135deg, var(--ui-rgba-130-247-193-050), var(--ui-rgba-255-255-255-020)) !important",
+        }}
+      >
         <Stack
-          direction="row"
-          sx={{
-            justifyContent: "space-between",
-            alignItems: "center",
-            mb: 1.5
-          }}>
-          <Box>
-            <Typography variant="h6">Sender Trust Policies</Typography>
-            <Typography variant="body2" sx={{
-              color: "text.secondary"
-            }}>
-              Use `pairing` when a channel should stop unknown senders until an operator approves them.
-            </Typography>
-          </Box>
-          <Button variant="contained" onClick={handleSave} disabled={busy || overviewQ.isLoading}>
-            Save Policies
+          direction={{ xs: "column", md: "row" }}
+          spacing={1.5}
+          sx={{ justifyContent: "space-between", alignItems: "flex-start" }}
+        >
+          <Stack direction="row" spacing={1.3} sx={{ minWidth: 0 }}>
+            <Box
+              sx={{
+                width: 40,
+                height: 40,
+                borderRadius: 2,
+                display: "grid",
+                placeItems: "center",
+                color: "var(--ui-rgba-130-247-193-920)",
+                background: "var(--ui-rgba-130-247-193-100)",
+                flexShrink: 0,
+              }}
+            >
+              <ShieldOutlinedIcon fontSize="small" />
+            </Box>
+            <Stack spacing={0.4} sx={{ minWidth: 0 }}>
+              <Stack
+                direction="row"
+                spacing={0.8}
+                useFlexGap
+                sx={{ alignItems: "center", flexWrap: "wrap" }}
+              >
+                <Typography variant="h6" sx={{ lineHeight: 1.15 }}>
+                  Sender verification control
+                </Typography>
+                <Chip
+                  size="small"
+                  color={dirty ? "warning" : "success"}
+                  variant={dirty ? "outlined" : "filled"}
+                  label={dirty ? "Unsaved changes" : "Saved"}
+                />
+                {refreshing ? (
+                  <Chip size="small" variant="outlined" label="Refreshing" />
+                ) : null}
+              </Stack>
+              <Typography
+                variant="body2"
+                sx={{ color: "text.secondary", maxWidth: 760 }}
+              >
+                Transport signatures prove the request came from Slack, Teams,
+                or WhatsApp. Sender trust decides which authenticated humans can
+                start AgentArk work.
+              </Typography>
+            </Stack>
+          </Stack>
+          <Button
+            variant="contained"
+            startIcon={
+              saveSettings.isPending ? (
+                <CircularProgress color="inherit" size={15} />
+              ) : (
+                <SaveRoundedIcon fontSize="small" />
+              )
+            }
+            onClick={handleSave}
+            disabled={!dirty || saveSettings.isPending || initialLoading}
+            sx={{ minWidth: 136 }}
+          >
+            {saveSettings.isPending ? "Saving" : "Save Policies"}
           </Button>
         </Stack>
 
+        <Box
+          sx={{
+            display: "grid",
+            gridTemplateColumns: {
+              xs: "1fr",
+              sm: "repeat(2, minmax(0, 1fr))",
+              lg: "repeat(4, minmax(0, 1fr))",
+            },
+            gap: 1,
+            mt: 1.6,
+          }}
+        >
+          <SummaryTile
+            icon={<HourglassTopRoundedIcon fontSize="small" />}
+            label="Pending"
+            value={String(pending.length)}
+            detail="Needs approval before work runs"
+          />
+          <SummaryTile
+            icon={<VerifiedUserRoundedIcon fontSize="small" />}
+            label="Approved"
+            value={String(approved.length)}
+            detail="Trusted for paired channels"
+          />
+          <SummaryTile
+            icon={<CheckCircleRoundedIcon fontSize="small" />}
+            label="Configured"
+            value={`${configuredCount} / ${channels.length}`}
+            detail="Channels with transport setup"
+          />
+          <SummaryTile
+            icon={<DoneAllRoundedIcon fontSize="small" />}
+            label="Always trusted"
+            value={String(trustedStaticCount)}
+            detail="Static IDs across policies"
+          />
+        </Box>
+      </Box>
+
+      {overviewQ.error ? (
+        <Alert severity="error">{errMessage(overviewQ.error)}</Alert>
+      ) : null}
+      {error ? <Alert severity="error">{error}</Alert> : null}
+      {success ? <Alert severity="success">{success}</Alert> : null}
+      {initialLoading ? (
+        <Alert severity="info">Loading sender verification state...</Alert>
+      ) : null}
+
+      <Box className="list-shell" sx={{ p: 2 }}>
         <Stack spacing={1.5}>
-          {[
-            {
-              key: "slack",
-              title: "Slack",
-              form: slack,
-              setForm: setSlack,
-              configured: toBool(slackSettings.configured),
-              helper: "Always-trusted sender IDs, usually Slack user IDs such as U123ABC."
-            },
-            {
-              key: "teams",
-              title: "Teams",
-              form: teams,
-              setForm: setTeams,
-              configured: toBool(teamsSettings.configured),
-              helper: "Always-trusted sender IDs, usually Teams IDs or AAD object IDs."
-            },
-            {
-              key: "whatsapp",
-              title: "WhatsApp",
-              form: whatsapp,
-              setForm: setWhatsapp,
-              configured: toBool(whatsappSettings.configured),
-              helper: "Allowed numbers stay as a hard allowlist; dynamic approvals appear below."
-            }
-          ].map((item) => (
-            <Box key={item.key} className="integration-card">
-              <Stack
-                direction={{ xs: "column", md: "row" }}
-                spacing={1.5}
-                sx={{
-                  justifyContent: "space-between",
-                  alignItems: { xs: "flex-start", md: "center" },
-                  mb: 1.5
-                }}>
-                <Box>
-                  <Typography variant="subtitle1">{item.title}</Typography>
-                  <Typography variant="body2" sx={{
-                    color: "text.secondary"
-                  }}>
-                    {item.helper}
-                  </Typography>
-                </Box>
-                <Chip
-                  size="small"
-                  color={item.configured ? "success" : "default"}
-                  label={item.configured ? "Configured" : "Not configured"}
-                />
-              </Stack>
-              <Stack direction={{ xs: "column", lg: "row" }} spacing={1.5}>
-                <TextField
-                  select
-                  label="Policy"
-                  value={item.form.policy}
-                  onChange={(event) => updateChannel(item.setForm, "policy", event.target.value)}
-                  sx={{ minWidth: 180 }}
-                  disabled={item.key === "whatsapp" && !item.configured}
-                >
-                  <MenuItem value="open">Open</MenuItem>
-                  <MenuItem value="pairing">Pairing</MenuItem>
-                </TextField>
-                <TextField
-                  label="Always-Trusted Sender IDs"
-                  value={item.form.allowed}
-                  onChange={(event) => updateChannel(item.setForm, "allowed", event.target.value)}
-                  multiline
-                  minRows={2}
-                  fullWidth
-                  disabled={item.key === "whatsapp" && !item.configured}
-                  helperText={item.helper}
-                />
-              </Stack>
+          <Stack
+            direction={{ xs: "column", md: "row" }}
+            spacing={1}
+            sx={{ justifyContent: "space-between", alignItems: "flex-start" }}
+          >
+            <Box>
+              <Typography variant="h6" sx={{ lineHeight: 1.2 }}>
+                Trust policies
+              </Typography>
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                Use pairing for channels where a new human sender should pause
+                before AgentArk takes action.
+              </Typography>
             </Box>
-          ))}
+          </Stack>
+
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: {
+                xs: "1fr",
+                lg: "repeat(3, minmax(0, 1fr))",
+              },
+              gap: 1.25,
+            }}
+          >
+            {channels.map((channel) => {
+              const disabled = channel.key === "whatsapp" && !channel.configured;
+              return (
+                <Box
+                  key={channel.key}
+                  sx={{
+                    p: 1.45,
+                    borderRadius: 2,
+                    border: "1px solid",
+                    borderColor:
+                      channel.form.policy === "pairing"
+                        ? "var(--ui-rgba-255-220-145-220)"
+                        : "var(--ui-rgba-255-255-255-080)",
+                    background:
+                      channel.form.policy === "pairing"
+                        ? "var(--ui-rgba-255-220-145-050)"
+                        : "var(--ui-rgba-255-255-255-025)",
+                    minWidth: 0,
+                  }}
+                >
+                  <Stack spacing={1.25}>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      sx={{ justifyContent: "space-between", gap: 1 }}
+                    >
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 800 }}>
+                          {channel.title}
+                        </Typography>
+                        <Typography
+                          variant="caption"
+                          sx={{ color: "text.secondary", display: "block" }}
+                        >
+                          {channel.description}
+                        </Typography>
+                      </Box>
+                      <Chip
+                        size="small"
+                        color={channel.configured ? "success" : "default"}
+                        variant={channel.configured ? "filled" : "outlined"}
+                        label={channel.configured ? "Configured" : "Not configured"}
+                      />
+                    </Stack>
+
+                    <Divider />
+
+                    <Stack spacing={1.2}>
+                      <TextField
+                        select
+                        label="Policy"
+                        size="small"
+                        value={channel.form.policy}
+                        onChange={(event) =>
+                          updateChannel(
+                            channel.setForm,
+                            "policy",
+                            event.target.value,
+                          )
+                        }
+                        disabled={disabled}
+                        fullWidth
+                        helperText={policyDetail(channel.form.policy)}
+                      >
+                        <MenuItem value="open">Open</MenuItem>
+                        <MenuItem value="pairing">Pairing</MenuItem>
+                      </TextField>
+                      <TextField
+                        label="Trusted sender IDs"
+                        size="small"
+                        value={channel.form.allowed}
+                        onChange={(event) =>
+                          updateChannel(
+                            channel.setForm,
+                            "allowed",
+                            event.target.value,
+                          )
+                        }
+                        multiline
+                        minRows={2}
+                        fullWidth
+                        disabled={disabled}
+                        helperText={channel.helper}
+                      />
+                    </Stack>
+
+                    <Stack
+                      direction="row"
+                      spacing={0.75}
+                      useFlexGap
+                      sx={{ alignItems: "center", flexWrap: "wrap" }}
+                    >
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        label={policyLabel(channel.form.policy)}
+                      />
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        label={`${trustCount(channel.form)} trusted ID${
+                          trustCount(channel.form) === 1 ? "" : "s"
+                        }`}
+                      />
+                    </Stack>
+                  </Stack>
+                </Box>
+              );
+            })}
+          </Box>
         </Stack>
       </Box>
-      <Box className="list-shell">
-        <Stack
-          direction="row"
-          sx={{
-            justifyContent: "space-between",
-            alignItems: "center",
-            mb: 1
-          }}>
-          <Box>
-            <Typography variant="h6">Pending Sender Approvals</Typography>
-            <Typography variant="body2" sx={{
-              color: "text.secondary"
-            }}>
-              New senders that hit a paired channel stop here until an operator approves them.
-            </Typography>
-          </Box>
-          <Chip size="small" label={`${pending.length} pending`} />
+
+      <Box className="list-shell" sx={{ p: 2 }}>
+        <Stack spacing={1.4}>
+          <Stack
+            direction="row"
+            sx={{ justifyContent: "space-between", alignItems: "flex-start" }}
+          >
+            <Box>
+              <Typography variant="h6" sx={{ lineHeight: 1.2 }}>
+                Pending approvals
+              </Typography>
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                New senders from paired channels appear here before work starts.
+              </Typography>
+            </Box>
+            <Chip size="small" label={`${pending.length} pending`} />
+          </Stack>
+
+          {pending.length === 0 ? (
+            <EmptyState
+              icon={<HourglassTopRoundedIcon fontSize="small" />}
+              title="No senders are waiting"
+              body="Pairing is active only when a configured channel receives a message from an untrusted sender."
+            />
+          ) : (
+            <TableContainer
+              sx={{
+                border: "1px solid var(--ui-rgba-255-255-255-080)",
+                borderRadius: 2,
+              }}
+            >
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Channel</TableCell>
+                    <TableCell>Sender</TableCell>
+                    <TableCell>Scope</TableCell>
+                    <TableCell>Seen</TableCell>
+                    <TableCell>Attempts</TableCell>
+                    <TableCell>Preview</TableCell>
+                    <TableCell align="right">Action</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {pending.map((row, index) => (
+                    <TableRow key={rowKey(row, index)}>
+                      <TableCell>{channelLabel(str(row.channel))}</TableCell>
+                      <TableCell>
+                        <Stack spacing={0.2}>
+                          <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                            {senderDisplay(row)}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "text.secondary" }}
+                          >
+                            {str(row.sender_id, "-")}
+                          </Typography>
+                        </Stack>
+                      </TableCell>
+                      <TableCell>{scopeDisplay(row)}</TableCell>
+                      <TableCell>
+                        <Stack spacing={0.2}>
+                          <Typography variant="body2">
+                            {humanTs(str(row.last_seen_at))}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "text.secondary" }}
+                          >
+                            First {humanTs(str(row.first_seen_at))}
+                          </Typography>
+                        </Stack>
+                      </TableCell>
+                      <TableCell>{String(row.occurrences ?? 1)}</TableCell>
+                      <TableCell>
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            maxWidth: 320,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                          title={str(row.message_preview, "-")}
+                        >
+                          {str(row.message_preview, "-")}
+                        </Typography>
+                      </TableCell>
+                      <TableCell align="right">
+                        <Button
+                          size="small"
+                          variant="contained"
+                          startIcon={<CheckCircleRoundedIcon fontSize="small" />}
+                          onClick={() => handleApprove(row)}
+                          disabled={mutating}
+                        >
+                          Approve
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          )}
         </Stack>
-        {pending.length === 0 ? (
-          <Typography variant="body2" sx={{
-            color: "text.secondary"
-          }}>
-            No pending senders.
-          </Typography>
-        ) : (
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell>Channel</TableCell>
-                <TableCell>Sender</TableCell>
-                <TableCell>Scope</TableCell>
-                <TableCell>Seen</TableCell>
-                <TableCell>Attempts</TableCell>
-                <TableCell>Preview</TableCell>
-                <TableCell align="right">Ops</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {pending.map((row) => (
-                <TableRow key={str(row.key)}>
-                  <TableCell>{channelLabel(str(row.channel))}</TableCell>
-                  <TableCell>
-                    <Stack spacing={0.2}>
-                      <span>{senderDisplay(row)}</span>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        {str(row.sender_id, "-")}
-                      </Typography>
-                    </Stack>
-                  </TableCell>
-                  <TableCell>{scopeDisplay(row)}</TableCell>
-                  <TableCell>
-                    <Stack spacing={0.2}>
-                      <span>{humanTs(str(row.last_seen_at))}</span>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        First seen {humanTs(str(row.first_seen_at))}
-                      </Typography>
-                    </Stack>
-                  </TableCell>
-                  <TableCell>{String(row.occurrences ?? 1)}</TableCell>
-                  <TableCell>
-                    <Typography variant="body2" sx={{ maxWidth: 320 }}>
-                      {str(row.message_preview, "-")}
-                    </Typography>
-                  </TableCell>
-                  <TableCell align="right">
-                    <Button size="small" variant="contained" onClick={() => handleApprove(row)} disabled={busy}>
-                      Approve
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
       </Box>
-      <Box className="list-shell">
-        <Stack
-          direction="row"
-          sx={{
-            justifyContent: "space-between",
-            alignItems: "center",
-            mb: 1
-          }}>
-          <Box>
-            <Typography variant="h6">Approved Senders</Typography>
-            <Typography variant="body2" sx={{
-              color: "text.secondary"
-            }}>
-              These senders can trigger AgentArk on paired channels until they are revoked.
-            </Typography>
-          </Box>
-          <Chip size="small" label={`${approved.length} approved`} />
+
+      <Box className="list-shell" sx={{ p: 2 }}>
+        <Stack spacing={1.4}>
+          <Stack
+            direction="row"
+            sx={{ justifyContent: "space-between", alignItems: "flex-start" }}
+          >
+            <Box>
+              <Typography variant="h6" sx={{ lineHeight: 1.2 }}>
+                Approved senders
+              </Typography>
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                These senders can start AgentArk work on paired channels until
+                revoked.
+              </Typography>
+            </Box>
+            <Chip size="small" label={`${approved.length} approved`} />
+          </Stack>
+
+          {approved.length === 0 ? (
+            <EmptyState
+              icon={<VerifiedUserRoundedIcon fontSize="small" />}
+              title="No persistent approvals yet"
+              body="Approving a pending sender creates a scoped trust record that can be revoked later."
+            />
+          ) : (
+            <TableContainer
+              sx={{
+                border: "1px solid var(--ui-rgba-255-255-255-080)",
+                borderRadius: 2,
+              }}
+            >
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Channel</TableCell>
+                    <TableCell>Sender</TableCell>
+                    <TableCell>Scope</TableCell>
+                    <TableCell>Approved</TableCell>
+                    <TableCell>By</TableCell>
+                    <TableCell align="right">Action</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {approved.map((row, index) => (
+                    <TableRow key={rowKey(row, index)}>
+                      <TableCell>{channelLabel(str(row.channel))}</TableCell>
+                      <TableCell>
+                        <Stack spacing={0.2}>
+                          <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                            {senderDisplay(row)}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "text.secondary" }}
+                          >
+                            {str(row.sender_id, "-")}
+                          </Typography>
+                        </Stack>
+                      </TableCell>
+                      <TableCell>{scopeDisplay(row)}</TableCell>
+                      <TableCell>{humanTs(str(row.approved_at))}</TableCell>
+                      <TableCell>{str(row.approved_by, "-")}</TableCell>
+                      <TableCell align="right">
+                        <Button
+                          size="small"
+                          color="warning"
+                          variant="outlined"
+                          onClick={() => handleRevoke(row)}
+                          disabled={mutating}
+                        >
+                          Revoke
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          )}
         </Stack>
-        {approved.length === 0 ? (
-          <Typography variant="body2" sx={{
-            color: "text.secondary"
-          }}>
-            No approved senders yet.
-          </Typography>
-        ) : (
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell>Channel</TableCell>
-                <TableCell>Sender</TableCell>
-                <TableCell>Scope</TableCell>
-                <TableCell>Approved</TableCell>
-                <TableCell>By</TableCell>
-                <TableCell align="right">Ops</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {approved.map((row) => (
-                <TableRow key={str(row.key)}>
-                  <TableCell>{channelLabel(str(row.channel))}</TableCell>
-                  <TableCell>
-                    <Stack spacing={0.2}>
-                      <span>{senderDisplay(row)}</span>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        {str(row.sender_id, "-")}
-                      </Typography>
-                    </Stack>
-                  </TableCell>
-                  <TableCell>{scopeDisplay(row)}</TableCell>
-                  <TableCell>{humanTs(str(row.approved_at))}</TableCell>
-                  <TableCell>{str(row.approved_by, "-")}</TableCell>
-                  <TableCell align="right">
-                    <Button size="small" color="warning" onClick={() => handleRevoke(row)} disabled={busy}>
-                      Revoke
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
       </Box>
     </Stack>
   );

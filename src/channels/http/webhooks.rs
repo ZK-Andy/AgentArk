@@ -460,6 +460,41 @@ fn default_secret_header_for_provider(
     }
 }
 
+fn public_webhook_auth_required_message() -> &'static str {
+    "Public webhook sources require a secret. Choose header token, bearer token, or HMAC."
+}
+
+fn public_webhook_ingress_requires_auth_for_posture(
+    deployment_mode: DeploymentMode,
+    tunnel_active: bool,
+    tunnel_control_plane_enabled: bool,
+) -> bool {
+    deployment_mode == DeploymentMode::InternetFacing
+        || (tunnel_active && tunnel_control_plane_enabled)
+}
+
+fn validate_public_webhook_auth_mode(
+    auth_mode: WebhookAuthMode,
+    public_ingress_requires_auth: bool,
+) -> Result<()> {
+    if matches!(auth_mode, WebhookAuthMode::None) && public_ingress_requires_auth {
+        anyhow::bail!(public_webhook_auth_required_message());
+    }
+    Ok(())
+}
+
+async fn public_webhook_ingress_requires_auth(state: &AppState) -> bool {
+    let (active, control_plane_enabled) = {
+        let tunnel = state.tunnel.read().await;
+        (tunnel.active, tunnel.control_plane_enabled)
+    };
+    public_webhook_ingress_requires_auth_for_posture(
+        state.deployment_mode,
+        active,
+        control_plane_enabled,
+    )
+}
+
 fn clip_chars(value: &str, max_chars: usize) -> String {
     let trimmed = value.trim();
     if trimmed.chars().count() <= max_chars {
@@ -1503,6 +1538,10 @@ async fn upsert_source_internal(
     let auth_mode = request
         .auth_mode
         .unwrap_or_else(|| default_auth_mode_for_provider(&provider));
+    validate_public_webhook_auth_mode(
+        auth_mode,
+        public_webhook_ingress_requires_auth(state).await,
+    )?;
     let match_mode = request.match_mode.unwrap_or_default();
     let event_header = sanitize_header_name(request.event_header.as_deref())
         .or_else(|| Some(default_event_header_for_provider(&provider)));
@@ -1843,6 +1882,18 @@ pub(super) async fn handle_inbound_webhook(
     if !source.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if let Err(error) = validate_public_webhook_auth_mode(
+        source.auth_mode,
+        public_webhook_ingress_requires_auth(&state).await,
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     let payload = serde_json::from_str::<serde_json::Value>(&raw_body).ok();
     let normalized = normalize_event(&source, &headers, &raw_body, payload.as_ref());
@@ -2157,6 +2208,39 @@ mod tests {
             .get("error")
             .and_then(|value| value.as_str())
             .is_some_and(|value| value.contains("not currently available")));
+    }
+
+    #[test]
+    fn public_webhook_posture_requires_auth_for_internet_and_control_tunnel() {
+        assert!(public_webhook_ingress_requires_auth_for_posture(
+            DeploymentMode::InternetFacing,
+            false,
+            false
+        ));
+        assert!(public_webhook_ingress_requires_auth_for_posture(
+            DeploymentMode::TrustedLocal,
+            true,
+            true
+        ));
+        assert!(!public_webhook_ingress_requires_auth_for_posture(
+            DeploymentMode::TrustedLocal,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn public_webhook_auth_mode_rejects_no_auth_when_public() {
+        let error = validate_public_webhook_auth_mode(WebhookAuthMode::None, true)
+            .expect_err("public no-auth webhooks should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("Public webhook sources require a secret"));
+        validate_public_webhook_auth_mode(WebhookAuthMode::HeaderToken, true)
+            .expect("authenticated public webhooks are allowed");
+        validate_public_webhook_auth_mode(WebhookAuthMode::None, false)
+            .expect("local-only no-auth webhooks are allowed");
     }
 
     #[tokio::test]

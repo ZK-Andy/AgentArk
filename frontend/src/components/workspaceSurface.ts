@@ -1,7 +1,4 @@
-import {
-  preloadCommonSettingsPanels,
-  preloadSettingsTab,
-} from "./pages/workspacePreload";
+import { preloadSettingsTab } from "./pages/workspacePreload";
 import { preloadWorkspaceRoute } from "./WorkspaceViewOutlet";
 
 export type WorkspaceView =
@@ -34,7 +31,7 @@ export type WorkspaceView =
   | "search"
   | "settings";
 
-export { preloadCommonSettingsPanels, preloadSettingsTab };
+export { preloadSettingsTab };
 
 export function preloadWorkspaceSurface(
   view: WorkspaceView,
@@ -48,10 +45,14 @@ export function preloadWorkspaceSurface(
     case "connections":
     case "channels":
     case "routing":
-    case "webhooks":
-    case "devices":
     case "browser":
-      preloadSettingsTab(view === "devices" ? 26 : settingsTab ?? 20);
+      preloadSettingsTab(settingsTab ?? 20);
+      return;
+    case "webhooks":
+      preloadSettingsTab(settingsTab ?? 22);
+      return;
+    case "devices":
+      preloadSettingsTab(settingsTab ?? 26);
       return;
     case "search":
       preloadSettingsTab(settingsTab ?? 24);

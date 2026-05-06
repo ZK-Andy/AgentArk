@@ -21,7 +21,7 @@ pub(super) struct ChatSuggestionOutcome {
     pub primary: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct SuggestionRunSnapshot {
     task_ids: HashMap<String, crate::storage::entities::task::Model>,
     watcher_ids: HashMap<String, crate::core::watcher::Watcher>,

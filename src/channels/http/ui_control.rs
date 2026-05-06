@@ -221,10 +221,6 @@ pub(super) fn request_matches_active_tunnel(headers: &HeaderMap, tunnel_url: Opt
         return false;
     };
 
-    if request_host.ends_with(".trycloudflare.com") || request_host.ends_with(".cfargotunnel.com") {
-        return true;
-    }
-
     let Some(url) = tunnel_url else {
         return false;
     };
@@ -273,9 +269,6 @@ pub(super) async fn tunnel_exposure_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if path == "/health" || path == "/readiness" {
-        return next.run(request).await;
-    }
 
     let (tunnel_url, selected_app_id, exposed_app_ids, control_plane_enabled, companion_enabled) = {
         let tunnel = state.tunnel.read().await;
@@ -298,6 +291,10 @@ pub(super) async fn tunnel_exposure_middleware(
 
     if !request_matches_active_tunnel(request.headers(), tunnel_url.as_deref()) {
         return next.run(request).await;
+    }
+
+    if path == "/health" || path == "/readiness" {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     if companion_enabled && (path == "/companion/ws" || path == "/companion/web") {

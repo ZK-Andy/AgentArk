@@ -25,6 +25,13 @@ const REASONING_PHASE_LABELS: Record<string, string> = {
   planner: "Planning",
   model: "Reasoning",
 };
+const WORKING_PREVIEW_MAX_CHARS = 12_000;
+
+function tailPreview(value: string): string {
+  return value.length > WORKING_PREVIEW_MAX_CHARS
+    ? value.slice(-WORKING_PREVIEW_MAX_CHARS)
+    : value;
+}
 
 function normalizeStartedAt(value: WorkingViewProps["startedAt"]): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -60,7 +67,7 @@ export function WorkingView({
   const previewModeRef = useRef("");
 
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 200);
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
 
@@ -78,7 +85,7 @@ export function WorkingView({
   // the assistant stream has not started — structural fallback, no phrase
   // matching.
   const isReasoning = !assistantContent && Boolean(reasoningContent);
-  const previewContent = assistantContent || reasoningContent;
+  const previewContent = tailPreview(assistantContent || reasoningContent);
   const previewMode = isReasoning
     ? "reasoning"
     : assistantContent
@@ -88,6 +95,9 @@ export function WorkingView({
     isReasoning && reasoningPhase
       ? REASONING_PHASE_LABELS[reasoningPhase] || null
       : null;
+  const emptyPreviewText = detail
+    ? "Preparing the next step..."
+    : "Preparing the response...";
 
   useEffect(() => {
     if (previewModeRef.current !== previewMode) {
@@ -151,7 +161,7 @@ export function WorkingView({
           </pre>
         ) : (
           <Typography variant="body2" className="cview-working-preview-empty">
-            Waiting for first tokens...
+            {emptyPreviewText}
           </Typography>
         )}
       </Box>

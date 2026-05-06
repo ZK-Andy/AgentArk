@@ -1,7 +1,7 @@
 // File view for source_read / source_write / file_edit etc.
 // Renders syntax-colored file content when it is available.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import Box from "@mui/material/Box";
 import IconButton from "@mui/material/IconButton";
 import Tooltip from "@mui/material/Tooltip";
@@ -10,6 +10,7 @@ import ContentCopyRounded from "@mui/icons-material/ContentCopyRounded";
 
 import type { ChatStepCard } from "../types";
 import { extractFilePath } from "../dispatch";
+import { surfacePayloads } from "../surface";
 import { guessCodeLanguage, renderCodeBlockLines } from "../codeHighlight";
 
 export interface FileViewProps {
@@ -108,6 +109,38 @@ function structuredCardContent(card: ChatStepCard, path: string): string {
   return "";
 }
 
+function structuredSurfaceContent(card: ChatStepCard, path: string): string {
+  const target = normalizePath(path);
+  for (const item of surfacePayloads(card)) {
+    const itemPath = normalizePath(
+      item.path ||
+        str(item.metadata?.path) ||
+        str(item.metadata?.file) ||
+        str(item.metadata?.name),
+    );
+    if (target && !itemPath) continue;
+    if (
+      target &&
+      itemPath &&
+      itemPath !== target &&
+      !itemPath.endsWith(`/${target}`) &&
+      !target.endsWith(`/${itemPath}`)
+    ) {
+      continue;
+    }
+    if (item.text) return item.text;
+    if (typeof item.json === "string") return item.json;
+    if (item.json != null) {
+      try {
+        return JSON.stringify(item.json, null, 2);
+      } catch {
+        return "";
+      }
+    }
+  }
+  return "";
+}
+
 function pickContent(
   card: ChatStepCard,
   path: string,
@@ -127,6 +160,8 @@ function pickContent(
       return snippet;
     }
   }
+  const surfaceContent = structuredSurfaceContent(card, path);
+  if (surfaceContent) return surfaceContent;
   const structured = structuredCardContent(card, path);
   if (structured) return structured;
   if (snippetPath && snippetPath.trim()) return "";
@@ -165,7 +200,7 @@ function languageLabel(path: string, body: string): string {
   }
 }
 
-export function FileView({
+function FileViewInner({
   card,
   snippetPath,
   snippetContent,
@@ -175,6 +210,10 @@ export function FileView({
     (snippetPath && snippetPath.trim()) || extractFilePath(card) || card.label;
   const body = pickContent(card, path, snippetPath, snippetContent);
   const byteCount = useMemo(() => new Blob([body || ""]).size, [body]);
+  const highlightedLines = useMemo(
+    () => renderCodeBlockLines(body, { fileName: path }),
+    [body, path],
+  );
   const meta = body
     ? `${languageLabel(path, body)} / ${formatBytes(byteCount)}`
     : (card.kind || "").toLowerCase();
@@ -245,7 +284,7 @@ export function FileView({
       </Box>
       {body ? (
         <pre ref={preRef} className="code-viewer-pre cview-file-body">
-          <code>{renderCodeBlockLines(body, { fileName: path })}</code>
+          <code>{highlightedLines}</code>
           {live ? (
             <span className="cview-file-caret" aria-hidden="true">
               |
@@ -262,5 +301,36 @@ export function FileView({
     </Box>
   );
 }
+
+function areFileViewPropsEqual(prev: FileViewProps, next: FileViewProps) {
+  if (
+    prev.live !== next.live ||
+    prev.snippetPath !== next.snippetPath ||
+    prev.snippetContent !== next.snippetContent
+  ) {
+    return false;
+  }
+
+  if (
+    (prev.snippetContent || next.snippetContent) &&
+    prev.snippetPath === next.snippetPath
+  ) {
+    return true;
+  }
+
+  return (
+    prev.card.id === next.card.id &&
+    prev.card.label === next.card.label &&
+    prev.card.kind === next.card.kind &&
+    prev.card.detail === next.card.detail &&
+    prev.card.detailFull === next.card.detailFull &&
+    prev.card.rawDetailFull === next.card.rawDetailFull &&
+    prev.card.payloadView?.body === next.card.payloadView?.body &&
+    prev.card.surface === next.card.surface
+  );
+}
+
+export const FileView = memo(FileViewInner, areFileViewPropsEqual);
+FileView.displayName = "FileView";
 
 export default FileView;

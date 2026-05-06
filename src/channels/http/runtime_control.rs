@@ -256,7 +256,11 @@ pub(super) async fn build_runtime_health_payload(
         && blocking_startup_issue_count == 0;
     let overall_ok = if readiness_mode { ready } else { true };
     let status_text = if readiness_mode {
-        if ready { "ok" } else { "not_ready" }
+        if ready {
+            "ok"
+        } else {
+            "not_ready"
+        }
     } else if healthy {
         "ok"
     } else {

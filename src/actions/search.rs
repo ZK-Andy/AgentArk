@@ -1654,7 +1654,7 @@ const DEFAULT_CONFIGURED_PROVIDER_ORDER: &[&str] = &[
     "firecrawl",
     "searxng",
 ];
-const DEFAULT_FREE_BACKEND_ORDER: &[&str] = &["duckduckgo", "lightpanda", "bing_rss"];
+const DEFAULT_FREE_BACKEND_ORDER: &[&str] = &["duckduckgo", "lightpanda", "playwright", "bing_rss"];
 
 /// Execute a web search
 pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<String> {

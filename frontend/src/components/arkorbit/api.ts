@@ -2,6 +2,7 @@ import { api, apiUrl } from "../../api/client";
 import type {
   Orbit,
   OrbitChatHistoryMessage,
+  OrbitChatMessageStatus,
   OrbitChatTranscript,
   OrbitFileEntry,
   OrbitId,
@@ -15,6 +16,18 @@ function asString(value: unknown): string | undefined {
 
 function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asOrbitChatMessageStatus(value: unknown): OrbitChatMessageStatus | undefined {
+  if (
+    value === "running" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "stopped"
+  ) {
+    return value;
+  }
+  return undefined;
 }
 
 function asOrbit(value: unknown): Orbit | null {
@@ -69,6 +82,8 @@ function asChatHistoryMessage(value: unknown): OrbitChatHistoryMessage | null {
     role: raw.role,
     content: raw.content,
     created_at: asString(raw.created_at),
+    status: asOrbitChatMessageStatus(raw.status),
+    activity: asString(raw.activity),
     model: asString(raw.model),
     input_tokens: asNumber(raw.input_tokens),
     output_tokens: asNumber(raw.output_tokens),
@@ -121,6 +136,26 @@ function asOrbitFile(value: unknown): OrbitFileEntry | null {
   };
 }
 
+function isUserArtifactFile(path: string): boolean {
+  const normalized = path.trim().replace(/\\/g, "/");
+  if (
+    !normalized ||
+    normalized.startsWith(".tmp/") ||
+    normalized === "index.html" ||
+    normalized === "orbit.json" ||
+    normalized === "messages.jsonl" ||
+    normalized === "data/chat-session.txt" ||
+    normalized.startsWith("data/chat-history/")
+  ) {
+    return false;
+  }
+  return (
+    normalized.startsWith("mod/") ||
+    normalized.startsWith("assets/") ||
+    normalized.startsWith("data/")
+  );
+}
+
 function extractOrbitFiles(payload: unknown): OrbitFileEntry[] {
   const list =
     payload && typeof payload === "object"
@@ -129,7 +164,10 @@ function extractOrbitFiles(payload: unknown): OrbitFileEntry[] {
   if (!Array.isArray(list)) return [];
   return list
     .map(asOrbitFile)
-    .filter((file): file is OrbitFileEntry => file !== null);
+    .filter(
+      (file): file is OrbitFileEntry =>
+        file !== null && isUserArtifactFile(file.path),
+    );
 }
 
 function extractTranscripts(payload: unknown): OrbitChatTranscript[] {

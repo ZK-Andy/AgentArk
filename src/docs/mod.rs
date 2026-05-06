@@ -1,2 +1,2 @@
 pub(crate) mod agent_toc;
-pub(crate) mod product_help;
+pub(crate) mod agentark_manual;

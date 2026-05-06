@@ -1,8 +1,8 @@
 use super::*;
 
-pub(super) async fn sync_product_help_knowledge(State(state): State<AppState>) -> Response {
+pub(super) async fn sync_agentark_knowledge(State(state): State<AppState>) -> Response {
     let agent = state.agent.read().await;
-    match agent.sync_bundled_product_help().await {
+    match agent.sync_agentark_knowledge().await {
         Ok(synced) => (
             StatusCode::OK,
             Json(serde_json::json!({ "synced": synced })),

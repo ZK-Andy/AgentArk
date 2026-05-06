@@ -3,7 +3,7 @@ import ChatRoundedIcon from "@mui/icons-material/ChatRounded";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import ListAltRoundedIcon from "@mui/icons-material/ListAltRounded";
 import { useEffect, useMemo, useState } from "react";
-import { PRODUCT_SHELL_TITLE, PRODUCT_TAGLINE } from "../brand";
+import { PRODUCT_CATEGORY, PRODUCT_NAME, PRODUCT_TAGLINE } from "../brand";
 
 type Props = {
   onGoChat?: () => void;
@@ -159,18 +159,43 @@ export function WelcomeHero({
                   />
                   <Box sx={{ minWidth: 0 }}>
                     <Typography
-                      variant="overline"
-                      sx={{ color: "var(--ui-rgba-183-188-196-680)", letterSpacing: 0, display: "block", lineHeight: 1 }}
-                    >
-                      {PRODUCT_SHELL_TITLE}
-                    </Typography>
-                    <Typography
+                      component="h1"
                       variant="h5"
                       sx={{
                         fontWeight: 700,
                         lineHeight: 1.08,
                         letterSpacing: 0,
                         fontSize: { xs: "1.32rem", md: "1.52rem" },
+                        color: "#ffffff",
+                        m: 0,
+                      }}
+                    >
+                      {PRODUCT_NAME}
+                    </Typography>
+                    <Typography
+                      component="div"
+                      sx={{
+                        fontSize: { xs: "0.6rem", md: "0.62rem" },
+                        fontWeight: 600,
+                        letterSpacing: "0.22em",
+                        textTransform: "uppercase",
+                        color: "var(--ui-rgba-183-188-196-680)",
+                        mt: { xs: 0.6, md: 0.8 },
+                        lineHeight: 1,
+                      }}
+                    >
+                      {PRODUCT_CATEGORY}
+                    </Typography>
+                    <Typography
+                      variant="body1"
+                      sx={{
+                        fontWeight: 500,
+                        lineHeight: 1.4,
+                        letterSpacing: 0,
+                        fontSize: { xs: "0.92rem", md: "1rem" },
+                        color: "var(--ui-rgba-220-224-232-880)",
+                        mt: { xs: 0.9, md: 1.1 },
+                        maxWidth: "62ch",
                       }}
                     >
                       Private OS for memory, agents, apps, and automation.

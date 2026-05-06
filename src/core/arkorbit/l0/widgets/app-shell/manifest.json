@@ -1,0 +1,5 @@
+{
+  "name": "app-shell",
+  "description": "Generic declarative mini-app renderer for framework-generated Orbit widgets.",
+  "entry": "index.js"
+}

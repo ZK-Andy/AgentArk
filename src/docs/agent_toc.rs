@@ -7,14 +7,14 @@ pub(crate) struct AgentDocTocEntry {
 
 pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     AgentDocTocEntry {
-        label: "Bundled product help",
-        location: "src/docs/product_help.rs",
+        label: "AgentArk manual",
+        location: "src/docs/agentark_manual.rs",
         use_for: "user-facing setup, navigation, feature, Docker, memory, ArkReflect, built-in connector, and custom integration guidance",
     },
     AgentDocTocEntry {
-        label: "Product help retrieval",
-        location: "src/core/product_help.rs",
-        use_for: "how bundled help docs become searchable knowledge and runtime help context",
+        label: "AgentArk knowledge retrieval",
+        location: "src/core/agentark_knowledge.rs",
+        use_for: "how live capability registry entries and manual docs become searchable AgentArk knowledge context",
     },
     AgentDocTocEntry {
         label: "Primary system prompt",
@@ -33,7 +33,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     },
     AgentDocTocEntry {
         label: "Companion devices",
-        location: "src/core/companion.rs; src/channels/http/companion_control.rs; frontend/src/components/CompanionDevicesPanel.tsx; clients/companion/; src/docs/product_help.rs",
+        location: "src/core/companion.rs; src/channels/http/companion_control.rs; frontend/src/components/CompanionDevicesPanel.tsx; clients/companion/; src/docs/agentark_manual.rs",
         use_for: "paired device setup, scoped grants, WebSocket protocol, typed companion commands, approval requirements, first-party native clients, and custom-device guidance",
     },
     AgentDocTocEntry {
@@ -43,7 +43,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     },
     AgentDocTocEntry {
         label: "ArkReflect",
-        location: "src/channels/http/reflect_control.rs; src/storage/entities/semantic_work_unit.rs; frontend/src/components/pages/ArkReflectPage.tsx; src/docs/product_help.rs",
+        location: "src/channels/http/reflect_control.rs; src/storage/entities/semantic_work_unit.rs; frontend/src/components/pages/ArkReflectPage.tsx; src/docs/agentark_manual.rs",
         use_for: "cached day/week/month retrospectives, /reflect API queries, derived semantic work units, source coverage, related-history lookup, Daily Digest delivery, and Panorama UI behavior",
     },
     AgentDocTocEntry {
@@ -63,7 +63,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     },
     AgentDocTocEntry {
         label: "GEPA background optimizer",
-        location: "src/core/self_evolve/gepa_bridge.rs; bridges/gepa_optimizer/; src/channels/http/evolution_control.rs; src/docs/product_help.rs",
+        location: "src/core/self_evolve/gepa_bridge.rs; bridges/gepa_optimizer/; src/channels/http/evolution_control.rs; src/docs/agentark_manual.rs",
         use_for: "automatic prompt optimizer scheduling, model/runtime readiness, cost budgets, GEPA file artifacts, and experience_runs or kv_store inspection",
     },
     AgentDocTocEntry {
@@ -73,7 +73,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     },
     AgentDocTocEntry {
         label: "Security and secrets",
-        location: "SECURITY.md; src/security/; src/security/capabilities.rs; src/security/skill_review.rs; src/crypto/; src/docs/product_help.rs",
+        location: "SECURITY.md; src/security/; src/security/capabilities.rs; src/security/skill_review.rs; src/crypto/; src/docs/agentark_manual.rs",
         use_for: "secret handling, encryption, API-token safety, approvals, inbound guard behavior, security alerts, and security expectations",
     },
     AgentDocTocEntry {
@@ -88,7 +88,7 @@ pub(crate) const AGENT_DOC_TOC: &[AgentDocTocEntry] = &[
     },
     AgentDocTocEntry {
         label: "Skill management",
-        location: "src/docs/product_help.rs; src/security/skill_review.rs; src/security/capabilities.rs; src/channels/http/actions.rs; src/runtime/mod.rs",
+        location: "src/docs/agentark_manual.rs; src/security/skill_review.rs; src/security/capabilities.rs; src/channels/http/actions.rs; src/runtime/mod.rs",
         use_for: "user-added skill import, editing, semantic capability review, deterministic skill policy, and reviewed skill runtime loading",
     },
 ];
@@ -123,7 +123,7 @@ mod tests {
         let rendered = render_agent_doc_toc();
 
         assert!(rendered.contains("table of contents"));
-        assert!(rendered.contains("src/docs/product_help.rs"));
+        assert!(rendered.contains("src/docs/agentark_manual.rs"));
         assert!(rendered.contains("src/core/agent/prompt_builder.rs"));
         assert!(rendered.contains("src/storage/"));
         assert!(rendered.lines().count() <= 22);

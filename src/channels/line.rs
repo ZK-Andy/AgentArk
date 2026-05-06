@@ -195,22 +195,24 @@ async fn send_message_to_destination(
         trim_trailing_slashes(&config.api_base_url)
     );
     let client = http_client()?;
-    let response = super::outbound_rate_limit::send_with_bounded_retries(
-        "line",
-        "push_message",
-        client
-            .post(&url)
-            .bearer_auth(&config.channel_access_token)
-            .json(&json!({
-                "to": destination.target,
-                "messages": [{ "type": "text", "text": text }],
-            })),
-    )
-    .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("LINE delivery failed ({}): {}", status, body));
+    for chunk in super::outbound_split::split_for_provider_safe_channel("line", text) {
+        let response = super::outbound_rate_limit::send_with_bounded_retries(
+            "line",
+            "push_message",
+            client
+                .post(&url)
+                .bearer_auth(&config.channel_access_token)
+                .json(&json!({
+                    "to": destination.target,
+                    "messages": [{ "type": "text", "text": chunk }],
+                })),
+        )
+        .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("LINE delivery failed ({}): {}", status, body));
+        }
     }
     Ok(())
 }

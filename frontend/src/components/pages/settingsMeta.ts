@@ -15,7 +15,7 @@ export function normalizeSettingsTab(rawTab?: number | null): number {
   if (typeof rawTab !== "number" || !Number.isFinite(rawTab)) return 0;
   const tab = Math.max(0, Math.trunc(rawTab));
   if (tab === 2 || tab === 10 || tab === 15) return 20;
-  if (tab === 9) return 0;
+  if (tab === 9 || tab === 13 || tab === 17) return 0;
   return tab;
 }
 
@@ -83,6 +83,47 @@ export function settingsTabSupportsSave(tab: number): boolean {
   return ![9, 11, 13, 16, 17, 20, 21, 22, 23, 25, 26].includes(tab);
 }
 
+export function getSettingsTabLoadingMessage(tab: number): string {
+  switch (normalizeSettingsTab(tab)) {
+    case 1:
+      return "Loading models...";
+    case 3:
+      return "Loading media settings...";
+    case 4:
+      return "Loading security settings...";
+    case 5:
+      return "Loading advanced settings...";
+    case 6:
+      return "Loading observability...";
+    case 8:
+      return "Loading MCP servers...";
+    case 11:
+      return "Loading trace...";
+    case 12:
+      return "Loading memory...";
+    case 14:
+      return "Loading data cleanup...";
+    case 16:
+      return "Loading sender verification...";
+    case 20:
+      return "Loading messaging channels...";
+    case 21:
+      return "Loading integrations...";
+    case 22:
+      return "Loading webhooks and APIs...";
+    case 23:
+      return "Loading plugins...";
+    case 24:
+      return "Loading search settings...";
+    case 25:
+      return "Loading updates...";
+    case 26:
+      return "Loading companion devices...";
+    default:
+      return "Loading settings...";
+  }
+}
+
 export function getSettingsPageMeta(tab: number): SettingsPageMeta {
   switch (tab) {
     case 0:
@@ -114,6 +155,13 @@ export function getSettingsPageMeta(tab: number): SettingsPageMeta {
         kicker: "Security",
         description:
           "Instance protection, secrets posture, and security review controls.",
+      };
+    case 16:
+      return {
+        kicker: "Security",
+        title: "Sender Verification",
+        description:
+          "Trust policies, pending approvals, and approved senders for inbound channels.",
       };
     case 5:
       return {

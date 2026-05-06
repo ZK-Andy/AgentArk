@@ -158,27 +158,29 @@ async fn send_to_destination(
     {
         return Err(anyhow!("Signal destination is missing"));
     }
-    let mut request = http_client()?.post(format!(
-        "{}/send",
-        trim_trailing_slashes(&config.bridge_url)
-    ));
-    if !config.bridge_token.trim().is_empty() {
-        request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
-    }
-    let response = super::outbound_rate_limit::send_with_bounded_retries(
-        "signal",
-        "bridge_message",
-        request.json(&serde_json::json!({
-            "channel": "signal",
-            "text": text,
-            "recipient": destination.recipient,
-            "group_id": destination.group_id
-        })),
-    )
-    .await?;
-    if !response.status().is_success() {
-        let payload = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Signal bridge error: {}", payload));
+    for chunk in super::outbound_split::split_for_provider_safe_channel("signal", text) {
+        let mut request = http_client()?.post(format!(
+            "{}/send",
+            trim_trailing_slashes(&config.bridge_url)
+        ));
+        if !config.bridge_token.trim().is_empty() {
+            request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
+        }
+        let response = super::outbound_rate_limit::send_with_bounded_retries(
+            "signal",
+            "bridge_message",
+            request.json(&serde_json::json!({
+                "channel": "signal",
+                "text": chunk,
+                "recipient": destination.recipient,
+                "group_id": destination.group_id
+            })),
+        )
+        .await?;
+        if !response.status().is_success() {
+            let payload = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Signal bridge error: {}", payload));
+        }
     }
     Ok(())
 }

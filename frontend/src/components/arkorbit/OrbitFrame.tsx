@@ -702,6 +702,37 @@ function OrbitWidgetSlot({
   const moduleName = identity?.moduleName ?? null;
   const id = identity?.id ?? `widget-${index}`;
 
+  // Stable mount-identity: anything OTHER than position fields. If only the
+  // widget's left/top changed (e.g. user dragged it), this hash is unchanged
+  // and the mount effect below will not re-run — so the widget keeps its
+  // internal DOM/state instead of blanking out and reloading.
+  const widgetMountKey = useMemo(() => {
+    if (!widget || typeof widget !== "object") return "";
+    const stripped: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(widget as Record<string, unknown>)) {
+      if (
+        key === "left" || key === "top" ||
+        key === "x" || key === "y" ||
+        key === "width" || key === "height"
+      ) {
+        continue;
+      }
+      stripped[key] = value;
+    }
+    try {
+      return JSON.stringify(stripped);
+    } catch {
+      return String(identity?.id ?? index);
+    }
+  }, [identity?.id, index, widget]);
+
+  // Latest widget snapshot for use inside the mount effect's render context,
+  // without making the effect itself depend on the widget reference.
+  const widgetRef = useRef(widget);
+  useEffect(() => {
+    widgetRef.current = widget;
+  }, [widget]);
+
   const style = useMemo(() => {
     return {
       left: `${layout.x}px`,
@@ -723,7 +754,7 @@ function OrbitWidgetSlot({
     const fetchPublic = createOrbitPublicFetch(orbitId);
     const ctx: OrbitWidgetContext = {
       orbitId,
-      widget,
+      widget: widgetRef.current,
       moduleName,
       resolveText: (path: string) => fetchOrbitText(orbitId, path),
       importMod: (path: string) => importOrbitModule(orbitId, path),
@@ -769,7 +800,10 @@ function OrbitWidgetSlot({
       }
       host.innerHTML = "";
     };
-  }, [moduleName, onRuntimeNotice, orbitId, reloadToken, widget]);
+    // widgetMountKey replaces `widget` in deps so position-only updates do not
+    // trigger a remount. The widget ref above keeps render() seeing fresh data.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moduleName, onRuntimeNotice, orbitId, reloadToken, widgetMountKey]);
 
   const handlePointerDown = useCallback(
     (event: PointerEvent<HTMLDivElement>) => {

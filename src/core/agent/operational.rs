@@ -342,7 +342,15 @@ Rules:\n\
         crate::core::self_evolve::specialist_prompt_evolution::parse_specialist_prompt_bundle_profile(&raw)
     }
 
-    fn prompt_seed_for_message(message: &str) -> String {
+    async fn load_prompt_fragment_bundle_by_key(
+        &self,
+        key: &str,
+    ) -> Option<crate::core::prompt_fragments::PromptFragmentBundleProfile> {
+        let raw = self.storage.get(key).await.ok().flatten()?;
+        crate::core::prompt_fragments::parse_prompt_fragment_bundle_profile(&raw)
+    }
+
+    pub(super) fn prompt_seed_for_message(message: &str) -> String {
         let normalized = message.trim().to_ascii_lowercase();
         if normalized.is_empty() {
             "_empty".to_string()
@@ -534,6 +542,49 @@ Rules:\n\
                     if let Some(canary) = self
                         .load_specialist_prompt_bundle_by_key(
                             crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+                        )
+                        .await
+                    {
+                        selected = canary;
+                    }
+                }
+            }
+        }
+
+        selected
+    }
+
+    pub(crate) async fn active_prompt_fragment_bundle_for_message(
+        &self,
+        message: &str,
+    ) -> crate::core::prompt_fragments::PromptFragmentBundleProfile {
+        let mut selected = self
+            .load_prompt_fragment_bundle_by_key(
+                crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
+            )
+            .await
+            .unwrap_or_else(crate::core::prompt_fragments::default_prompt_fragment_bundle);
+
+        let canary_state_raw = self
+            .storage
+            .get(crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_CANARY_STATE_KEY)
+            .await
+            .ok()
+            .flatten();
+        if let Some(raw) = canary_state_raw {
+            if let Ok(state) = serde_json::from_slice::<
+                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+            >(&raw)
+            {
+                if state.enabled
+                    && crate::core::self_evolve::strategy_runtime::should_use_canary(
+                        &Self::prompt_seed_for_message(message),
+                        state.rollout_percent,
+                    )
+                {
+                    if let Some(canary) = self
+                        .load_prompt_fragment_bundle_by_key(
+                            crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_PROFILE_CANARY_KEY,
                         )
                         .await
                     {

@@ -314,6 +314,7 @@ impl Agent {
             timeout_ms,
             max_candidates,
             None,
+            false,
         )
         .await
     }
@@ -333,6 +334,7 @@ impl Agent {
         timeout_ms: u64,
         max_candidates: usize,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+        app_delivery_stream: bool,
     ) -> Result<super::llm::LlmResponse, crate::core::UserFacingOutcome> {
         if candidates.is_empty() {
             candidates = self.llm_candidates_for_role(preferred_role);
@@ -353,9 +355,37 @@ impl Agent {
         };
         let mut attempted_models = Vec::new();
         let mut attempt_records = Vec::new();
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            channel = %channel,
+            usage_label = %usage_label,
+            request_kind = %request_kind,
+            preferred_role = ?preferred_role,
+            candidate_count = candidates.len(),
+            max_candidates = max_candidates.max(1),
+            timeout_ms,
+            stream = stream_tx.is_some(),
+            prompt_chars = system_prompt.chars().count().saturating_add(user_message.chars().count()),
+            action_count = actions.len(),
+            "supervised model request start"
+        );
 
         for (idx, candidate) in candidates.iter().take(max_candidates.max(1)).enumerate() {
             let started = std::time::Instant::now();
+            tracing::debug!(
+                target: "agentark.turn_timing",
+                channel = %channel,
+                usage_label = %usage_label,
+                request_kind = %request_kind,
+                candidate_index = idx,
+                slot_id = %candidate.slot_id,
+                slot_label = %candidate.slot_label,
+                model = %candidate.client.model_name(),
+                provider = %candidate.client.provider_name(),
+                stream = stream_tx.is_some(),
+                timeout_ms,
+                "supervised model candidate start"
+            );
             let result = if let Some(token_tx) = stream_tx.clone() {
                 crate::core::execution::execute_supervised_transport_chat_stream_with_policy(
                     &self.execution_supervisor,
@@ -365,8 +395,13 @@ impl Agent {
                     user_message,
                     memories,
                     actions,
-                    Some(timeout_ms.max(1)),
+                    if app_delivery_stream {
+                        None
+                    } else {
+                        Some(timeout_ms.max(1))
+                    },
                     token_tx,
+                    app_delivery_stream,
                     &self.config.model_privacy,
                     false,
                 )
@@ -389,6 +424,24 @@ impl Agent {
 
             match result {
                 Ok(resp) => {
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    tracing::debug!(
+                        target: "agentark.turn_timing",
+                        channel = %channel,
+                        usage_label = %usage_label,
+                        request_kind = %request_kind,
+                        candidate_index = idx,
+                        slot_id = %candidate.slot_id,
+                        slot_label = %candidate.slot_label,
+                        model = %candidate.client.model_name(),
+                        provider = %candidate.client.provider_name(),
+                        stream = stream_tx.is_some(),
+                        duration_ms,
+                        success = true,
+                        response_chars = resp.content.chars().count(),
+                        tool_calls = resp.tool_calls.len(),
+                        "supervised model candidate complete"
+                    );
                     self.record_llm_usage(channel, usage_label, &resp).await;
                     self.record_model_attempt(
                         &mut attempted_models,
@@ -404,7 +457,24 @@ impl Agent {
                     return Ok(resp);
                 }
                 Err(error) => {
+                    let duration_ms = started.elapsed().as_millis() as u64;
                     let error_text = error.to_string();
+                    tracing::debug!(
+                        target: "agentark.turn_timing",
+                        channel = %channel,
+                        usage_label = %usage_label,
+                        request_kind = %request_kind,
+                        candidate_index = idx,
+                        slot_id = %candidate.slot_id,
+                        slot_label = %candidate.slot_label,
+                        model = %candidate.client.model_name(),
+                        provider = %candidate.client.provider_name(),
+                        stream = stream_tx.is_some(),
+                        duration_ms,
+                        success = false,
+                        error = %safe_truncate(&error_text, 320),
+                        "supervised model candidate failed"
+                    );
                     self.record_model_attempt(
                         &mut attempted_models,
                         &mut attempt_records,

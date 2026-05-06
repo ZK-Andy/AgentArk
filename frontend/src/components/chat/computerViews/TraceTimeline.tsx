@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { ReactElement } from "react";
 import type { ChatStepCard } from "../types";
-import { highlightCodeLine } from "../codeHighlight";
+import { buildReadableToolPresentation } from "./presentation";
 
 export interface TraceTimelineProps {
   cards: ChatStepCard[];
@@ -17,38 +17,42 @@ function truncate(text: string, limit = SUMMARY_LIMIT): string {
   return `${trimmed.slice(0, limit - 3)}...`;
 }
 
-function pickPayload(card: ChatStepCard): string {
+function looksLikeStructuredPayload(text: string): boolean {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return false;
   return (
-    card.payloadView?.body ||
-    card.rawDetailFull ||
-    card.detailFull ||
-    card.detail ||
-    ""
+    ((trimmed.startsWith("{") || trimmed.startsWith("[")) &&
+      /["}\]]\s*[:,]|^\{\s*"|^\[\s*(\{|"|\])/.test(trimmed)) ||
+    /^<artifact\b/i.test(trimmed)
   );
 }
 
-function renderHighlighted(payload: string): ReactElement[] {
-  const lines = payload.split("\n");
-  return lines.map((line, lineIdx) => {
-    const tokens = highlightCodeLine(line, "json");
-    return (
-      <div key={lineIdx} className="trace-row-payload-line">
-        {tokens.map((token, tokenIdx) =>
-          token.className ? (
-            <span
-              key={tokenIdx}
-              className={`code-token code-token-${token.className}`}
-            >
-              {token.text}
-            </span>
-          ) : (
-            <span key={tokenIdx}>{token.text}</span>
-          ),
-        )}
-        {line.length === 0 ? " " : null}
-      </div>
-    );
-  });
+function safeTraceText(text: string): string {
+  const trimmed = (text || "").replace(/\s+/g, " ").trim();
+  if (!trimmed) return "";
+  if (looksLikeStructuredPayload(trimmed)) return "";
+  return truncate(trimmed, 220);
+}
+
+function traceDetailRows(card: ChatStepCard, subline: string): string[] {
+  const presentation = buildReadableToolPresentation(card);
+  const candidates = [
+    presentation.summary,
+    ...presentation.rows,
+    card.summary,
+    card.detail,
+    card.detailFull,
+  ];
+  const seen = new Set<string>();
+  const rows: string[] = [];
+  for (const candidate of candidates) {
+    const text = safeTraceText(candidate || "");
+    if (!text || text === subline || seen.has(text.toLowerCase())) continue;
+    seen.add(text.toLowerCase());
+    rows.push(text);
+    if (rows.length >= 4) break;
+  }
+  return rows;
 }
 
 interface TraceRowProps {
@@ -66,8 +70,10 @@ function TraceRow({ card, isActive, onActivate }: TraceRowProps) {
     }
   }, [isActive]);
 
-  const subline = truncate(card.summary || card.detail || "");
-  const payload = pickPayload(card);
+  const subline =
+    safeTraceText(card.summary || card.detail || "") ||
+    "Trace event recorded.";
+  const detailRows = traceDetailRows(card, subline);
 
   return (
     <li
@@ -89,18 +95,18 @@ function TraceRow({ card, isActive, onActivate }: TraceRowProps) {
         </div>
         {subline ? <div className="trace-row-detail">{subline}</div> : null}
       </button>
-      <details className="trace-row-expander" open={isActive}>
-        <summary>View raw payload</summary>
-        <div className="trace-row-payload">
-          {payload ? (
-            renderHighlighted(payload)
-          ) : (
-            <div className="trace-row-payload-empty">
-              (no payload captured)
-            </div>
-          )}
-        </div>
-      </details>
+      {detailRows.length > 0 ? (
+        <details className="trace-row-expander" open={isActive}>
+          <summary>View details</summary>
+          <div className="trace-row-payload">
+            {detailRows.map((row, index) => (
+              <div key={index} className="trace-row-payload-line">
+                {row}
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
     </li>
   );
 }

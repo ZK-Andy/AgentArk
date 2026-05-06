@@ -1,9 +1,9 @@
 use crate::core::Agent;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -541,13 +541,13 @@ async fn integration_connected(
     integration_id: &str,
 ) -> bool {
     let started = Instant::now();
-    tracing::info!(
+    tracing::debug!(
         integration_id = integration_id,
         "Integration sync connection check started"
     );
     if integration_id == "gmail" {
         let connected = gmail_connected(ctx).await;
-        tracing::info!(
+        tracing::debug!(
             integration_id = integration_id,
             connected = connected,
             duration_ms = started.elapsed().as_millis() as u64,
@@ -557,7 +557,7 @@ async fn integration_connected(
     }
     if integration_id == "google_calendar" {
         let connected = calendar_connected(ctx).await;
-        tracing::info!(
+        tracing::debug!(
             integration_id = integration_id,
             connected = connected,
             duration_ms = started.elapsed().as_millis() as u64,
@@ -567,7 +567,7 @@ async fn integration_connected(
     }
     if integration_id == "google_workspace" {
         let connected = google_workspace_connected(ctx).await;
-        tracing::info!(
+        tracing::debug!(
             integration_id = integration_id,
             connected = connected,
             duration_ms = started.elapsed().as_millis() as u64,
@@ -576,7 +576,7 @@ async fn integration_connected(
         return connected;
     }
     if integration_uses_config_only_status(integration_id) {
-        tracing::info!(
+        tracing::debug!(
             integration_id = integration_id,
             connected = false,
             duration_ms = started.elapsed().as_millis() as u64,
@@ -585,7 +585,7 @@ async fn integration_connected(
         return false;
     }
     let Some(integration) = manager.get(integration_id) else {
-        tracing::info!(
+        tracing::debug!(
             integration_id = integration_id,
             connected = false,
             duration_ms = started.elapsed().as_millis() as u64,
@@ -601,7 +601,7 @@ async fn integration_connected(
     {
         Ok(status) => {
             let connected = matches!(status, crate::integrations::IntegrationStatus::Connected);
-            tracing::info!(
+            tracing::debug!(
                 integration_id = integration_id,
                 connected = connected,
                 status = ?status,
@@ -1034,7 +1034,7 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
     );
     supported_ids.sort();
     supported_ids.dedup();
-    tracing::info!(
+    tracing::debug!(
         supported_integrations = supported_ids.len(),
         "Integration sync run started"
     );
@@ -1060,11 +1060,12 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
         }
         due_configs.push(config);
     }
-    tracing::info!(
+    tracing::debug!(
         due_integrations = due_configs.len(),
         "Integration sync due integration scan completed"
     );
 
+    let mut attempted_syncs = 0usize;
     for config in due_configs {
         let cursor = store
             .cursors
@@ -1074,6 +1075,7 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
         if !is_due(&cursor, &config) {
             continue;
         }
+        attempted_syncs = attempted_syncs.saturating_add(1);
         sync_integration(
             ctx,
             &manager,
@@ -1087,14 +1089,23 @@ pub async fn run_due_syncs(ctx: &IntegrationSyncContext) -> Result<()> {
         .await;
     }
 
-    tracing::info!("Integration sync persisting state");
+    tracing::debug!("Integration sync persisting state");
     save_state_store(ctx, &store).await?;
     save_feed(ctx, &feed).await?;
     save_runs(ctx, &runs).await?;
-    tracing::info!(
-        duration_ms = started.elapsed().as_millis() as u64,
-        "Integration sync run completed"
-    );
+    if attempted_syncs > 0 {
+        tracing::info!(
+            attempted_syncs,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Integration sync run completed"
+        );
+    } else {
+        tracing::debug!(
+            attempted_syncs,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Integration sync run completed"
+        );
+    }
     Ok(())
 }
 
@@ -1251,7 +1262,7 @@ async fn sync_integration(
     let previous_error = cursor.last_error.clone();
 
     if !force && !config.enabled {
-        tracing::info!(
+        tracing::debug!(
             integration_id = config.integration_id.as_str(),
             trigger = trigger,
             "Integration sync skipped disabled config"

@@ -14,25 +14,11 @@ import {
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-
-const TIMEZONE_OPTIONS = [
-  "UTC",
-  "America/New_York",
-  "America/Chicago",
-  "America/Denver",
-  "America/Los_Angeles",
-  "America/Phoenix",
-  "America/Toronto",
-  "America/Vancouver",
-  "Europe/London",
-  "Europe/Paris",
-  "Europe/Berlin",
-  "Asia/Dubai",
-  "Asia/Kolkata",
-  "Asia/Singapore",
-  "Asia/Tokyo",
-  "Australia/Sydney",
-];
+import {
+  detectLocalTimeZone,
+  getSupportedUiTimeZones,
+  setUiTimeZoneOverride,
+} from "../lib/dateFormat";
 
 const RESPONSE_STYLE_OPTIONS = [
   { value: "concise", label: "Concise" },
@@ -55,13 +41,7 @@ type Props = {
 
 export function PersonalizeAgentArkDialog({ open, profile, onClose }: Props) {
   const queryClient = useQueryClient();
-  const detectedTimezone = useMemo(() => {
-    try {
-      return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
-    } catch {
-      return "";
-    }
-  }, []);
+  const detectedTimezone = useMemo(() => detectLocalTimeZone(), []);
   const [preferredName, setPreferredName] = useState("");
   const [timezone, setTimezone] = useState("");
   const [responseStyle, setResponseStyle] = useState("concise");
@@ -78,6 +58,30 @@ export function PersonalizeAgentArkDialog({ open, profile, onClose }: Props) {
     );
     setError(null);
   }, [detectedTimezone, open, profile]);
+  const timezoneOptions = useMemo(() => {
+    const zones = new Set(getSupportedUiTimeZones());
+    if (timezone.trim()) zones.add(timezone.trim());
+    if (detectedTimezone) zones.add(detectedTimezone);
+    return Array.from(zones).sort((left, right) => {
+      if (left === "UTC") return -1;
+      if (right === "UTC") return 1;
+      return left.localeCompare(right);
+    });
+  }, [detectedTimezone, timezone]);
+  const timezoneHelperText = (() => {
+    const saved = timezone.trim();
+    if (!saved) {
+      return detectedTimezone
+        ? `Detected timezone: ${detectedTimezone}. Not correct? Choose one manually.`
+        : "Choose an IANA timezone such as America/New_York.";
+    }
+    if (detectedTimezone && saved !== detectedTimezone) {
+      return `Manual timezone override. This browser detected ${detectedTimezone}.`;
+    }
+    return detectedTimezone
+      ? `Using detected timezone ${detectedTimezone}.`
+      : "Saved timezone override.";
+  })();
 
   const saveMutation = useMutation({
     mutationFn: async () =>
@@ -89,6 +93,7 @@ export function PersonalizeAgentArkDialog({ open, profile, onClose }: Props) {
       }),
     onSuccess: async () => {
       setError(null);
+      setUiTimeZoneOverride(timezone.trim() || null);
       await queryClient.invalidateQueries({ queryKey: ["profile"] });
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
       await queryClient.invalidateQueries({
@@ -170,7 +175,7 @@ export function PersonalizeAgentArkDialog({ open, profile, onClose }: Props) {
           />
           <Autocomplete
             freeSolo
-            options={TIMEZONE_OPTIONS}
+            options={timezoneOptions}
             value={timezone}
             onChange={(_, value) => setTimezone(String(value ?? ""))}
             inputValue={timezone}
@@ -180,10 +185,22 @@ export function PersonalizeAgentArkDialog({ open, profile, onClose }: Props) {
                 {...params}
                 label="Timezone"
                 fullWidth
-                placeholder="e.g. America/New_York"
+                placeholder={detectedTimezone || "e.g. America/New_York"}
+                helperText={timezoneHelperText}
               />
             )}
           />
+          {detectedTimezone ? (
+            <Button
+              size="small"
+              variant="text"
+              sx={{ alignSelf: "flex-start" }}
+              disabled={timezone.trim() === detectedTimezone}
+              onClick={() => setTimezone(detectedTimezone)}
+            >
+              Use detected timezone
+            </Button>
+          ) : null}
           <TextField
             label="Response style"
             select

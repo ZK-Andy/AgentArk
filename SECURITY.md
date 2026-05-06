@@ -18,7 +18,7 @@ The recommended path is Docker Compose with a dedicated project directory and a 
 1. Clone the repository and review `docker-compose.yml`, `Dockerfile`, and [VERIFY.md](VERIFY.md).
 2. Verify the release artifact or GHCR image before use.
 3. Run AgentArk behind localhost or a trusted reverse proxy/tunnel.
-4. Set `AGENTARK_MASTER_PASSWORD` so encrypted secrets use Argon2id-derived keys instead of only the local keyfile fallback.
+4. Use the bundled Docker Compose stack so the `agentark-secrets` volume generates the install-managed encryption secret automatically.
 
 ## High-Privilege Disclosures
 

@@ -20,7 +20,7 @@ pub(super) fn background_session_policy_for_action(
     background_session::BackgroundSessionPolicy {
         allowed_action_roles: vec![planner_action_role_name(&meta.role).to_string()],
         allowed_integration_classes: vec![
-            planner_integration_class_name(&meta.integration_class).to_string(),
+            planner_integration_class_name(&meta.integration_class).to_string()
         ],
     }
     .normalized()

@@ -158,6 +158,80 @@ pub(super) async fn load_json_value_by_key(
     serde_json::from_slice::<serde_json::Value>(&raw).ok()
 }
 
+fn replay_gate_reasons_from_json(
+    replay: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<crate::core::self_evolve::PromotionGateReason> {
+    replay
+        .get("reasons")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let obj = item.as_object()?;
+                    let code = obj
+                        .get("code")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    let label = obj
+                        .get("label")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    Some(crate::core::self_evolve::PromotionGateReason::new(
+                        code, label,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn promotion_gate_summary_from_result(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    obj.get("promotion_gate_report")
+        .and_then(|value| value.as_object())
+        .and_then(|report| report.get("summary"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            obj.get("promotion_gate_summary")
+                .and_then(|value| value.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            obj.get("promotion_gate")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+pub(super) async fn load_live_policy_replay_evaluation(
+    storage: &crate::storage::Storage,
+    canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+) -> Option<crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult> {
+    let state = canary_state.filter(|state| state.enabled)?;
+    let logs = storage
+        .list_operational_logs_by_event("tool_call", 4_000)
+        .await
+        .ok()?;
+    Some(
+        crate::core::self_evolve::strategy_runtime::evaluate_canary_by_policy_version(
+            &logs,
+            &state.baseline_version,
+            &state.candidate_version,
+            state.min_samples_per_version,
+            state.min_success_gain,
+            state.max_sign_test_p_value,
+        ),
+    )
+}
+
 pub(super) async fn load_live_prompt_replay_evaluation(
     storage: &crate::storage::Storage,
     prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
@@ -192,6 +266,29 @@ pub(super) async fn load_live_metadata_prompt_replay_evaluation(
     Some(
         crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_metadata_version(
             &runs,
+            metadata_key,
+            &state.baseline_version,
+            &state.candidate_version,
+            state.min_samples_per_version,
+            state.min_success_gain,
+            state.max_sign_test_p_value,
+        ),
+    )
+}
+
+pub(super) async fn load_live_trace_prompt_telemetry_replay_evaluation(
+    storage: &crate::storage::Storage,
+    canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    metadata_key: &str,
+) -> Option<crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult> {
+    let state = canary_state.filter(|state| state.enabled)?;
+    let traces = storage
+        .list_execution_trace_summaries(None, PROMPT_REPLAY_EVAL_SAMPLE_LIMIT, 0)
+        .await
+        .ok()?;
+    Some(
+        crate::core::self_evolve::strategy_runtime::evaluate_trace_prompt_telemetry_canary_by_version(
+            &traces,
             metadata_key,
             &state.baseline_version,
             &state.candidate_version,
@@ -297,6 +394,7 @@ pub(super) async fn disable_all_evolution_canaries(
         crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
         crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
         crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+        crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_CANARY_STATE_KEY,
     ] {
         disable_canary_state_if_present(storage, key).await?;
     }
@@ -1246,8 +1344,88 @@ pub(super) fn format_char_count(value: usize) -> String {
     format!("{} chars", formatted)
 }
 
-pub(super) fn aggregate_prompt_telemetry_summary(
+fn push_prompt_telemetry_sample(
+    prompt_telemetry: &serde_json::Map<String, serde_json::Value>,
+    success: Option<bool>,
+    corrected: bool,
+    final_prompt_chars: &mut Vec<usize>,
+    tool_schema_chars: &mut Vec<usize>,
+    estimated_total_request_chars: &mut Vec<usize>,
+    tool_counts: &mut Vec<usize>,
+    success_samples: &mut usize,
+    corrected_samples: &mut usize,
+    section_samples: &mut BTreeMap<String, Vec<usize>>,
+) {
+    if let Some(value) = prompt_telemetry_usize(prompt_telemetry.get("final_system_prompt_chars")) {
+        final_prompt_chars.push(value);
+    } else {
+        return;
+    }
+    if let Some(value) = prompt_telemetry_usize(prompt_telemetry.get("tool_schema_chars")) {
+        tool_schema_chars.push(value);
+    }
+    if let Some(value) =
+        prompt_telemetry_usize(prompt_telemetry.get("estimated_total_request_chars"))
+    {
+        estimated_total_request_chars.push(value);
+    }
+    if let Some(value) = prompt_telemetry_usize(prompt_telemetry.get("tool_count")) {
+        tool_counts.push(value);
+    }
+    if success.unwrap_or(false) {
+        *success_samples = (*success_samples).saturating_add(1);
+    }
+    if corrected {
+        *corrected_samples = (*corrected_samples).saturating_add(1);
+    }
+    if let Some(sections) = prompt_telemetry
+        .get("sections")
+        .and_then(|value| value.as_object())
+    {
+        for (section, value) in sections {
+            if let Some(chars) = prompt_telemetry_usize(Some(value)) {
+                section_samples
+                    .entry(section.clone())
+                    .or_default()
+                    .push(chars);
+            }
+        }
+    }
+}
+
+fn prompt_telemetry_samples_from_trace(
+    trace: &crate::storage::ExecutionTraceSummaryRow,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let steps = serde_json::from_str::<Vec<crate::core::ExecutionStep>>(&trace.steps_json)
+        .unwrap_or_default();
+    steps
+        .into_iter()
+        .filter_map(|step| {
+            let data = step.data?;
+            let value = serde_json::from_str::<serde_json::Value>(&data).ok()?;
+            let object = value.as_object()?;
+            let trace_kind = object
+                .get("trace_kind")
+                .and_then(|value| value.as_str())
+                .map(str::trim);
+            if trace_kind == Some("prompt_telemetry") {
+                Some(object.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn trace_summary_has_error_step(trace: &crate::storage::ExecutionTraceSummaryRow) -> bool {
+    serde_json::from_str::<Vec<crate::core::ExecutionStep>>(&trace.steps_json)
+        .map(|steps| steps.iter().any(|step| step.step_type == "error"))
+        .unwrap_or(false)
+}
+
+pub(super) fn aggregate_prompt_telemetry_summary_with_traces(
     runs: &[crate::storage::experience_run::Model],
+    traces: &[crate::storage::ExecutionTraceSummaryRow],
 ) -> PromptTelemetrySummary {
     let mut final_prompt_chars = Vec::new();
     let mut tool_schema_chars = Vec::new();
@@ -1256,6 +1434,7 @@ pub(super) fn aggregate_prompt_telemetry_summary(
     let mut success_samples = 0usize;
     let mut corrected_samples = 0usize;
     let mut section_samples: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut experience_prompt_trace_ids = std::collections::HashSet::new();
 
     for run in runs {
         let Some(prompt_telemetry) = run
@@ -1265,41 +1444,47 @@ pub(super) fn aggregate_prompt_telemetry_summary(
         else {
             continue;
         };
+        if let Some(trace_id) = run
+            .trace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            experience_prompt_trace_ids.insert(trace_id.to_string());
+        }
 
-        if let Some(value) =
-            prompt_telemetry_usize(prompt_telemetry.get("final_system_prompt_chars"))
-        {
-            final_prompt_chars.push(value);
+        push_prompt_telemetry_sample(
+            prompt_telemetry,
+            Some(run.success_state != "failed"),
+            run.correction_state == "corrected",
+            &mut final_prompt_chars,
+            &mut tool_schema_chars,
+            &mut estimated_total_request_chars,
+            &mut tool_counts,
+            &mut success_samples,
+            &mut corrected_samples,
+            &mut section_samples,
+        );
+    }
+
+    for trace in traces {
+        if experience_prompt_trace_ids.contains(trace.id.as_str()) {
+            continue;
         }
-        if let Some(value) = prompt_telemetry_usize(prompt_telemetry.get("tool_schema_chars")) {
-            tool_schema_chars.push(value);
-        }
-        if let Some(value) =
-            prompt_telemetry_usize(prompt_telemetry.get("estimated_total_request_chars"))
-        {
-            estimated_total_request_chars.push(value);
-        }
-        if let Some(value) = prompt_telemetry_usize(prompt_telemetry.get("tool_count")) {
-            tool_counts.push(value);
-        }
-        if run.success_state != "failed" {
-            success_samples = success_samples.saturating_add(1);
-        }
-        if run.correction_state == "corrected" {
-            corrected_samples = corrected_samples.saturating_add(1);
-        }
-        if let Some(sections) = prompt_telemetry
-            .get("sections")
-            .and_then(|value| value.as_object())
-        {
-            for (section, value) in sections {
-                if let Some(chars) = prompt_telemetry_usize(Some(value)) {
-                    section_samples
-                        .entry(section.clone())
-                        .or_default()
-                        .push(chars);
-                }
-            }
+        let success = !trace_summary_has_error_step(trace);
+        for prompt_telemetry in prompt_telemetry_samples_from_trace(trace) {
+            push_prompt_telemetry_sample(
+                &prompt_telemetry,
+                Some(success),
+                false,
+                &mut final_prompt_chars,
+                &mut tool_schema_chars,
+                &mut estimated_total_request_chars,
+                &mut tool_counts,
+                &mut success_samples,
+                &mut corrected_samples,
+                &mut section_samples,
+            );
         }
     }
 
@@ -1421,6 +1606,10 @@ pub(super) fn prompt_canary_state_key_for_surface(
         "specialist_prompt" => Some((
             crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
             "Specialist prompt bundle",
+        )),
+        "prompt_fragment" => Some((
+            crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_CANARY_STATE_KEY,
+            "Prompt fragment bundle",
         )),
         _ => None,
     }
@@ -1802,6 +1991,11 @@ pub(super) async fn build_evolution_settings_response(
         crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
     )
     .await;
+    let prompt_fragment_canary_state = load_canary_state_by_key(
+        storage,
+        crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_CANARY_STATE_KEY,
+    )
+    .await;
     let prompt_last_result = load_json_value_by_key(
         storage,
         crate::core::self_evolve::PROMPT_BUNDLE_LAST_RESULT_KEY,
@@ -1810,6 +2004,11 @@ pub(super) async fn build_evolution_settings_response(
     let specialist_prompt_last_result = load_json_value_by_key(
         storage,
         crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_LAST_RESULT_KEY,
+    )
+    .await;
+    let prompt_fragment_last_result = load_json_value_by_key(
+        storage,
+        crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_LAST_RESULT_KEY,
     )
     .await;
 
@@ -1884,21 +2083,53 @@ pub(super) async fn build_evolution_settings_response(
             candidate_version: "-".to_string(),
         }
     };
+    let prompt_fragment_canary = if let Some(state) = prompt_fragment_canary_state.as_ref() {
+        EvolutionCanarySummary {
+            enabled: state.enabled,
+            rollout_percent: state.rollout_percent,
+            baseline_version: state.baseline_version.clone(),
+            candidate_version: state.candidate_version.clone(),
+        }
+    } else {
+        EvolutionCanarySummary {
+            enabled: false,
+            rollout_percent: 0,
+            baseline_version: crate::core::prompt_fragments::compose_prompt_fragment_version(
+                "prompt-fragments-default-v1",
+            ),
+            candidate_version: "-".to_string(),
+        }
+    };
 
     let mut replay_gate_result: Option<String> = None;
+    let mut replay_gate_reasons: Vec<crate::core::self_evolve::PromotionGateReason> = Vec::new();
     let mut promotion_mode = if canary.enabled {
         "canary".to_string()
     } else {
         "none".to_string()
     };
     let mut prompt_replay_gate_result: Option<String> = None;
+    let mut prompt_replay_gate_reasons: Vec<crate::core::self_evolve::PromotionGateReason> =
+        Vec::new();
     let mut prompt_promotion_mode = if prompt_canary.enabled {
         "canary".to_string()
     } else {
         "none".to_string()
     };
     let mut specialist_prompt_replay_gate_result: Option<String> = None;
+    let mut specialist_prompt_replay_gate_reasons: Vec<
+        crate::core::self_evolve::PromotionGateReason,
+    > = Vec::new();
     let mut specialist_prompt_promotion_mode = if specialist_prompt_canary.enabled {
+        "canary".to_string()
+    } else {
+        "none".to_string()
+    };
+    let mut prompt_fragment_replay_gate_result: Option<String> = None;
+    let mut prompt_fragment_replay_gate_reasons: Vec<
+        crate::core::self_evolve::PromotionGateReason,
+    > = Vec::new();
+    let mut prompt_fragment_promotion_mode = if prompt_fragment_canary.enabled {
         "canary".to_string()
     } else {
         "none".to_string()
@@ -1920,18 +2151,16 @@ pub(super) async fn build_evolution_settings_response(
             } else if let Some(reason) = replay.get("reason").and_then(|v| v.as_str()) {
                 replay_gate_result = Some(reason.to_string());
             }
+            replay_gate_reasons = replay_gate_reasons_from_json(replay);
         }
         let promoted = obj
             .get("promoted")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let gate = obj
-            .get("promotion_gate")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let gate_summary = promotion_gate_summary_from_result(obj);
         if promoted {
             "Promoted candidate policy".to_string()
-        } else if !gate.trim().is_empty() {
+        } else if let Some(gate) = gate_summary.as_deref() {
             format!("Not promoted ({})", gate)
         } else {
             "Evolution completed".to_string()
@@ -1956,22 +2185,20 @@ pub(super) async fn build_evolution_settings_response(
                 } else if let Some(reason) = replay.get("reason").and_then(|v| v.as_str()) {
                     prompt_replay_gate_result = Some(reason.to_string());
                 }
+                prompt_replay_gate_reasons = replay_gate_reasons_from_json(replay);
             }
             let promoted = obj
                 .get("promoted")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let gate = obj
-                .get("promotion_gate")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let gate_summary = promotion_gate_summary_from_result(obj);
             if prompt_promotion_mode == "baseline" {
                 "Promoted candidate prompt bundle".to_string()
             } else if prompt_promotion_mode == "canary" {
                 "Activated candidate prompt bundle in canary".to_string()
             } else if promoted {
                 "Candidate prompt bundle passed offline benchmark gate".to_string()
-            } else if !gate.trim().is_empty() {
+            } else if let Some(gate) = gate_summary.as_deref() {
                 format!("Not promoted ({})", gate)
             } else {
                 "Prompt evolution completed".to_string()
@@ -1998,22 +2225,20 @@ pub(super) async fn build_evolution_settings_response(
             } else if let Some(reason) = replay.get("reason").and_then(|v| v.as_str()) {
                 specialist_prompt_replay_gate_result = Some(reason.to_string());
             }
+            specialist_prompt_replay_gate_reasons = replay_gate_reasons_from_json(replay);
         }
         let promoted = obj
             .get("promoted")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let gate = obj
-            .get("promotion_gate")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let gate_summary = promotion_gate_summary_from_result(obj);
         if specialist_prompt_promotion_mode == "baseline" {
             "Promoted candidate specialist prompt bundle".to_string()
         } else if specialist_prompt_promotion_mode == "canary" {
             "Activated candidate specialist prompt bundle in canary".to_string()
         } else if promoted {
             "Candidate specialist prompt bundle passed offline benchmark gate".to_string()
-        } else if !gate.trim().is_empty() {
+        } else if let Some(gate) = gate_summary.as_deref() {
             format!("Not promoted ({})", gate)
         } else {
             "Specialist prompt evolution completed".to_string()
@@ -2021,14 +2246,65 @@ pub(super) async fn build_evolution_settings_response(
     } else {
         "No specialist prompt evolution runs yet".to_string()
     };
+    let prompt_fragment_last_promotion_result = if let Some(obj) = prompt_fragment_last_result
+        .as_ref()
+        .and_then(|v| v.as_object())
+    {
+        if let Some(mode) = obj.get("promotion_mode").and_then(|v| v.as_str()) {
+            if !mode.trim().is_empty() {
+                prompt_fragment_promotion_mode = mode.to_string();
+            }
+        }
+        if let Some(replay) = obj.get("replay_evaluation").and_then(|v| v.as_object()) {
+            if replay
+                .get("promote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                prompt_fragment_replay_gate_result = Some("passed".to_string());
+            } else if let Some(reason) = replay.get("reason").and_then(|v| v.as_str()) {
+                prompt_fragment_replay_gate_result = Some(reason.to_string());
+            }
+            prompt_fragment_replay_gate_reasons = replay_gate_reasons_from_json(replay);
+        }
+        let promoted = obj
+            .get("promoted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let gate_summary = promotion_gate_summary_from_result(obj);
+        if prompt_fragment_promotion_mode == "baseline" {
+            "Promoted candidate prompt fragment bundle".to_string()
+        } else if prompt_fragment_promotion_mode == "canary" {
+            "Activated candidate prompt fragment bundle in canary".to_string()
+        } else if promoted {
+            "Candidate prompt fragment bundle passed structural canary gate".to_string()
+        } else if let Some(gate) = gate_summary.as_deref() {
+            format!("Not promoted ({})", gate)
+        } else {
+            "Prompt fragment evolution completed".to_string()
+        }
+    } else {
+        "No prompt fragment evolution runs yet".to_string()
+    };
+    if let Some(replay_eval) =
+        load_live_policy_replay_evaluation(storage, canary_state.as_ref()).await
+    {
+        replay_gate_result = Some(if replay_eval.promote {
+            "passed".to_string()
+        } else {
+            replay_eval.reason.clone()
+        });
+        replay_gate_reasons = replay_eval.reasons.clone();
+    }
     if let Some(replay_eval) =
         load_live_prompt_replay_evaluation(storage, prompt_canary_state.as_ref()).await
     {
         prompt_replay_gate_result = Some(if replay_eval.promote {
             "passed".to_string()
         } else {
-            replay_eval.reason
+            replay_eval.reason.clone()
         });
+        prompt_replay_gate_reasons = replay_eval.reasons.clone();
     }
     if let Some(replay_eval) = load_live_metadata_prompt_replay_evaluation(
         storage,
@@ -2040,8 +2316,23 @@ pub(super) async fn build_evolution_settings_response(
         specialist_prompt_replay_gate_result = Some(if replay_eval.promote {
             "passed".to_string()
         } else {
-            replay_eval.reason
+            replay_eval.reason.clone()
         });
+        specialist_prompt_replay_gate_reasons = replay_eval.reasons.clone();
+    }
+    if let Some(replay_eval) = load_live_trace_prompt_telemetry_replay_evaluation(
+        storage,
+        prompt_fragment_canary_state.as_ref(),
+        "prompt_fragment_version",
+    )
+    .await
+    {
+        prompt_fragment_replay_gate_result = Some(if replay_eval.promote {
+            "passed".to_string()
+        } else {
+            replay_eval.reason.clone()
+        });
+        prompt_fragment_replay_gate_reasons = replay_eval.reasons.clone();
     }
 
     let learning_enabled = load_learning_enabled(storage).await;
@@ -2100,15 +2391,23 @@ pub(super) async fn build_evolution_settings_response(
         strategy_canary,
         prompt_canary,
         specialist_prompt_canary,
+        prompt_fragment_canary,
         last_promotion_result,
         replay_gate_result,
+        replay_gate_reasons,
         promotion_mode,
         prompt_last_promotion_result,
         prompt_replay_gate_result,
+        prompt_replay_gate_reasons,
         prompt_promotion_mode,
         specialist_prompt_last_promotion_result,
         specialist_prompt_replay_gate_result,
+        specialist_prompt_replay_gate_reasons,
         specialist_prompt_promotion_mode,
+        prompt_fragment_last_promotion_result,
+        prompt_fragment_replay_gate_result,
+        prompt_fragment_replay_gate_reasons,
+        prompt_fragment_promotion_mode,
         routing_rollback_available,
         deploy_guard_default: load_deploy_guard_default(storage).await,
         readiness_policy,
@@ -2158,6 +2457,74 @@ pub(super) fn aggregate_version_metrics(
     out
 }
 
+pub(super) fn routing_policy_metric_fallback_version(
+    canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+) -> String {
+    canary_state
+        .map(|state| state.baseline_version.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("routing-policy-default-v1")
+        .to_string()
+}
+
+pub(super) fn aggregate_policy_version_metrics(
+    logs: &[crate::storage::OperationalLogVersionMetricRow],
+    fallback_version: &str,
+) -> Vec<EvolutionVersionMetric> {
+    let metrics = aggregate_version_metrics(logs, |row| row.policy_version.as_deref());
+    if !metrics.is_empty() {
+        return metrics;
+    }
+
+    let fallback_version = fallback_version.trim();
+    if fallback_version.is_empty() || logs.is_empty() {
+        return Vec::new();
+    }
+
+    let fallback_logs = logs
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row.policy_version = Some(fallback_version.to_string());
+            row
+        })
+        .collect::<Vec<_>>();
+    aggregate_version_metrics(&fallback_logs, |row| row.policy_version.as_deref())
+}
+
+pub(super) fn aggregate_trace_policy_metrics(
+    traces: &[crate::storage::ExecutionTraceSummaryRow],
+    fallback_version: &str,
+) -> Vec<EvolutionVersionMetric> {
+    let fallback_version = fallback_version.trim();
+    if fallback_version.is_empty() || traces.is_empty() {
+        return Vec::new();
+    }
+
+    let samples = traces.len();
+    let successes = traces
+        .iter()
+        .filter(|row| {
+            row.completed_at
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+        .count();
+    let errors = samples.saturating_sub(successes);
+    let latencies = traces
+        .iter()
+        .filter_map(|row| row.duration_ms.map(i64::from))
+        .collect::<Vec<_>>();
+
+    vec![EvolutionVersionMetric {
+        version: fallback_version.to_string(),
+        samples,
+        success_rate: round4(successes as f64 / samples as f64),
+        error_rate: round4(errors as f64 / samples as f64),
+        p95_latency_ms: compute_p95(latencies),
+    }]
+}
+
 pub(super) fn parse_operational_payload(
     row: &crate::storage::entities::operational_log::Model,
 ) -> serde_json::Value {
@@ -2198,6 +2565,10 @@ pub(super) async fn read_recent_prompt_lineage(limit: usize) -> Vec<serde_json::
 
 pub(super) async fn read_recent_specialist_prompt_lineage(limit: usize) -> Vec<serde_json::Value> {
     read_recent_jsonl(SPECIALIST_PROMPT_BUNDLE_LINEAGE_REL_PATH, limit).await
+}
+
+pub(super) async fn read_recent_prompt_fragment_lineage(limit: usize) -> Vec<serde_json::Value> {
+    read_recent_jsonl(PROMPT_FRAGMENT_BUNDLE_LINEAGE_REL_PATH, limit).await
 }
 
 pub(super) fn experience_run_resolved_for_prompt_metrics(
@@ -2628,6 +2999,9 @@ pub(super) async fn build_evolution_dev_response(
     include_superseded: bool,
 ) -> EvolutionDevResponse {
     let limit = limit.clamp(24, EVOLUTION_DEV_MAX_LIMIT);
+    let canary_state = load_evolution_canary_state(storage).await;
+    let routing_policy_metric_version =
+        routing_policy_metric_fallback_version(canary_state.as_ref());
     let logs = storage
         .list_operational_log_version_metrics_by_event("tool_call", limit)
         .await
@@ -2636,10 +3010,18 @@ pub(super) async fn build_evolution_dev_response(
         .list_operational_log_version_metrics_by_event("response_complete", limit)
         .await
         .unwrap_or_default();
+    let recent_trace_rows = storage
+        .list_execution_trace_summaries(None, limit.max(24), 0)
+        .await
+        .unwrap_or_default();
     let mut policy_metrics =
-        aggregate_version_metrics(&response_logs, |row| row.policy_version.as_deref());
+        aggregate_policy_version_metrics(&response_logs, &routing_policy_metric_version);
     if policy_metrics.is_empty() {
-        policy_metrics = aggregate_version_metrics(&logs, |row| row.policy_version.as_deref());
+        policy_metrics = aggregate_policy_version_metrics(&logs, &routing_policy_metric_version);
+    }
+    if policy_metrics.is_empty() {
+        policy_metrics =
+            aggregate_trace_policy_metrics(&recent_trace_rows, &routing_policy_metric_version);
     }
     let strategy_metrics = aggregate_version_metrics(&logs, |row| row.strategy_version.as_deref());
     let strategy_canary_state = load_canary_state_by_key(
@@ -2779,7 +3161,10 @@ pub(super) async fn build_evolution_dev_response(
         &learning_candidate_rows,
     )
     .await;
-    let prompt_telemetry_summary = aggregate_prompt_telemetry_summary(&recent_experience_run_rows);
+    let prompt_telemetry_summary = aggregate_prompt_telemetry_summary_with_traces(
+        &recent_experience_run_rows,
+        &recent_trace_rows,
+    );
     let prompt_optimization_review_state = load_prompt_optimization_review_state(storage).await;
     let prompt_canary_safety_events = load_prompt_canary_safety_events(storage).await;
     let prompt_optimization_opportunities = build_prompt_optimization_opportunities(
@@ -2799,6 +3184,11 @@ pub(super) async fn build_evolution_dev_response(
         crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
     )
     .await;
+    let prompt_fragment_canary_state = load_canary_state_by_key(
+        storage,
+        crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_CANARY_STATE_KEY,
+    )
+    .await;
     let specialist_prompt_metrics = aggregate_bundle_metrics_by_selectors(
         &recent_experience_run_rows,
         &prompt_tool_logs,
@@ -2816,6 +3206,14 @@ pub(super) async fn build_evolution_dev_response(
     let specialist_prompt_insights = build_specialist_prompt_insights(
         &specialist_prompt_metrics,
         specialist_prompt_canary_state.as_ref(),
+    );
+    let prompt_fragment_metrics = aggregate_prompt_telemetry_metrics_by_version(
+        &recent_trace_rows,
+        "prompt_fragment_version",
+    );
+    let prompt_fragment_insights = build_specialist_prompt_insights(
+        &prompt_fragment_metrics,
+        prompt_fragment_canary_state.as_ref(),
     );
     let recent_prompt_runs = recent_experience_run_rows
         .iter()
@@ -2841,13 +3239,15 @@ pub(super) async fn build_evolution_dev_response(
         .take(24)
         .map(build_experience_run_summary)
         .collect::<Vec<_>>();
+    let recent_prompt_fragment_runs =
+        recent_prompt_telemetry_runs_by_version(&recent_trace_rows, "prompt_fragment_version", 24);
     let recent_experience_runs = recent_experience_run_rows
         .into_iter()
         .take(EVOLUTION_DEV_RECENT_RUN_RESPONSE_LIMIT)
         .map(|run| build_experience_run_summary(&run))
         .collect::<Vec<_>>();
     EvolutionDevResponse {
-        canary_state: load_evolution_canary_state(storage).await,
+        canary_state,
         strategy_canary_state,
         last_result: load_last_self_evolve_result(storage).await,
         lineage_recent: read_recent_lineage(40).await,
@@ -2871,6 +3271,15 @@ pub(super) async fn build_evolution_dev_response(
         specialist_prompt_lineage_recent: read_recent_specialist_prompt_lineage(40).await,
         specialist_prompt_metrics,
         specialist_prompt_insights,
+        prompt_fragment_canary_state,
+        prompt_fragment_last_result: load_json_value_by_key(
+            storage,
+            crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_LAST_RESULT_KEY,
+        )
+        .await,
+        prompt_fragment_lineage_recent: read_recent_prompt_fragment_lineage(40).await,
+        prompt_fragment_metrics,
+        prompt_fragment_insights,
         learning_queue: storage.learning_queue_counts().await.unwrap_or_default(),
         learning_candidates,
         skill_evolutions,
@@ -2879,11 +3288,125 @@ pub(super) async fn build_evolution_dev_response(
         experience_graph,
         recent_prompt_runs,
         recent_specialist_prompt_runs,
+        recent_prompt_fragment_runs,
         recent_experience_runs,
         prompt_canary_safety_events,
         prompt_telemetry_summary,
         prompt_optimization_opportunities,
     }
+}
+
+pub(super) fn aggregate_prompt_telemetry_metrics_by_version(
+    traces: &[crate::storage::ExecutionTraceSummaryRow],
+    metadata_key: &str,
+) -> Vec<PromptEvolutionMetric> {
+    #[derive(Default)]
+    struct Bucket {
+        samples: usize,
+        successes: usize,
+        latencies: Vec<i64>,
+        tool_counts: Vec<usize>,
+    }
+
+    let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
+    for trace in traces {
+        let success = !trace_summary_has_error_step(trace);
+        for prompt_telemetry in prompt_telemetry_samples_from_trace(trace) {
+            let Some(version) = prompt_telemetry
+                .get(metadata_key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let bucket = buckets.entry(version.to_string()).or_default();
+            bucket.samples = bucket.samples.saturating_add(1);
+            if success {
+                bucket.successes = bucket.successes.saturating_add(1);
+            }
+            if let Some(duration_ms) = trace.duration_ms {
+                bucket.latencies.push(i64::from(duration_ms));
+            }
+            if let Some(tool_count) = prompt_telemetry_usize(prompt_telemetry.get("tool_count")) {
+                bucket.tool_counts.push(tool_count);
+            }
+        }
+    }
+
+    let mut out = buckets
+        .into_iter()
+        .filter_map(|(version, bucket)| {
+            if bucket.samples == 0 {
+                return None;
+            }
+            let errors = bucket.samples.saturating_sub(bucket.successes);
+            let success_rate = round4(bucket.successes as f64 / bucket.samples as f64);
+            Some(PromptEvolutionMetric {
+                version,
+                samples: bucket.samples,
+                success_rate,
+                error_rate: round4(errors as f64 / bucket.samples as f64),
+                p95_latency_ms: compute_p95(bucket.latencies),
+                routing_decisions: 0,
+                delegation_rate: 0.0,
+                clarification_rate: 0.0,
+                avg_tool_calls_per_request: average_usize(&bucket.tool_counts),
+                tool_success_rate: success_rate,
+            })
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| {
+        b.samples
+            .cmp(&a.samples)
+            .then_with(|| a.version.cmp(&b.version))
+    });
+    out
+}
+
+pub(super) fn recent_prompt_telemetry_runs_by_version(
+    traces: &[crate::storage::ExecutionTraceSummaryRow],
+    metadata_key: &str,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for trace in traces {
+        let success = !trace_summary_has_error_step(trace);
+        for prompt_telemetry in prompt_telemetry_samples_from_trace(trace) {
+            let Some(version) = prompt_telemetry
+                .get(metadata_key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            rows.push(serde_json::json!({
+                "trace_id": trace.id.clone(),
+                "channel": trace.channel.clone(),
+                "created_at": trace.created_at.clone(),
+                "duration_ms": trace.duration_ms,
+                "success": success,
+                "version": version,
+                "request_mode": prompt_telemetry
+                    .get("request_mode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("agent_loop"),
+                "estimated_total_request_chars": prompt_telemetry_usize(
+                    prompt_telemetry.get("estimated_total_request_chars")
+                ).unwrap_or_default(),
+                "final_system_prompt_chars": prompt_telemetry_usize(
+                    prompt_telemetry.get("final_system_prompt_chars")
+                ).unwrap_or_default(),
+                "tool_count": prompt_telemetry_usize(prompt_telemetry.get("tool_count"))
+                    .unwrap_or_default(),
+            }));
+            if rows.len() >= limit {
+                return rows;
+            }
+        }
+    }
+    rows
 }
 
 pub(super) async fn get_evolution_settings(State(state): State<AppState>) -> Response {
@@ -3301,6 +3824,18 @@ pub(super) fn summarize_autonomy_action_result(
                 "Created a task from this suggestion.".to_string()
             } else {
                 format!("Created task {}.", task_id)
+            }
+        }
+        "watch" => {
+            let watcher_id = result
+                .get("watcher_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            if watcher_id.is_empty() {
+                "Created a watcher from this suggestion.".to_string()
+            } else {
+                format!("Created watcher {}.", watcher_id)
             }
         }
         "activate_mode" => {
@@ -5215,6 +5750,9 @@ pub(super) async fn run_evolution_dev_action(
             "last_result": dev.last_result.clone(),
             "prompt_canary_safety_events": dev.prompt_canary_safety_events.clone(),
             "prompt_telemetry_summary": dev.prompt_telemetry_summary.clone(),
+            "prompt_fragment_metrics": serde_json::to_value(&dev.prompt_fragment_metrics)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+            "prompt_fragment_canary_state": dev.prompt_fragment_canary_state.clone(),
             "prompt_optimization_opportunities": dev.prompt_optimization_opportunities.clone(),
         }),
     )

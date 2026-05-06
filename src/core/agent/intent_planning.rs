@@ -2,12 +2,49 @@ use super::*;
 
 const INTENT_PLAN_TIMEOUT_MS: u64 = 90_000;
 const INTENT_PLAN_MAX_ACTIONS: usize = 20;
-const INTENT_PLAN_MAX_HISTORY: usize = 6;
 const INTENT_PLAN_MAX_ENTITIES: usize = 36;
 const INTENT_KIND_ANSWER: &str = "answer";
 const INTENT_KIND_ACT: &str = "act";
 const INTENT_KIND_DELEGATE: &str = "delegate";
 const INTENT_KIND_INTERACTIVE: &str = "interactive";
+const INTENT_PLAN_TIMING_SLOW_STAGE_WARN_MS: u64 = 1_000;
+const INTENT_PLAN_TIMING_MODEL_WARN_MS: u64 = 5_000;
+
+fn intent_plan_elapsed_ms(started: std::time::Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn log_intent_plan_timing_instant(
+    timing: (&str, &str, &str),
+    stage: &str,
+    started: std::time::Instant,
+    success: bool,
+    warn_after_ms: u64,
+) {
+    let duration_ms = intent_plan_elapsed_ms(started);
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        turn_timing_id = %timing.0,
+        conversation_id = %timing.1,
+        channel = %timing.2,
+        stage = %stage,
+        duration_ms,
+        success,
+        "advisory planner timing stage"
+    );
+    if duration_ms >= warn_after_ms {
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            turn_timing_id = %timing.0,
+            conversation_id = %timing.1,
+            channel = %timing.2,
+            stage = %stage,
+            duration_ms,
+            warn_after_ms,
+            "slow advisory planner timing stage"
+        );
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdvisoryIntentPlan {
@@ -395,25 +432,45 @@ fn intent_plan_prompt(
     apps: &[serde_json::Value],
     authorized_actions: &[crate::actions::ActionDef],
 ) -> String {
-    let recent_messages = packed_context
-        .history
-        .iter()
-        .rev()
-        .take(INTENT_PLAN_MAX_HISTORY)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|turn| {
-            serde_json::json!({
-                "role": turn.role,
-                "content": safe_truncate(
-                    &crate::security::redact_secret_input(&turn.content).text,
-                    700,
-                ),
-                "timestamp": turn._timestamp,
-            })
-        })
-        .collect::<Vec<_>>();
+    let history_budget = crate::core::context_budget::HistoryTokenBudget {
+        history_tokens: packed_context
+            .history_token_budget
+            .max(MIN_CHAT_HISTORY_TOKEN_BUDGET),
+        summary_tokens: packed_context.summary_token_budget.max(256),
+    };
+    let recent_history_budget = Agent::prompt_recent_token_budget(
+        history_budget,
+        "AGENTARK_CHAT_INTENT_PLAN_HISTORY_TOKENS",
+        INTENT_PLAN_HISTORY_RATIO_PERCENT,
+    );
+    let message_token_budget = packed_context
+        .message_token_budget
+        .clamp(MIN_CHAT_MESSAGE_TOKEN_BUDGET, MAX_CHAT_MESSAGE_TOKEN_BUDGET);
+    let mut recent_messages = Vec::new();
+    let mut used_history_tokens = 0usize;
+    for turn in packed_context.history.iter().rev() {
+        let redacted = crate::security::redact_secret_input(&turn.content).text;
+        let content =
+            crate::core::context_budget::truncate_to_token_budget(&redacted, message_token_budget);
+        let turn_tokens =
+            crate::core::context_budget::estimate_role_message_tokens(&turn.role, &content)
+                .saturating_add(8);
+        if !recent_messages.is_empty()
+            && used_history_tokens.saturating_add(turn_tokens) > recent_history_budget
+        {
+            break;
+        }
+        used_history_tokens = used_history_tokens.saturating_add(turn_tokens);
+        recent_messages.push(serde_json::json!({
+            "role": turn.role.clone(),
+            "content": content,
+            "timestamp": turn._timestamp,
+        }));
+        if used_history_tokens >= recent_history_budget {
+            break;
+        }
+    }
+    recent_messages.reverse();
     let mut recent_entities = Vec::new();
     recent_entities.extend(pending_actions.iter().take(8).map(pending_action_entity));
     recent_entities.extend(
@@ -496,11 +553,24 @@ impl Agent {
         watchers: &[crate::core::watcher::Watcher],
         authorized_actions: &[crate::actions::ActionDef],
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+        timing: Option<(&str, &str, &str)>,
     ) -> Option<AdvisoryIntentPlan> {
+        let total_started = std::time::Instant::now();
         if message.trim().is_empty() {
             return None;
         }
+        let stage_started = std::time::Instant::now();
         let apps = self.app_registry.list().await;
+        if let Some(timing) = timing {
+            log_intent_plan_timing_instant(
+                timing,
+                "advisory_planner_app_registry_list",
+                stage_started,
+                true,
+                INTENT_PLAN_TIMING_SLOW_STAGE_WARN_MS,
+            );
+        }
+        let stage_started = std::time::Instant::now();
         let prompt = intent_plan_prompt(
             message,
             packed_context,
@@ -510,6 +580,27 @@ impl Agent {
             &apps,
             authorized_actions,
         );
+        let prompt_chars = prompt.chars().count();
+        if let Some(timing) = timing {
+            log_intent_plan_timing_instant(
+                timing,
+                "advisory_planner_prompt_build",
+                stage_started,
+                true,
+                INTENT_PLAN_TIMING_SLOW_STAGE_WARN_MS,
+            );
+            tracing::debug!(
+                target: "agentark.turn_timing",
+                turn_timing_id = %timing.0,
+                conversation_id = %timing.1,
+                channel = %timing.2,
+                stage = "advisory_planner_prompt_budget",
+                prompt_chars,
+                authorized_action_count = authorized_actions.len(),
+                app_count = apps.len(),
+                "advisory planner prompt budget"
+            );
+        }
         let proxy_stream_tx = stream_tx.as_ref().map(|parent| {
             super::reasoning_stream::spawn_reasoning_proxy(parent.clone(), "planner")
         });
@@ -536,22 +627,63 @@ impl Agent {
                 INTENT_PLAN_TIMEOUT_MS,
                 2,
                 proxy_stream_tx,
+                false,
             )
             .await
             .ok();
+        if let Some(timing) = timing {
+            log_intent_plan_timing_instant(
+                timing,
+                "advisory_planner_model_call",
+                total_started,
+                response.is_some(),
+                INTENT_PLAN_TIMING_MODEL_WARN_MS,
+            );
+        }
         if let Some(parent_tx) = stream_tx.as_ref() {
             super::reasoning_stream::stream_reasoning_progress(parent_tx, "planner", "", true)
                 .await;
         }
         let response = response?;
+        let stage_started = std::time::Instant::now();
         let value = extract_json_object(&response.content)?;
         let authorized_names = authorized_actions
             .iter()
             .map(|action| action.name.clone())
             .collect::<HashSet<_>>();
-        serde_json::from_value::<AdvisoryIntentPlan>(value)
+        let plan = serde_json::from_value::<AdvisoryIntentPlan>(value)
             .ok()
-            .map(|plan| normalize_plan(plan, &authorized_names))
+            .map(|plan| normalize_plan(plan, &authorized_names));
+        if let Some(timing) = timing {
+            log_intent_plan_timing_instant(
+                timing,
+                "advisory_planner_parse_normalize",
+                stage_started,
+                plan.is_some(),
+                INTENT_PLAN_TIMING_SLOW_STAGE_WARN_MS,
+            );
+            tracing::debug!(
+                target: "agentark.turn_timing",
+                turn_timing_id = %timing.0,
+                conversation_id = %timing.1,
+                channel = %timing.2,
+                stage = "advisory_planner_total",
+                duration_ms = intent_plan_elapsed_ms(total_started),
+                success = plan.is_some(),
+                intent_count = plan.as_ref().map(|plan| plan.intents.len()).unwrap_or(0),
+                likely_action_count = plan
+                    .as_ref()
+                    .map(|plan| {
+                        plan.intents
+                            .iter()
+                            .flat_map(|intent| intent.likely_actions.iter())
+                            .count()
+                    })
+                    .unwrap_or(0),
+                "advisory planner total"
+            );
+        }
+        plan
     }
 }
 

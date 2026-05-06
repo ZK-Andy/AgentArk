@@ -205,66 +205,6 @@ async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result
     ))
 }
 
-/// Split a message into chunks for Telegram (max 4096 chars)
-/// Tries to split at paragraph boundaries for better formatting
-fn split_message_for_telegram(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut current_chunk = String::new();
-
-    for paragraph in text.split("\n\n") {
-        let paragraph_with_break = if current_chunk.is_empty() {
-            paragraph.to_string()
-        } else {
-            format!("\n\n{}", paragraph)
-        };
-
-        if current_chunk.len() + paragraph_with_break.len() <= max_len {
-            current_chunk.push_str(&paragraph_with_break);
-        } else {
-            // If current paragraph is too long, split it by lines
-            if paragraph.len() > max_len {
-                if !current_chunk.is_empty() {
-                    chunks.push(current_chunk);
-                    current_chunk = String::new();
-                }
-                // Split long paragraph by lines
-                for line in paragraph.lines() {
-                    let line_with_break = if current_chunk.is_empty() {
-                        line.to_string()
-                    } else {
-                        format!("\n{}", line)
-                    };
-
-                    if current_chunk.len() + line_with_break.len() <= max_len {
-                        current_chunk.push_str(&line_with_break);
-                    } else {
-                        if !current_chunk.is_empty() {
-                            chunks.push(current_chunk);
-                        }
-                        current_chunk = line.to_string();
-                    }
-                }
-            } else {
-                // Start new chunk with this paragraph
-                if !current_chunk.is_empty() {
-                    chunks.push(current_chunk);
-                }
-                current_chunk = paragraph.to_string();
-            }
-        }
-    }
-
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk);
-    }
-
-    chunks
-}
-
 /// Convert markdown to Telegram HTML format
 fn markdown_to_telegram_html(text: &str) -> String {
     let mut result = String::new();
@@ -733,9 +673,10 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     // Convert markdown to Telegram HTML
                     let html_response = markdown_to_telegram_html(&response);
 
-                    // Split long messages (Telegram limit is 4096 chars)
-                    // Try to split at paragraph boundaries for better formatting
-                    let chunks = split_message_for_telegram(&html_response, 4000);
+                    let chunks = super::outbound_split::split_for_provider_safe_channel(
+                        "telegram",
+                        &html_response,
+                    );
                     for chunk in chunks {
                         bot.send_message(chat_id, chunk)
                             .parse_mode(ParseMode::Html)
@@ -766,7 +707,9 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     };
 
     let bot = Bot::new(&config.bot_token);
-    bot.send_message(ChatId(chat_id), text).await?;
+    for chunk in super::outbound_split::split_for_provider_safe_channel("telegram", text) {
+        bot.send_message(ChatId(chat_id), chunk).await?;
+    }
     Ok(())
 }
 

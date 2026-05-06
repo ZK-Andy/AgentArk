@@ -4,12 +4,11 @@ export function normalizeSettingsPreloadTab(
   if (typeof rawTab !== "number" || !Number.isFinite(rawTab)) return null;
   const tab = Math.trunc(rawTab);
   if (tab === 2 || tab === 10 || tab === 15) return 20;
+  if (tab === 9 || tab === 13 || tab === 17) return 0;
   return tab;
 }
 
 const loadedPreloads = new Set<string>();
-const COMMON_SETTINGS_TABS = [3, 6, 8, 11, 12, 20, 21, 22, 23, 26] as const;
-let commonSettingsPreloadScheduled = false;
 
 function preloadOnce(key: string, loader: () => Promise<unknown>): void {
   if (loadedPreloads.has(key)) return;
@@ -17,14 +16,6 @@ function preloadOnce(key: string, loader: () => Promise<unknown>): void {
   void loader().catch(() => {
     loadedPreloads.delete(key);
   });
-}
-
-function schedulePreload(task: () => void, delayMs: number): void {
-  if (typeof window === "undefined") {
-    task();
-    return;
-  }
-  window.setTimeout(task, delayMs);
 }
 
 export function preloadSettingsShell(): void {
@@ -47,10 +38,16 @@ export function preloadSettingsTab(rawTab?: number | null): void {
       preloadOnce("settings-media", () => import("./MediaSettingsPanel"));
       break;
     case 1:
-      preloadOnce("settings-models", () => import("./SettingsModelsPanel"));
+      // Models panel is now statically imported by SettingsPageFull, so no
+      // separate preload is needed. Falls through to settings-full preload.
       break;
     case 4:
       preloadOnce("settings-security", () => import("./SettingsSecurityPanel"));
+      break;
+    case 16:
+      preloadOnce("settings-sender-verification", () =>
+        import("../SenderVerificationPanel"),
+      );
       break;
     case 5:
       preloadOnce("settings-advanced", () => import("./SettingsAdvancedPanel"));
@@ -90,14 +87,4 @@ export function preloadSettingsTab(rawTab?: number | null): void {
     default:
       break;
   }
-}
-
-export function preloadCommonSettingsPanels(): void {
-  preloadSettingsShell();
-  preloadSettingsFull();
-  if (commonSettingsPreloadScheduled) return;
-  commonSettingsPreloadScheduled = true;
-  COMMON_SETTINGS_TABS.forEach((tab, index) => {
-    schedulePreload(() => preloadSettingsTab(tab), 40 + index * 50);
-  });
 }

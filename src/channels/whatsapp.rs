@@ -569,6 +569,8 @@ async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result
 ///
 /// Tries to split at paragraph boundaries (`\n\n`) first, then falls back to
 /// line boundaries (`\n`), so the recipient sees coherent chunks.
+#[cfg(test)]
+#[allow(dead_code)]
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];
@@ -747,7 +749,10 @@ fn http_client() -> reqwest::Client {
 /// Long messages are automatically split into multiple chunks.
 async fn send_whatsapp_text(config: &WhatsAppChannelConfig, to: &str, text: &str) -> Result<()> {
     let formatted = format_for_whatsapp(text);
-    let chunks = split_message(&formatted, MAX_MESSAGE_LEN);
+    let chunks = super::outbound_split::split_outbound_message(
+        &formatted,
+        super::outbound_split::SplitProfile::provider_safe(MAX_MESSAGE_LEN),
+    );
 
     let client = http_client();
     let url = format!("{}/{}/messages", API_BASE, config.phone_number_id);
@@ -884,31 +889,34 @@ async fn send_via_bridge(config: &WhatsAppChannelConfig, to: &str, text: &str) -
     let client = http_client();
     let url = format!("{}/send", config.effective_bridge_url()?);
 
-    let body = serde_json::json!({
-        "to": to,
-        "text": formatted
-    });
+    for formatted in super::outbound_split::split_for_provider_safe_channel("whatsapp", &formatted)
+    {
+        let body = serde_json::json!({
+            "to": to,
+            "text": formatted
+        });
 
-    let mut request = client.post(&url).header("Content-Type", "application/json");
-    if !config.bridge_token.trim().is_empty() {
-        request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
-    }
-    let resp = super::outbound_rate_limit::send_with_bounded_retries(
-        "whatsapp",
-        "bridge_message",
-        request.json(&body),
-    )
-    .await?;
+        let mut request = client.post(&url).header("Content-Type", "application/json");
+        if !config.bridge_token.trim().is_empty() {
+            request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
+        }
+        let resp = super::outbound_rate_limit::send_with_bounded_retries(
+            "whatsapp",
+            "bridge_message",
+            request.json(&body),
+        )
+        .await?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let error_body = resp.text().await.unwrap_or_default();
-        tracing::error!("WhatsApp bridge send error ({}): {}", status, error_body);
-        return Err(anyhow!(
-            "WhatsApp bridge returned {} — {}",
-            status,
-            error_body
-        ));
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::error!("WhatsApp bridge send error ({}): {}", status, error_body);
+            return Err(anyhow!(
+                "WhatsApp bridge returned {} — {}",
+                status,
+                error_body
+            ));
+        }
     }
 
     Ok(())
@@ -1906,11 +1914,12 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::outbound_split::{split_outbound_message, SplitProfile};
 
     #[test]
     fn test_split_message_short() {
         let text = "Hello, world!";
-        let chunks = split_message(text, MAX_MESSAGE_LEN);
+        let chunks = split_outbound_message(text, SplitProfile::provider_safe(MAX_MESSAGE_LEN));
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], "Hello, world!");
     }
@@ -1920,7 +1929,7 @@ mod tests {
         let a = "A".repeat(2000);
         let b = "B".repeat(2000);
         let text = format!("{}\n\n{}", a, b);
-        let chunks = split_message(&text, 2500);
+        let chunks = split_outbound_message(&text, SplitProfile::provider_safe(2500));
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0], a);
         assert_eq!(chunks[1], b);

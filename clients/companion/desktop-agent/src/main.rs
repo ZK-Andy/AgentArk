@@ -293,11 +293,98 @@ async fn handle_command(args: &Args, capabilities: &[String], command: &CommandR
 }
 
 async fn handle_notification(command: &CommandRecord) -> Result<String> {
-    println!(
-        "AgentArk companion notification: action={} arguments={}",
-        command.action, command.arguments
-    );
-    Ok("Notification delivered to the companion console.".to_string())
+    let title = notification_title(command);
+    let body = notification_body(command);
+    let shown = show_desktop_notification(&title, &body).await;
+    println!("AgentArk companion notification: {} - {}", title, body);
+    if shown {
+        Ok("Notification delivered to the desktop notification center.".to_string())
+    } else {
+        Ok("Notification delivered to the companion console.".to_string())
+    }
+}
+
+fn notification_title(command: &CommandRecord) -> String {
+    if let Some(title) = json_optional_string(&command.arguments, "title") {
+        return title;
+    }
+    if command.capability == "approval_prompt" {
+        "AgentArk Approval".to_string()
+    } else {
+        "AgentArk".to_string()
+    }
+}
+
+fn notification_body(command: &CommandRecord) -> String {
+    for key in ["body", "message", "text"] {
+        if let Some(value) = json_optional_string(&command.arguments, key) {
+            return value;
+        }
+    }
+    if command.action.trim().is_empty() {
+        "AgentArk companion notification".to_string()
+    } else {
+        command.action.trim().to_string()
+    }
+}
+
+fn json_optional_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn show_desktop_notification(title: &str, body: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification {} with title {}",
+            osascript_string(body),
+            osascript_string(title)
+        );
+        let mut command = Command::new("osascript");
+        command.arg("-e").arg(script);
+        return notification_command_status(&mut command).await;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; $n.BalloonTipTitle=$env:AGENTARK_NOTIFICATION_TITLE; $n.BalloonTipText=$env:AGENTARK_NOTIFICATION_BODY; $n.Visible=$true; $n.ShowBalloonTip(5000); Start-Sleep -Seconds 6; $n.Dispose()";
+        let mut command = Command::new("powershell");
+        command
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg(script)
+            .env("AGENTARK_NOTIFICATION_TITLE", title)
+            .env("AGENTARK_NOTIFICATION_BODY", body);
+        return notification_command_status(&mut command).await;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut command = Command::new("notify-send");
+        command.arg(title).arg(body);
+        notification_command_status(&mut command).await
+    }
+}
+
+async fn notification_command_status(command: &mut Command) -> bool {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    match timeout(Duration::from_secs(8), command.status()).await {
+        Ok(Ok(status)) => status.success(),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn osascript_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
 }
 
 async fn handle_file_read(args: &Args, command: &CommandRecord) -> Result<String> {

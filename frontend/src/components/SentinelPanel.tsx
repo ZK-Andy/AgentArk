@@ -182,6 +182,10 @@ function proposalConversationId(proposal: SentinelProposal): string {
   return str(proposalMetadata(proposal).conversation_id, "").trim();
 }
 
+function proposalChatSuggestionId(proposal: SentinelProposal): string {
+  return str(proposal.chat_suggestion_id, str(proposalMetadata(proposal).suggestion_id, "")).trim();
+}
+
 function proposalHasRunnableAction(proposal: SentinelProposal): boolean {
   return !!proposal.action && !!str(proposal.action.action_kind, "").trim();
 }
@@ -275,6 +279,8 @@ function storeChatPendingLaunch(snapshot: {
   message: string;
   conversationId?: string;
   source?: string;
+  acceptedSuggestionId?: string;
+  sentinelProposalId?: string;
 }): void {
   if (typeof window === "undefined") return;
   window.sessionStorage.setItem(CHAT_PENDING_LAUNCH_STORAGE_KEY, JSON.stringify(snapshot));
@@ -309,11 +315,18 @@ export function SentinelPanel({
   });
 
   const runTraceId = run?.traceId || "";
+  const runSuggestionDetailId = run?.suggestionId || "";
   const runTraceQ = useQuery({
     queryKey: ["sentinel-run-trace", runTraceId],
     queryFn: () => api.rawGet(`/trace/${encodeURIComponent(runTraceId)}`),
     enabled: !!runTraceId && runOpen,
     refetchInterval: runOpen && !!runTraceId && run?.status === "running" ? REFRESH_MS : false,
+  });
+  const runSuggestionDetailQ = useQuery({
+    queryKey: ["sentinel-suggestion-detail", runSuggestionDetailId],
+    queryFn: () => api.rawGet(`/autonomy/suggestions/${encodeURIComponent(runSuggestionDetailId)}`),
+    enabled: !!runSuggestionDetailId && runOpen,
+    refetchInterval: runOpen && !!runSuggestionDetailId && run?.status === "running" ? REFRESH_MS : false,
   });
 
   const approveMutation = useMutation({
@@ -369,6 +382,30 @@ export function SentinelPanel({
       );
     }
   }, [run, runTraceQ.data, runTraceQ.error, runTraceQ.isLoading]);
+
+  const runAcceptedOutcomes = useMemo(
+    () => pickRecords(asRecord(runSuggestionDetailQ.data).suggestion, "accepted_outcomes"),
+    [runSuggestionDetailQ.data]
+  );
+
+  useEffect(() => {
+    if (!run || runAcceptedOutcomes.length === 0) return;
+    const titles = runAcceptedOutcomes
+      .map((outcome) => str(outcome.title, "").trim())
+      .filter(Boolean);
+    const summary = `Saved ${runAcceptedOutcomes.length} outcome${runAcceptedOutcomes.length === 1 ? "" : "s"}${titles.length ? `: ${titles.slice(0, 3).join(", ")}` : "."}`;
+    if (run.status === "completed" && run.summary === summary) return;
+    setRun((current) =>
+      current
+        ? {
+            ...current,
+            status: "completed",
+            summary,
+            completedAt: current.completedAt || new Date().toISOString(),
+          }
+        : current
+    );
+  }, [run, runAcceptedOutcomes]);
 
   const feed = feedQ.data as SentinelFeedResponse | undefined;
   const openProposals = useMemo(
@@ -455,6 +492,28 @@ export function SentinelPanel({
     }
   ];
   async function runProposal(proposal: SentinelProposal) {
+    const linkedSuggestionId = proposalChatSuggestionId(proposal);
+    if (proposal.proposal_kind === "chat_suggestion_accept") {
+      if (!linkedSuggestionId) {
+        setError("This Sentinel item is missing its linked chat suggestion.");
+        return;
+      }
+      setError(null);
+      setSuccess(null);
+      storeChatPendingLaunch({
+        createdAt: Date.now(),
+        launchMode: "message",
+        message: `Launch Sentinel suggestion: ${proposal.title}`,
+        conversationId: proposalConversationId(proposal) || undefined,
+        source: "sentinel",
+        acceptedSuggestionId: linkedSuggestionId,
+        sentinelProposalId: proposal.id,
+      });
+      setSelectedProposalId((current) => current === proposal.id ? "" : current);
+      setSuccess("Opening Chat to launch this Sentinel suggestion.");
+      navigateToView("chat");
+      return;
+    }
     setError(null);
     setSuccess(null);
     setRun({
@@ -462,7 +521,7 @@ export function SentinelPanel({
       status: "running",
       summary: "Launching ArkSentinel proposal...",
       startedAt: new Date().toISOString(),
-      suggestionId: proposal.id,
+      suggestionId: linkedSuggestionId || undefined,
     });
     setRunOpen(true);
     setRunMinimized(false);
@@ -471,6 +530,10 @@ export function SentinelPanel({
       const traceId = str(response.trace_id, str(asRecord(response.proposal).trace_id, "")).trim();
       const proposalRecord = asRecord(response.proposal);
       const runStatus = str(proposalRecord.run_status, "").toLowerCase();
+      const responseSuggestionId = str(
+        proposalRecord.chat_suggestion_id,
+        str(asRecord(proposalRecord.metadata).suggestion_id, linkedSuggestionId)
+      ).trim();
       setRun({
         title: proposal.title,
         status:
@@ -483,7 +546,7 @@ export function SentinelPanel({
         traceId: traceId || undefined,
         startedAt: new Date().toISOString(),
         completedAt: runStatus === "queued_for_approval" || !traceId ? new Date().toISOString() : undefined,
-        suggestionId: proposal.id,
+        suggestionId: responseSuggestionId || undefined,
       });
       setSelectedProposalId((current) => current === proposal.id ? "" : current);
       setSuccess("ArkSentinel proposal accepted.");
@@ -918,8 +981,8 @@ export function SentinelPanel({
         traceSteps={pickRecords(runTraceQ.data, "steps")}
         traceLoading={runTraceQ.isLoading}
         traceError={runTraceQ.error}
-        detailError={null}
-        acceptedOutcomes={[]}
+        detailError={runSuggestionDetailQ.error}
+        acceptedOutcomes={runAcceptedOutcomes}
         onClose={() => {
           setRunOpen(false);
           setRunMinimized(false);

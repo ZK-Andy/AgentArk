@@ -401,73 +401,81 @@ pub async fn send_message_to_room(
     if body.is_empty() {
         bail!("message body is required");
     }
-
+    let chunks = super::outbound_split::split_for_provider_safe_channel("matrix", body);
+    let split_count = chunks.len();
     let client = build_client(config)?;
-    let txn_id = uuid::Uuid::new_v4().to_string();
-    let url = matrix_url(
-        config,
-        &format!(
-            "_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            urlencoding::encode(message.room_id.trim()),
-            txn_id
-        ),
-    );
+    let mut last_response = None;
+    for chunk in chunks {
+        let txn_id = uuid::Uuid::new_v4().to_string();
+        let url = matrix_url(
+            config,
+            &format!(
+                "_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                urlencoding::encode(message.room_id.trim()),
+                txn_id
+            ),
+        );
 
-    let mut content = serde_json::json!({
-        "msgtype": message.msgtype.as_deref().unwrap_or("m.text"),
-        "body": body,
-    });
-    if let Some(formatted_body) = message
-        .formatted_body
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        content["format"] = serde_json::Value::String("org.matrix.custom.html".to_string());
-        content["formatted_body"] = serde_json::Value::String(formatted_body.to_string());
-    }
-    if let Some(thread_root_event_id) = message
-        .thread_root_event_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        content["m.relates_to"] = serde_json::json!({
-            "rel_type": "m.thread",
-            "event_id": thread_root_event_id,
-            "is_falling_back": true
+        let mut content = serde_json::json!({
+            "msgtype": message.msgtype.as_deref().unwrap_or("m.text"),
+            "body": chunk,
+        });
+        if split_count == 1 {
+            if let Some(formatted_body) = message
+                .formatted_body
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                content["format"] = serde_json::Value::String("org.matrix.custom.html".to_string());
+                content["formatted_body"] = serde_json::Value::String(formatted_body.to_string());
+            }
+        }
+        if let Some(thread_root_event_id) = message
+            .thread_root_event_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            content["m.relates_to"] = serde_json::json!({
+                "rel_type": "m.thread",
+                "event_id": thread_root_event_id,
+                "is_falling_back": true
+            });
+        }
+
+        let response = super::outbound_rate_limit::send_with_bounded_retries(
+            "matrix",
+            "send_message",
+            client
+                .put(url)
+                .bearer_auth(config.access_token.trim())
+                .json(&content),
+        )
+        .await
+        .context("failed to send Matrix message")?;
+
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+        if !status.is_success() {
+            let message = payload
+                .get("error")
+                .and_then(|value| value.as_str())
+                .or_else(|| payload.get("errcode").and_then(|value| value.as_str()))
+                .unwrap_or("Matrix send failed");
+            return Err(anyhow!(message.to_string()));
+        }
+
+        last_response = Some(MatrixOutboundResponse {
+            event_id: payload
+                .get("event_id")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
+            transaction_id: Some(txn_id),
         });
     }
 
-    let response = super::outbound_rate_limit::send_with_bounded_retries(
-        "matrix",
-        "send_message",
-        client
-            .put(url)
-            .bearer_auth(config.access_token.trim())
-            .json(&content),
-    )
-    .await
-    .context("failed to send Matrix message")?;
-
-    let status = response.status();
-    let payload: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
-    if !status.is_success() {
-        let message = payload
-            .get("error")
-            .and_then(|value| value.as_str())
-            .or_else(|| payload.get("errcode").and_then(|value| value.as_str()))
-            .unwrap_or("Matrix send failed");
-        return Err(anyhow!(message.to_string()));
-    }
-
-    Ok(MatrixOutboundResponse {
-        event_id: payload
-            .get("event_id")
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned),
-        transaction_id: Some(txn_id),
-    })
+    last_response.ok_or_else(|| anyhow!("message body is required"))
 }
 
 pub async fn sync_once(

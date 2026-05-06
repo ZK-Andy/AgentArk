@@ -1,6 +1,6 @@
 use super::*;
 
-static PRODUCT_HELP_SYNC_LOCK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+static AGENTARK_KNOWLEDGE_SYNC_LOCK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
     std::sync::OnceLock::new();
 
 impl Agent {
@@ -229,7 +229,11 @@ impl Agent {
             let ready = model_pool_map
                 .get(&slot_id)
                 .is_some_and(|(slot, _)| Self::provider_has_runtime_credentials(&slot.provider));
-            if ready { Some(slot_id) } else { None }
+            if ready {
+                Some(slot_id)
+            } else {
+                None
+            }
         });
         if had_persisted_model_override && user_selected_model_slot.is_none() {
             let _ = storage.delete(USER_SELECTED_MODEL_SLOT_KEY).await;
@@ -466,6 +470,21 @@ impl Agent {
                 }
             }
         }
+
+        let runtime_timezone = user_profile.timezone.as_deref();
+        if let Some(timezone) = runtime_timezone {
+            std::env::set_var("AGENTARK_LOG_TIMEZONE", timezone);
+        }
+        let llm = llm.with_runtime_timezone(runtime_timezone);
+        let model_pool_map = model_pool_map
+            .into_iter()
+            .map(|(slot_id, (slot, client))| {
+                (
+                    slot_id,
+                    (slot, client.with_runtime_timezone(runtime_timezone)),
+                )
+            })
+            .collect();
 
         // Load persisted tasks (if any)
         if let Ok(stored_tasks) = storage.get_tasks().await {
@@ -782,25 +801,28 @@ impl Agent {
         }
 
         {
-            let agent_for_product_help = agent.clone();
-            crate::spawn_logged!("src/core/agent/startup.rs:product_help_sync", async move {
-                match agent_for_product_help.sync_bundled_product_help().await {
-                    Ok(count) => {
-                        tracing::info!("Synced {} bundled product-help knowledge item(s)", count)
-                    }
-                    Err(error) => {
-                        tracing::warn!("Failed to sync bundled product-help knowledge: {}", error);
-                        agent_for_product_help
-                            .push_startup_issue(StartupIssue::new(
-                                "product_help",
-                                "warning",
-                                "Bundled product-help sync failed during startup",
-                                error.to_string(),
-                            ))
-                            .await;
+            let agent_for_agentark_knowledge = agent.clone();
+            crate::spawn_logged!(
+                "src/core/agent/startup.rs:agentark_knowledge_sync",
+                async move {
+                    match agent_for_agentark_knowledge.sync_agentark_knowledge().await {
+                        Ok(count) => {
+                            tracing::info!("Synced {} AgentArk knowledge item(s)", count)
+                        }
+                        Err(error) => {
+                            tracing::warn!("Failed to sync AgentArk knowledge: {}", error);
+                            agent_for_agentark_knowledge
+                                .push_startup_issue(StartupIssue::new(
+                                    "agentark_knowledge",
+                                    "warning",
+                                    "AgentArk knowledge sync failed during startup",
+                                    error.to_string(),
+                                ))
+                                .await;
+                        }
                     }
                 }
-            });
+            );
         }
 
         {
@@ -1007,20 +1029,21 @@ impl Agent {
         Ok(stats)
     }
 
-    pub async fn sync_bundled_product_help(&self) -> Result<usize> {
-        let sync_lock = PRODUCT_HELP_SYNC_LOCK
+    pub async fn sync_agentark_knowledge(&self) -> Result<usize> {
+        let sync_lock = AGENTARK_KNOWLEDGE_SYNC_LOCK
             .get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _sync_guard = sync_lock.lock().await;
         let actions = self.load_action_catalog_actions().await?;
-        let items = crate::core::product_help::build_seed_knowledge_items(&actions);
-        let documents = crate::core::product_help::build_seed_product_help_documents(&actions);
+        let items = crate::core::agentark_knowledge::build_seed_knowledge_items(&actions);
+        let documents =
+            crate::core::agentark_knowledge::build_seed_agentark_knowledge_documents(&actions);
 
         self.storage
-            .delete_knowledge_items_by_source(crate::core::product_help::CURATED_SOURCE)
+            .delete_knowledge_items_by_source(crate::core::agentark_knowledge::CURATED_SOURCE)
             .await?;
         self.storage
-            .delete_knowledge_items_by_source(crate::core::product_help::RUNTIME_SOURCE)
+            .delete_knowledge_items_by_source(crate::core::agentark_knowledge::RUNTIME_SOURCE)
             .await?;
 
         let mut inserted = 0usize;
@@ -1056,13 +1079,15 @@ impl Agent {
                 .chunks
                 .iter()
                 .enumerate()
-                .map(|(index, content)| crate::storage::entities::document_chunk::Model {
-                    id: format!("{}:chunk:{}", document.id, index),
-                    document_id: document.id.clone(),
-                    chunk_index: index.min(i32::MAX as usize) as i32,
-                    content: content.clone(),
-                    embedding: None,
-                })
+                .map(
+                    |(index, content)| crate::storage::entities::document_chunk::Model {
+                        id: format!("{}:chunk:{}", document.id, index),
+                        document_id: document.id.clone(),
+                        chunk_index: index.min(i32::MAX as usize) as i32,
+                        content: content.clone(),
+                        embedding: None,
+                    },
+                )
                 .collect::<Vec<_>>();
             match crate::core::document_search::embed_document_chunks(
                 self.embedding_client.as_deref(),
@@ -1081,7 +1106,7 @@ impl Agent {
                     missing_embeddings += chunks.len();
                     tracing::warn!(
                         title = document.title.as_str(),
-                        "Product-help document embedding failed: {}",
+                        "AgentArk knowledge document embedding failed: {}",
                         error
                     );
                 }
@@ -1095,12 +1120,12 @@ impl Agent {
             .sum::<usize>();
         self.storage
             .replace_documents_by_id_prefix(
-                crate::core::product_help::DOCUMENT_ID_PREFIX,
+                crate::core::agentark_knowledge::DOCUMENT_ID_PREFIX,
                 &document_rows,
             )
             .await?;
         tracing::info!(
-            "Synced product-help document index docs={} chunks={} embedded={} missing_embeddings={}",
+            "Synced AgentArk knowledge document index docs={} chunks={} embedded={} missing_embeddings={}",
             document_count,
             chunk_count,
             embedded_chunks,

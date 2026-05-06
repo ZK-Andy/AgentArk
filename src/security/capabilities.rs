@@ -847,7 +847,7 @@ fn push_structured_capability_observations(
             );
             true
         }
-        "product-help" | "documentation" | "time" => true,
+        "agentark-capabilities" | "agentark-manual" | "documentation" | "time" => true,
         "gmail" => {
             push_observation(
                 out,
@@ -1767,12 +1767,10 @@ mod tests {
         );
 
         assert!(report.blocked);
-        assert!(
-            report
-                .matched_rules
-                .iter()
-                .any(|rule| rule.id == "block-shell-file-network")
-        );
+        assert!(report
+            .matched_rules
+            .iter()
+            .any(|rule| rule.id == "block-shell-file-network"));
     }
 
     #[test]
@@ -1796,12 +1794,10 @@ mod tests {
         let report = evaluate_cross_layer_capabilities(observations)
             .expect("cross-layer report should be produced");
         assert!(report.blocked);
-        assert!(
-            report
-                .matched_rules
-                .iter()
-                .any(|rule| rule.id == "block-shell-file-network")
-        );
+        assert!(report
+            .matched_rules
+            .iter()
+            .any(|rule| rule.id == "block-shell-file-network"));
     }
 
     #[test]
@@ -1850,6 +1846,8 @@ mod tests {
     fn builtin_action_capability_aliases_do_not_emit_unknown_high_risk() {
         let aliases = [
             "agent_orchestration",
+            "agentark_capabilities",
+            "agentark_manual",
             "analytics",
             "app_hosting",
             "capability_inventory",
@@ -1882,7 +1880,6 @@ mod tests {
             "orchestration",
             "pdf_generation",
             "platform_observability",
-            "product_help",
             "scheduler",
             "search",
             "self_evolve",

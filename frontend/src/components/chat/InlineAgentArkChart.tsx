@@ -1,5 +1,5 @@
 import { Box, Typography } from "@mui/material";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import ReactECharts from "echarts-for-react";
 
 const AGENTARK_CHART_LANGUAGE = "agentark-chart";
@@ -20,6 +20,10 @@ type ChartSeries = {
   key: string;
   name: string;
   kind?: ChartKind;
+};
+
+type EChartsInstance = {
+  resize: () => void;
 };
 
 type ChartModel =
@@ -409,6 +413,14 @@ function buildChartModel(code: string): ChartModel {
     return { ok: false, message: "Chart block does not include tabular data." };
   }
   const kind = inferChartKind(parsed, rows);
+  const categoryKey = inferCategoryKey(rows, parsed.x);
+  const series = seriesFromSpec(parsed, rows, categoryKey);
+  const hasNumericData = series.some((entry) =>
+    rows.some((row) => valueForRow(row, entry.key) != null),
+  );
+  if (!categoryKey || series.length === 0 || !hasNumericData) {
+    return { ok: false, message: "Chart block does not include numeric series data." };
+  }
   const option =
     kind === "pie" || kind === "doughnut"
       ? buildPieOption(parsed, rows, kind)
@@ -436,6 +448,32 @@ export function isAgentArkChartFence(className = ""): boolean {
 
 export function InlineAgentArkChart({ code }: { code: string }) {
   const model = useMemo(() => buildChartModel(code), [code]);
+  const shellRef = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<EChartsInstance | null>(null);
+
+  useEffect(() => {
+    if (!model.ok) return;
+    const resize = () => {
+      chartRef.current?.resize();
+    };
+    const resizeFrame = requestAnimationFrame(resize);
+    const resizeTimers = [80, 180, 420, 900, 1400].map((delay) =>
+      setTimeout(resize, delay),
+    );
+    const shell = shellRef.current;
+    const observer =
+      typeof ResizeObserver !== "undefined" && shell
+        ? new ResizeObserver(resize)
+        : null;
+    if (observer && shell) {
+      observer.observe(shell);
+    }
+    return () => {
+      cancelAnimationFrame(resizeFrame);
+      resizeTimers.forEach((timer) => clearTimeout(timer));
+      observer?.disconnect();
+    };
+  }, [model]);
 
   if (!model.ok) {
     return (
@@ -451,7 +489,7 @@ export function InlineAgentArkChart({ code }: { code: string }) {
   }
 
   return (
-    <Box className="chat-inline-chart">
+    <Box className="chat-inline-chart" ref={shellRef}>
       <Box className="chat-inline-chart-header">
         <Typography className="chat-inline-chart-title" variant="body2">
           {model.title}
@@ -464,10 +502,18 @@ export function InlineAgentArkChart({ code }: { code: string }) {
       </Box>
       <ReactECharts
         option={model.option}
+        onChartReady={(instance: EChartsInstance) => {
+          chartRef.current = instance;
+          requestAnimationFrame(() => instance.resize());
+          [80, 220, 520, 1000].forEach((delay) => {
+            setTimeout(() => instance.resize(), delay);
+          });
+        }}
+        autoResize
         notMerge
         lazyUpdate
         opts={{ renderer: "svg" }}
-        style={{ width: "100%", height: model.height }}
+        style={{ width: "100%", height: model.height, minHeight: model.height }}
       />
     </Box>
   );

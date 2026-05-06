@@ -9,9 +9,9 @@ pub mod google_workspace;
 pub mod lan;
 pub mod research;
 pub mod search;
-pub mod vercel;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+pub mod vercel;
 
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, str::FromStr};

@@ -4,7 +4,7 @@
 //! 2. Fetching and extracting content from URLs
 //! 3. Synthesizing information into a coherent report
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -219,6 +219,127 @@ fn summarize_progress_text(value: &str, max_chars: usize) -> String {
     shortened
 }
 
+fn trim_research_list_marker(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    for prefix in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
+        }
+    }
+
+    let digit_prefix_len = trimmed
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    if digit_prefix_len == 0 || digit_prefix_len >= trimmed.len() {
+        return None;
+    }
+
+    let after_digits = &trimmed[digit_prefix_len..];
+    let mut after_chars = after_digits.chars();
+    let marker = after_chars.next()?;
+    if !matches!(marker, '.' | ')' | ':') {
+        return None;
+    }
+
+    let rest = after_chars.as_str().trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+fn compact_research_query_text(text: &str, max_chars: usize) -> String {
+    let compact = text.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let mut out = String::new();
+    for word in compact.split_whitespace() {
+        let next_len =
+            out.chars().count() + if out.is_empty() { 0 } else { 1 } + word.chars().count();
+        if next_len > max_chars {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+
+    if out.is_empty() {
+        compact.chars().take(max_chars).collect()
+    } else {
+        out
+    }
+}
+
+fn research_request_outline(query: &str) -> (String, Vec<String>) {
+    let mut objective = String::new();
+    let mut focus_items = Vec::new();
+    let mut objective_closed = false;
+
+    for raw_line in query.lines().take(160) {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if !objective.is_empty() {
+                objective_closed = true;
+            }
+            continue;
+        }
+
+        if let Some(item) = trim_research_list_marker(line) {
+            let item = compact_research_query_text(item, 180);
+            if !item.is_empty() {
+                focus_items.push(item);
+            }
+            objective_closed = true;
+            continue;
+        }
+
+        if objective.is_empty() {
+            objective = compact_research_query_text(line, 220);
+        } else if !objective_closed && objective.chars().count() < 220 {
+            objective = compact_research_query_text(&format!("{} {}", objective, line), 220);
+        }
+    }
+
+    if objective.is_empty() {
+        objective = compact_research_query_text(query, 220);
+    }
+
+    let mut seen = HashSet::new();
+    let focus_items = focus_items
+        .into_iter()
+        .filter(|item| seen.insert(item.to_ascii_lowercase()))
+        .take(8)
+        .collect::<Vec<_>>();
+
+    (objective, focus_items)
+}
+
+fn combine_research_query_terms(base: &str, additions: &[&str]) -> String {
+    let mut parts = Vec::new();
+    let base = base.trim();
+    if !base.is_empty() {
+        parts.push(base.to_string());
+    }
+    for addition in additions {
+        let addition = addition.trim();
+        if !addition.is_empty() {
+            parts.push(addition.to_string());
+        }
+    }
+    compact_research_query_text(&parts.join(" "), 240)
+}
+
 fn backend_display_name(name: &str) -> &'static str {
     match name.trim().to_ascii_lowercase().as_str() {
         "serper" => "Serper",
@@ -262,7 +383,11 @@ fn summarize_error(err: &anyhow::Error) -> String {
     summarize_progress_text(&err.to_string(), 120)
 }
 
-fn research_result_failure_reason(result: &ResearchResult) -> Option<String> {
+fn research_result_failure_reason(
+    result: &ResearchResult,
+    min_sources: usize,
+    min_findings: usize,
+) -> Option<String> {
     let has_sources = result.sources.iter().any(|source| {
         !source.url.trim().is_empty()
             || !source.title.trim().is_empty()
@@ -276,6 +401,19 @@ fn research_result_failure_reason(result: &ResearchResult) -> Option<String> {
     let has_findings = primary_findings
         .iter()
         .any(|finding| !finding.content.trim().is_empty());
+    let source_count = result
+        .sources
+        .iter()
+        .filter(|source| {
+            !source.url.trim().is_empty()
+                || !source.title.trim().is_empty()
+                || !source.description.trim().is_empty()
+        })
+        .count();
+    let finding_count = primary_findings
+        .iter()
+        .filter(|finding| !finding.content.trim().is_empty())
+        .count();
     let summary_lower = result.summary.trim().to_ascii_lowercase();
     let placeholder_summary = summary_lower.starts_with("no relevant information found for:");
 
@@ -286,6 +424,14 @@ fn research_result_failure_reason(result: &ResearchResult) -> Option<String> {
             "The search returned pages, but none produced enough usable evidence to draft a research report."
                 .to_string(),
         )
+    } else if source_count < min_sources || finding_count < min_findings {
+        Some(format!(
+            "The search produced only {} usable source{} and {} usable finding{}, which is not enough evidence for this research depth.",
+            source_count,
+            if source_count == 1 { "" } else { "s" },
+            finding_count,
+            if finding_count == 1 { "" } else { "s" }
+        ))
     } else {
         None
     }
@@ -294,8 +440,10 @@ fn research_result_failure_reason(result: &ResearchResult) -> Option<String> {
 fn ensure_research_result_has_evidence(
     result: &ResearchResult,
     progress: Option<&ResearchProgressReporter>,
+    min_sources: usize,
+    min_findings: usize,
 ) -> Result<()> {
-    let Some(reason) = research_result_failure_reason(result) else {
+    let Some(reason) = research_result_failure_reason(result, min_sources, min_findings) else {
         return Ok(());
     };
     if let Some(progress) = progress {
@@ -499,9 +647,9 @@ impl ResearchClient {
             open_questions: Vec::new(),
             contradictions: Vec::new(),
             sources,
-            related_topics: self.extract_related_topics(&search_results),
+            related_topics: self.extract_related_topics(&search_results, &args.query),
         };
-        ensure_research_result_has_evidence(&result, progress)?;
+        ensure_research_result_has_evidence(&result, progress, 1, 1)?;
         if let Some(progress) = progress {
             progress.emit(
                 "synthesis",
@@ -618,9 +766,9 @@ impl ResearchClient {
             open_questions: Vec::new(),
             contradictions: Vec::new(),
             sources,
-            related_topics: self.extract_related_topics(&search_results),
+            related_topics: self.extract_related_topics(&search_results, &args.query),
         };
-        ensure_research_result_has_evidence(&result, progress)?;
+        ensure_research_result_has_evidence(&result, progress, 1, 1)?;
         if let Some(progress) = progress {
             progress.emit(
                 "reading",
@@ -940,9 +1088,16 @@ impl ResearchClient {
             open_questions,
             contradictions,
             sources,
-            related_topics: self.extract_related_topics(&all_results),
+            related_topics: self.extract_related_topics(&all_results, &args.query),
         };
-        ensure_research_result_has_evidence(&result, progress)?;
+        let min_deep_sources = max_sources.min(5);
+        let min_deep_findings = max_sources.min(5);
+        ensure_research_result_has_evidence(
+            &result,
+            progress,
+            min_deep_sources,
+            min_deep_findings,
+        )?;
         if let Some(progress) = progress {
             progress.emit(
                 "synthesis",
@@ -1247,14 +1402,11 @@ impl ResearchClient {
                 stream_key,
             );
         }
-        let (final_url, html) = self
-            .fetch_html_with_safe_redirects(validated_url.clone())
-            .await?;
         // Fast-path: Lightpanda returns clean markdown. Still wrap it in the
         // untrusted envelope: the remote server is attacker-controllable, and
         // clean markdown can still carry embedded instructions.
-        let origin_label = source_host_label(final_url.as_str());
-        match crate::integrations::lightpanda::fetch_markdown(final_url.as_str()).await {
+        let origin_label = source_host_label(validated_url.as_str());
+        match crate::integrations::lightpanda::fetch_markdown(validated_url.as_str()).await {
             Ok(markdown) => {
                 return Ok(crate::security::sanitize_untrusted_output(
                     &format!("web_page:{}", origin_label),
@@ -1281,6 +1433,11 @@ impl ResearchClient {
                 }
             }
         }
+
+        let (final_url, html) = self
+            .fetch_html_with_safe_redirects(validated_url.clone())
+            .await?;
+        let origin_label = source_host_label(final_url.as_str());
 
         // HTML fallback: run structural neutralization (strip script/style/
         // hidden elements/comments) and wrap.
@@ -1489,7 +1646,7 @@ impl ResearchClient {
         let mut seen = HashSet::new();
         query
             .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .map(|term| term.trim().to_ascii_lowercase())
+            .map(|term| self.normalize_relevance_token(term))
             .filter(|term| !term.is_empty())
             .filter(|term| term.len() >= 2)
             .filter(|term| {
@@ -1539,6 +1696,33 @@ impl ResearchClient {
             .collect()
     }
 
+    fn normalize_relevance_token(&self, token: &str) -> String {
+        let token = token.trim().to_ascii_lowercase();
+        if token.len() <= 4 {
+            return token;
+        }
+        if let Some(stem) = token.strip_suffix("ies") {
+            if stem.len() >= 3 {
+                return format!("{}y", stem);
+            }
+        }
+        for suffix in ["ing", "ed", "s"] {
+            if let Some(stem) = token.strip_suffix(suffix) {
+                if stem.len() >= 4 {
+                    return stem.to_string();
+                }
+            }
+        }
+        token
+    }
+
+    fn normalized_text_terms(&self, text: &str) -> HashSet<String> {
+        text.split(|ch: char| !ch.is_ascii_alphanumeric())
+            .map(|term| self.normalize_relevance_token(term))
+            .filter(|term| term.len() >= 2)
+            .collect()
+    }
+
     fn search_result_matches_query_terms(
         &self,
         result: &SearchResult,
@@ -1553,15 +1737,15 @@ impl ResearchClient {
             return Some(0.0);
         }
 
-        let text_lower = text.to_ascii_lowercase();
+        let text_terms = self.normalized_text_terms(text);
         let total_matches = query_terms
             .iter()
-            .filter(|term| text_lower.contains(term.as_str()))
+            .filter(|term| text_terms.contains(term.as_str()))
             .count();
         let specific_matches = query_terms
             .iter()
             .filter(|term| self.is_specific_query_term(term))
-            .filter(|term| text_lower.contains(term.as_str()))
+            .filter(|term| text_terms.contains(term.as_str()))
             .count();
         let minimum_matches = self.minimum_query_matches(query_terms.len());
 
@@ -2175,12 +2359,55 @@ impl ResearchClient {
         )
     }
 
+    fn format_scope_coverage_section(&self, query: &str, findings: &[Finding]) -> String {
+        let (_, focus_items) = research_request_outline(query);
+        if focus_items.is_empty() || findings.is_empty() {
+            return String::new();
+        }
+
+        let mut section = String::from("## Scope Coverage\n\n");
+        for focus in focus_items.iter().take(8) {
+            let query_terms = self.normalized_query_terms(focus);
+            let mut ranked = findings
+                .iter()
+                .filter_map(|finding| {
+                    self.text_relevance_score(&finding.content, &query_terms)
+                        .map(|score| (score, finding))
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_by(|(left, _), (right, _)| {
+                right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            section.push_str(&format!("### {}\n\n", focus));
+            if ranked.is_empty() {
+                section.push_str(
+                    "- Evidence gap: the collected sources did not provide a usable finding for this part of the request.\n\n",
+                );
+                continue;
+            }
+
+            for (_, finding) in ranked.into_iter().take(2) {
+                section.push_str(&format!(
+                    "- {} (confidence: {:.0}%, sources: {})\n",
+                    summarize_progress_text(&finding.content, 360),
+                    finding.confidence * 100.0,
+                    format_finding_citations(finding)
+                ));
+            }
+            section.push('\n');
+        }
+
+        section
+    }
+
     /// Generate sub-queries for deep research
     fn generate_research_queries(
         &self,
         query: &str,
         prefer_primary_sources: bool,
     ) -> Vec<ResearchQuery> {
+        let (objective, focus_items) = research_request_outline(query);
         let temporal_coverage = if self.query_targets_historical_period(query) {
             "period coverage"
         } else {
@@ -2189,51 +2416,67 @@ impl ResearchClient {
         let mut queries = vec![
             ResearchQuery {
                 category: ResearchQueryCategory::General,
-                text: query.to_string(),
+                text: objective.clone(),
             },
             ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} primary sources", query),
+                text: combine_research_query_terms(&objective, &["primary sources"]),
             },
             ResearchQuery {
                 category: ResearchQueryCategory::Recent,
-                text: format!("{} {}", query, temporal_coverage),
+                text: combine_research_query_terms(&objective, &[temporal_coverage]),
             },
             ResearchQuery {
                 category: ResearchQueryCategory::Comparison,
-                text: format!("{} comparison alternatives", query),
+                text: combine_research_query_terms(&objective, &["comparison alternatives"]),
             },
             ResearchQuery {
                 category: ResearchQueryCategory::Risks,
-                text: format!("{} risks limitations open questions", query),
+                text: combine_research_query_terms(
+                    &objective,
+                    &["risks limitations open questions"],
+                ),
             },
         ];
 
         if prefer_primary_sources {
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} official source", query),
+                text: combine_research_query_terms(&objective, &["official source"]),
             });
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} original report data", query),
+                text: combine_research_query_terms(&objective, &["original report data"]),
             });
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} source material", query),
+                text: combine_research_query_terms(&objective, &["source material"]),
             });
         } else {
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::General,
-                text: format!("{} overview", query),
+                text: combine_research_query_terms(&objective, &["overview"]),
             });
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Comparison,
-                text: format!("{} expert analysis", query),
+                text: combine_research_query_terms(&objective, &["expert analysis"]),
             });
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Recent,
-                text: format!("{} case study", query),
+                text: combine_research_query_terms(&objective, &["case study"]),
+            });
+        }
+
+        for (index, focus) in focus_items.iter().enumerate() {
+            let category = match index % 4 {
+                0 => ResearchQueryCategory::Primary,
+                1 => ResearchQueryCategory::Comparison,
+                2 => ResearchQueryCategory::Risks,
+                _ => ResearchQueryCategory::Recent,
+            };
+            queries.push(ResearchQuery {
+                category,
+                text: combine_research_query_terms(&objective, &[focus.as_str()]),
             });
         }
 
@@ -2253,39 +2496,39 @@ impl ResearchClient {
         freshness_gap: bool,
         round: usize,
     ) -> Vec<ResearchQuery> {
+        let (objective, _) = research_request_outline(query);
         let mut queries = Vec::new();
         if primary_gap {
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} official source", query),
+                text: combine_research_query_terms(&objective, &["official source"]),
             });
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} original report data", query),
+                text: combine_research_query_terms(&objective, &["original report data"]),
             });
         }
         if freshness_gap {
+            let current_year = Utc::now().year().to_string();
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Recent,
-                text: format!("{} {}", query, Utc::now().year()),
+                text: combine_research_query_terms(&objective, &[&current_year]),
             });
         }
         for question in open_questions.iter().take(2) {
+            let tail = self.normalize_search_tail(question, 90);
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::General,
-                text: format!("{} {}", query, self.normalize_search_tail(question, 90)),
+                text: combine_research_query_terms(&objective, &[&tail]),
             });
         }
         if let Some(contradiction) =
             contradictions.get(round.min(contradictions.len().saturating_sub(1)))
         {
+            let tail = self.normalize_search_tail(contradiction, 90);
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Risks,
-                text: format!(
-                    "{} {}",
-                    query,
-                    self.normalize_search_tail(contradiction, 90)
-                ),
+                text: combine_research_query_terms(&objective, &[&tail]),
             });
         }
 
@@ -2306,16 +2549,27 @@ impl ResearchClient {
     }
 
     /// Extract related topics from search results
-    fn extract_related_topics(&self, results: &[SearchResult]) -> Vec<String> {
+    fn extract_related_topics(&self, results: &[SearchResult], query: &str) -> Vec<String> {
         let mut topics: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let query_terms = self
+            .normalized_query_terms(query)
+            .into_iter()
+            .collect::<HashSet<_>>();
 
         for result in results {
-            // Extract potential topics from titles
-            let words: Vec<&str> = result.title.split_whitespace().collect();
+            let words = result
+                .title
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .map(str::trim)
+                .filter(|word| word.chars().count() >= 2)
+                .collect::<Vec<_>>();
             for window in words.windows(2) {
                 if window.len() == 2 {
                     let potential_topic = format!("{} {}", window[0], window[1]);
-                    if potential_topic.len() > 5 && potential_topic.len() < 30 {
+                    let overlaps_query = window.iter().any(|word| {
+                        query_terms.contains(self.normalize_relevance_token(word).as_str())
+                    });
+                    if overlaps_query && potential_topic.len() > 5 && potential_topic.len() < 30 {
                         topics.insert(potential_topic);
                     }
                 }
@@ -2395,6 +2649,8 @@ pub async fn execute_research_with_progress(
     } else {
         &result.key_findings
     };
+
+    output.push_str(&client.format_scope_coverage_section(&result.query, primary_findings));
 
     if !primary_findings.is_empty() {
         output.push_str("## Key Findings\n\n");
@@ -2575,26 +2831,39 @@ mod tests {
         let client = test_client();
         let queries = client.generate_research_queries("rust agent framework", true);
 
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("primary sources"))
-        );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("recent coverage"))
-        );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("comparison alternatives"))
-        );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("risks limitations open questions"))
-        );
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("primary sources")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("recent coverage")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("comparison alternatives")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("risks limitations open questions")));
+    }
+
+    #[test]
+    fn deep_research_queries_stay_compact_for_structured_requests() {
+        let client = test_client();
+        let request = "Research whether India should aggressively expand domestic AI research investment, frontier-model infrastructure, and public AI compute between 2026 and 2040, as of April 4, 2026.\n\nFocus on:\n- India’s current AI research capacity: universities, labs, talent pipeline, publications, and startups\n- whether India should prioritize open-source AI, closed proprietary AI, or a hybrid strategy\n- compute access, GPUs, data center power demand, semiconductor dependence, and cloud-provider reliance\n- the economic upside for India in sectors like software, manufacturing, healthcare, education, defense, and public services\n- the risks: safety, misuse, surveillance, labor displacement, misinformation, and concentration of power\n- how India compares with the US, China, EU, and major open-source ecosystems";
+        let queries = client.generate_research_queries(request, true);
+
+        assert!(queries.len() > 8);
+        assert!(queries
+            .iter()
+            .all(|query| query.text.chars().count() <= 240));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("compute access")));
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("open-source AI")));
+        assert!(!queries
+            .iter()
+            .any(|query| query.text.contains("Focus on:\n-")));
     }
 
     #[test]
@@ -2639,16 +2908,12 @@ mod tests {
             client.effective_freshness_window_days(&args, &args.query),
             None
         );
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.text.contains("period coverage"))
-        );
-        assert!(
-            !queries
-                .iter()
-                .any(|query| query.text.contains("recent coverage"))
-        );
+        assert!(queries
+            .iter()
+            .any(|query| query.text.contains("period coverage")));
+        assert!(!queries
+            .iter()
+            .any(|query| query.text.contains("recent coverage")));
     }
 
     #[test]
@@ -2702,6 +2967,71 @@ mod tests {
 
         assert_eq!(key_points.len(), 1);
         assert!(key_points[0].contains("talent pipeline"));
+    }
+
+    #[test]
+    fn relevance_scoring_uses_token_matches_not_substrings() {
+        let client = test_client();
+        let query_terms =
+            client.normalized_query_terms("India AI publications startups compute infrastructure");
+
+        assert!(client
+            .text_relevance_score(
+                "Access 160 million publication pages and gain visibility by uploading work.",
+                &query_terms,
+            )
+            .is_none());
+        assert!(client
+            .text_relevance_score(
+                "India AI compute infrastructure is shaping startup and publication output.",
+                &query_terms,
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn evidence_gate_rejects_under_supported_deep_reports() {
+        let result = ResearchResult {
+            query: "market structure analysis".to_string(),
+            summary: "Two thin findings were collected.".to_string(),
+            findings: vec![
+                Finding {
+                    content: "The first source gives one relevant claim.".to_string(),
+                    confidence: 0.7,
+                    source_index: 0,
+                    supporting_source_indices: vec![0],
+                },
+                Finding {
+                    content: "The second source gives another relevant claim.".to_string(),
+                    confidence: 0.7,
+                    source_index: 1,
+                    supporting_source_indices: vec![1],
+                },
+            ],
+            key_findings: Vec::new(),
+            open_questions: Vec::new(),
+            contradictions: Vec::new(),
+            sources: vec![
+                Source {
+                    title: "Source one".to_string(),
+                    url: "https://example.com/one".to_string(),
+                    description: String::new(),
+                    reliability: 0.7,
+                    published_date: None,
+                },
+                Source {
+                    title: "Source two".to_string(),
+                    url: "https://example.com/two".to_string(),
+                    description: String::new(),
+                    reliability: 0.7,
+                    published_date: None,
+                },
+            ],
+            related_topics: Vec::new(),
+        };
+
+        assert!(research_result_failure_reason(&result, 3, 3).is_some());
+        assert!(research_result_failure_reason(&result, 2, 2).is_none());
     }
 
     #[test]

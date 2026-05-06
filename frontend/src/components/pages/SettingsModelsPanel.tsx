@@ -70,6 +70,7 @@ export function SettingsModelsPanel({
   embeddingsIsLocal,
   embeddingsIsOllama,
   embeddingsIsExternal,
+  hiddenExternalEmbeddingsProvider,
   modelDialogOpen,
   setModelDialogOpen,
   modelForm,
@@ -309,7 +310,7 @@ export function SettingsModelsPanel({
                           eyebrow: "Models",
                           title: "Embeddings",
                           description:
-                            "Choose the backend used for local memory, retrieval, and document embeddings.",
+                            "Choose whether AgentArk uses the bundled local embeddings sidecar or lexical fallback.",
                         })}
 
                         <Stack
@@ -324,42 +325,30 @@ export function SettingsModelsPanel({
                             size="small"
                             variant="outlined"
                             label={
-                              embeddingsProvider === "local-hf"
-                                ? "Local Hugging Face"
-                                : embeddingsProvider === "ollama"
-                                  ? "External Ollama"
-                                  : embeddingsDisabled
-                                    ? "Disabled"
-                                    : "External Provider"
+                              embeddingsDisabled
+                                ? "Disabled"
+                                : "Local Hugging Face"
                             }
                           />
                           <Chip
                             size="small"
                             variant="outlined"
                             label={
-                              form.embeddings_model.trim() ||
-                              "No model selected"
+                              embeddingsDisabled
+                                ? "Lexical fallback"
+                                : LOCAL_EMBEDDINGS_MODEL
                             }
                           />
-                          {embeddingsProvider === "openai-compatible" ? (
-                            <Chip
-                              size="small"
-                              variant="outlined"
-                              color={
-                                form.embeddings_api_key.trim() ||
-                                embeddingsHasApiKey
-                                  ? "success"
-                                  : "default"
-                              }
-                              label={
-                                form.embeddings_api_key.trim() ||
-                                embeddingsHasApiKey
-                                  ? "API key configured"
-                                  : "No API key"
-                              }
-                            />
-                          ) : null}
                         </Stack>
+
+                        {hiddenExternalEmbeddingsProvider ? (
+                          <Alert severity="warning">
+                            An external embeddings provider is currently saved.
+                            Settings now exposes only Local or Disabled until
+                            provider-aware reindexing is built. Save this page
+                            to replace it with the selected mode.
+                          </Alert>
+                        ) : null}
 
                         {embeddingsStatus ? (
                           <Alert
@@ -384,101 +373,25 @@ export function SettingsModelsPanel({
                             <TextField
                               label="Provider"
                               select
-                              value={form.embeddings_provider}
+                              value={
+                                form.embeddings_provider === "disabled"
+                                  ? "disabled"
+                                  : "local-hf"
+                              }
                               onChange={(e) =>
                                 setField("embeddings_provider", e.target.value)
                               }
                               fullWidth
                               size="small"
                             >
-                              <MenuItem value="disabled">
-                                Disabled
-                              </MenuItem>
                               <MenuItem value="local-hf">
                                 Local Hugging Face
                               </MenuItem>
-                              <MenuItem value="openai-compatible">
-                                External OpenAI-compatible
-                              </MenuItem>
-                              <MenuItem value="ollama">
-                                External Ollama
+                              <MenuItem value="disabled">
+                                Disabled
                               </MenuItem>
                             </TextField>
                           </Grid2>
-                          {!embeddingsIsLocal && !embeddingsDisabled ? (
-                            <Grid2 size={{ xs: 12, md: 8 }}>
-                              <TextField
-                                label="Embedding Model"
-                                value={form.embeddings_model}
-                                onChange={(e) =>
-                                  setField("embeddings_model", e.target.value)
-                                }
-                                fullWidth
-                                size="small"
-                                placeholder={
-                                  embeddingsIsOllama
-                                    ? "nomic-embed-text"
-                                    : "text-embedding-3-small"
-                                }
-                                helperText={
-                                  embeddingsIsOllama
-                                    ? "Example: nomic-embed-text"
-                                    : "Use the model name exposed by your external /embeddings provider."
-                                }
-                              />
-                            </Grid2>
-                          ) : null}
-
-                          {embeddingsIsExternal ? (
-                            <Grid2 size={{ xs: 12, md: 8 }}>
-                              <TextField
-                                label={
-                                  embeddingsIsOllama
-                                    ? "Base URL"
-                                    : "Base URL (optional)"
-                                }
-                                value={form.embeddings_base_url}
-                                onChange={(e) =>
-                                  setField(
-                                    "embeddings_base_url",
-                                    e.target.value,
-                                  )
-                                }
-                                fullWidth
-                                size="small"
-                                placeholder={
-                                  embeddingsIsOllama
-                                    ? "http://host.docker.internal:11434"
-                                    : "https://api.openai.com/v1"
-                                }
-                                helperText={
-                                  embeddingsIsOllama
-                                    ? "Point this at a user-managed Ollama server. AgentArk does not bundle Ollama."
-                                    : "Leave blank to use the provider default. Set this when using another OpenAI-compatible embeddings endpoint."
-                                }
-                              />
-                            </Grid2>
-                          ) : null}
-
-                          {embeddingsProvider === "openai-compatible" ? (
-                            <Grid2 size={{ xs: 12, md: 4 }}>
-                              <TextField
-                                label="API Key (optional)"
-                                value={form.embeddings_api_key}
-                                onChange={(e) =>
-                                  setField("embeddings_api_key", e.target.value)
-                                }
-                                fullWidth
-                                size="small"
-                                type="password"
-                                helperText={
-                                  embeddingsHasApiKey
-                                    ? "Leave blank to keep the current key."
-                                    : "Only required if your external provider needs authentication."
-                                }
-                              />
-                            </Grid2>
-                          ) : null}
                         </Grid2>
 
                         {embeddingsIsLocal ? (

@@ -19,6 +19,10 @@ use crate::core::prompt_policy::{
     specialist_writer_system_prompt_v1,
 };
 
+use super::promotion_gate::{
+    promotion_gate_report, render_legacy_promotion_gate, PromotionGateCheck,
+    PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
+};
 use super::prompt_evolution::PromptSurfaceProfile;
 
 pub const SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY: &str = "specialist_prompt_bundle_profile_v1";
@@ -108,6 +112,8 @@ pub struct SpecialistPromptEvolutionResult {
     pub candidate_source: Option<String>,
     pub optimized_surfaces: Vec<String>,
     pub promotion_gate: String,
+    pub promotion_gate_summary: String,
+    pub promotion_gate_report: PromotionGateReport,
     pub promoted_specialist_bundle: Option<SpecialistPromptBundleProfile>,
     pub lineage_entry_id: String,
     pub lineage_archive_path: String,
@@ -330,30 +336,12 @@ impl SpecialistPromptEvolutionEngine {
         );
         best_candidate.bundle.updated_at = Some(chrono::Utc::now().to_rfc3339());
 
-        let promoted = best_eval.combined_score >= baseline_eval.combined_score
-            && best_stats.score_gain >= self.config.min_score_gain
-            && best_stats.wins > best_stats.losses
-            && best_stats.p_value <= self.config.max_sign_test_p_value;
-        let promotion_gate = if promoted {
-            "passed".to_string()
-        } else if best_eval.combined_score < baseline_eval.combined_score {
-            "candidate score below baseline".to_string()
-        } else if best_stats.score_gain < self.config.min_score_gain {
-            format!(
-                "score gain {:.4} below threshold {:.4}",
-                best_stats.score_gain, self.config.min_score_gain
-            )
-        } else if best_stats.wins <= best_stats.losses {
-            format!(
-                "wins={} not greater than losses={}",
-                best_stats.wins, best_stats.losses
-            )
-        } else {
-            format!(
-                "p-value {:.4} above threshold {:.4}",
-                best_stats.p_value, self.config.max_sign_test_p_value
-            )
-        };
+        let promotion_checks =
+            specialist_promotion_checks(&self.config, &baseline_eval, &best_eval, &best_stats);
+        let promoted = promotion_checks.iter().all(|check| check.passed);
+        let promotion_gate = render_specialist_promotion_gate(&promotion_checks);
+        let promotion_gate_report = promotion_gate_report(&promotion_checks);
+        let promotion_gate_summary = promotion_gate_report.summary.clone();
 
         let diff_summary = diff_summary(&baseline_bundle, &best_candidate.bundle);
         let optimized_surfaces = diff_summary.changed_roles.clone();
@@ -402,6 +390,8 @@ impl SpecialistPromptEvolutionEngine {
             candidate_source: Some(best_candidate.source),
             optimized_surfaces,
             promotion_gate,
+            promotion_gate_summary,
+            promotion_gate_report,
             promoted_specialist_bundle: if promoted {
                 Some(best_candidate.bundle)
             } else {
@@ -709,6 +699,13 @@ Baseline bundle:\n{}",
             candidate_source: Some("none".to_string()),
             optimized_surfaces: Vec::new(),
             promotion_gate: "no_distinct_candidates".to_string(),
+            promotion_gate_summary:
+                "Not promoted: no distinct specialist prompt changes were available to test."
+                    .to_string(),
+            promotion_gate_report: PromotionGateReport::rejected(vec![PromotionGateReason::new(
+                "no_distinct_candidates",
+                "no distinct specialist prompt changes were available to test",
+            )]),
             promoted_specialist_bundle: None,
             lineage_entry_id: entry_id,
             lineage_archive_path: self.archive_path().to_string_lossy().to_string(),
@@ -827,6 +824,66 @@ struct PairedStats {
     losses: usize,
     p_value: f64,
     score_gain: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SpecialistPromotionCheck {
+    ScoreNotWorse,
+    MinScoreGain,
+    WinsGtLosses,
+    SignTest,
+}
+
+impl PromotionGateCheck for SpecialistPromotionCheck {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ScoreNotWorse => "score_not_worse",
+            Self::MinScoreGain => "min_score_gain",
+            Self::WinsGtLosses => "wins_gt_losses",
+            Self::SignTest => "sign_test",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ScoreNotWorse => "candidate score was below the stable specialist prompt bundle",
+            Self::MinScoreGain => "score improvement was below the promotion threshold",
+            Self::WinsGtLosses => "candidate did not win more benchmark cases than it lost",
+            Self::SignTest => "statistical confidence is not high enough yet",
+        }
+    }
+}
+
+fn specialist_promotion_checks(
+    config: &SpecialistPromptEvolutionConfig,
+    baseline_eval: &BundleEvaluation,
+    candidate_eval: &BundleEvaluation,
+    stats: &PairedStats,
+) -> Vec<PromotionGateCheckResult<SpecialistPromotionCheck>> {
+    vec![
+        PromotionGateCheckResult {
+            check: SpecialistPromotionCheck::ScoreNotWorse,
+            passed: candidate_eval.combined_score >= baseline_eval.combined_score,
+        },
+        PromotionGateCheckResult {
+            check: SpecialistPromotionCheck::MinScoreGain,
+            passed: stats.score_gain >= config.min_score_gain,
+        },
+        PromotionGateCheckResult {
+            check: SpecialistPromotionCheck::WinsGtLosses,
+            passed: stats.wins > stats.losses,
+        },
+        PromotionGateCheckResult {
+            check: SpecialistPromotionCheck::SignTest,
+            passed: stats.p_value <= config.max_sign_test_p_value,
+        },
+    ]
+}
+
+fn render_specialist_promotion_gate(
+    checks: &[PromotionGateCheckResult<SpecialistPromotionCheck>],
+) -> String {
+    render_legacy_promotion_gate(checks)
 }
 
 fn sanitize_surface(surface: &mut PromptSurfaceProfile, defaults: &PromptSurfaceProfile) {

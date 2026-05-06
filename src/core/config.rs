@@ -17,8 +17,8 @@ use crate::channels::{
 };
 use crate::crypto::KeyManager;
 use crate::security::ModelPrivacyConfig;
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use anyhow::{anyhow, Result};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1212,6 +1212,31 @@ impl SecureConfigManager {
         if let Some(km) = global_key_manager() {
             return Ok(Self {
                 key_manager: km,
+                config_dir: config_dir.to_path_buf(),
+            });
+        }
+
+        if crate::crypto::master::MasterPasswordManager::docker_stack_requires_install_master_secret(
+        ) {
+            let secret =
+                crate::crypto::master::MasterPasswordManager::read_install_master_secret()?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Install-managed encryption secret is missing at {}",
+                            crate::crypto::master::INSTALL_MASTER_SECRET_PATH
+                        )
+                    })?;
+            let master_mgr = crate::crypto::master::MasterPasswordManager::new(
+                config_dir,
+                data_dir.unwrap_or(config_dir),
+            );
+            let key_manager = if master_mgr.is_password_set() {
+                master_mgr.unlock(&secret)?
+            } else {
+                master_mgr.initialize_startup_password_if_needed(&secret)?
+            };
+            return Ok(Self {
+                key_manager,
                 config_dir: config_dir.to_path_buf(),
             });
         }

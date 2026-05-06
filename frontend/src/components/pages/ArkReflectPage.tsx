@@ -1,7 +1,4 @@
 import {
-  Accordion,
-  AccordionDetails,
-  AccordionSummary,
   Alert,
   Box,
   Button,
@@ -20,13 +17,9 @@ import AutoGraphRoundedIcon from "@mui/icons-material/AutoGraphRounded";
 import BubbleChartRoundedIcon from "@mui/icons-material/BubbleChartRounded";
 import CalendarMonthRoundedIcon from "@mui/icons-material/CalendarMonthRounded";
 import ChatRoundedIcon from "@mui/icons-material/ChatRounded";
-import DonutLargeRoundedIcon from "@mui/icons-material/DonutLargeRounded";
-import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
 import HubRoundedIcon from "@mui/icons-material/HubRounded";
-import InsightsRoundedIcon from "@mui/icons-material/InsightsRounded";
 import MemoryRoundedIcon from "@mui/icons-material/MemoryRounded";
 import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
-import NotificationsActiveRoundedIcon from "@mui/icons-material/NotificationsActiveRounded";
 import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import WorkHistoryRoundedIcon from "@mui/icons-material/WorkHistoryRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -46,6 +39,7 @@ type ArkReflectPageProps = {
 };
 
 type ReflectPeriod = "daily" | "weekly" | "monthly";
+type ReflectStoryTab = "studio" | "patterns" | "achievements" | "dreams" | "replay";
 
 type ReflectUnit = {
   id: string;
@@ -103,6 +97,20 @@ type ReflectSourceCounts = {
   usage: number;
 };
 
+type ReflectSuggestedFollowup = {
+  id: string;
+  kind: string;
+  title: string;
+  detail: string;
+  prompt: string;
+  status: string;
+  source_label: string;
+  occurred_at: string;
+  conversation_id?: string | null;
+  source_unit_id?: string | null;
+  rank_score: number;
+};
+
 type ReflectResponse = {
   period: ReflectPeriod;
   from: string;
@@ -145,6 +153,7 @@ type ReflectResponse = {
     last_skipped_at: string;
     last_error: string;
   };
+  suggested_followups: ReflectSuggestedFollowup[];
   clusters: ReflectCluster[];
   unclustered_units: ReflectUnit[];
 };
@@ -274,6 +283,25 @@ function asRelatedHistory(value: unknown): ReflectRelatedHistory {
   };
 }
 
+function asSuggestedFollowup(value: unknown): ReflectSuggestedFollowup | null {
+  const raw = asRecord(value);
+  const id = str(raw.id, "");
+  if (!id) return null;
+  return {
+    id,
+    kind: str(raw.kind, "followup"),
+    title: str(raw.title, "Suggested follow-up"),
+    detail: str(raw.detail, ""),
+    prompt: str(raw.prompt, ""),
+    status: str(raw.status, "ready"),
+    source_label: str(raw.source_label, "ArkReflect"),
+    occurred_at: str(raw.occurred_at, ""),
+    conversation_id: str(raw.conversation_id, "") || null,
+    source_unit_id: str(raw.source_unit_id, "") || null,
+    rank_score: num(raw.rank_score, 0),
+  };
+}
+
 function asReflectCluster(value: unknown): ReflectCluster | null {
   const raw = asRecord(value);
   const id = str(raw.id, "");
@@ -360,6 +388,9 @@ function parseReflectResponse(value: unknown, period: ReflectPeriod): ReflectRes
       last_skipped_at: str(digest.last_skipped_at, ""),
       last_error: str(digest.last_error, ""),
     },
+    suggested_followups: pickRecords(raw, "suggested_followups")
+      .map(asSuggestedFollowup)
+      .filter((item): item is ReflectSuggestedFollowup => item !== null),
     clusters: pickRecords(raw, "clusters")
       .map(asReflectCluster)
       .filter((cluster): cluster is ReflectCluster => cluster !== null),
@@ -374,18 +405,6 @@ function sourceIcon(label: string) {
   if (lower.includes("orbit")) return <HubRoundedIcon fontSize="small" />;
   if (lower.includes("memory")) return <MemoryRoundedIcon fontSize="small" />;
   return <ChatRoundedIcon fontSize="small" />;
-}
-
-function relatedHistoryLabel(history: ReflectRelatedHistory): string {
-  if (history.mode === "recurring") return "Recurring theme";
-  if (history.mode === "new") return "New this period";
-  return "History pending";
-}
-
-function relatedHistoryColor(history: ReflectRelatedHistory): "default" | "primary" | "success" {
-  if (history.mode === "recurring") return "primary";
-  if (history.mode === "new") return "success";
-  return "default";
 }
 
 function relatedHistoryText(history: ReflectRelatedHistory): string {
@@ -737,8 +756,9 @@ function quietStatus(
   }
   if (response.cache_status.mode === "empty") {
     return {
-      title: "No recap for this range yet",
-      detail: "Choose another range or refresh when AgentArk is idle.",
+      title: "Still collecting data",
+      detail:
+        "ArkReflect does not have enough cached work units for this range yet. The recap will appear here once activity is available.",
       active: false,
     };
   }
@@ -760,6 +780,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
   const queryClient = useQueryClient();
   const [period, setPeriod] = useState<ReflectPeriod>("weekly");
   const [anchor, setAnchor] = useState(() => toDateInputValue(new Date()));
+  const [storyTab, setStoryTab] = useState<ReflectStoryTab>("studio");
   const bounds = useMemo(() => periodBounds(period, anchor), [period, anchor]);
   const fromIso = bounds.from.toISOString();
   const toIso = bounds.to.toISOString();
@@ -832,6 +853,18 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     for (const unit of response?.unclustered_units ?? []) byId.set(unit.id, unit);
     return [...byId.values()];
   }, [clusters, response?.unclustered_units]);
+  const suggestedFollowups = response?.suggested_followups ?? [];
+
+  useEffect(() => {
+    const waitingForDailyLatest = suggestedFollowups.some(
+      (item) => item.kind === "latest_developments" && item.status === "queued",
+    );
+    if (!waitingForDailyLatest) return undefined;
+    const id = window.setInterval(() => {
+      void queryClient.invalidateQueries({ queryKey: reflectQueryKey });
+    }, 30000);
+    return () => window.clearInterval(id);
+  }, [queryClient, reflectQueryKey, suggestedFollowups]);
 
   const totalUnits = allUnits.length;
   const strongestCluster = clusters[0] ?? null;
@@ -873,34 +906,20 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     () => narrativeLines(response, focusLabel, totalUnits, learnedCount, backgroundCount, recurringCount),
     [backgroundCount, focusLabel, learnedCount, recurringCount, response, totalUnits],
   );
-
-  const SPARKLINE_BUCKETS = 7;
-  const backgroundSparklines = useMemo(() => {
-    const sources = ["app", "goal", "watcher", "sentinel", "arkpulse", "arkevolve"] as const;
-    const fromTs = response?.from ? Date.parse(response.from) : NaN;
-    const toTs = response?.to ? Date.parse(response.to) : NaN;
-    const haveBounds =
-      Number.isFinite(fromTs) && Number.isFinite(toTs) && toTs > fromTs;
-    const span = haveBounds ? toTs - fromTs : 1;
-    const result: Record<string, number[]> = {};
-    for (const source of sources) {
-      result[source] = new Array(SPARKLINE_BUCKETS).fill(0);
-    }
-    if (!haveBounds) return result;
-    for (const unit of allUnits) {
-      const bucket = result[unit.source_kind as keyof typeof result];
-      if (!bucket) continue;
-      const ts = Date.parse(unit.occurred_at);
-      if (!Number.isFinite(ts)) continue;
-      const ratio = (ts - fromTs) / span;
-      const idx = Math.min(
-        SPARKLINE_BUCKETS - 1,
-        Math.max(0, Math.floor(ratio * SPARKLINE_BUCKETS)),
-      );
-      bucket[idx] += 1;
-    }
-    return result;
-  }, [allUnits, response?.from, response?.to]);
+  const hasReflectContent = clusters.length > 0;
+  const selectedRangeLabel = rangeLabel || formatUiDateRange(fromIso, toIso);
+  const sourceSignalCount = totalForSourceCounts(response?.source_counts);
+  const emptyStateDetail = response
+    ? totalUnits > 0
+      ? `ArkReflect has ${totalUnits} reflected work unit${totalUnits === 1 ? "" : "s"} for this range and is still grouping them into focus areas.`
+      : sourceSignalCount > 0
+      ? `ArkReflect has ${sourceSignalCount} source signal${sourceSignalCount === 1 ? "" : "s"} in this range and is preparing the reflected work units for the recap.`
+      : "No reflected work units are cached for this range yet. Keep working normally; this panel will turn into the recap after chat, ArkOrbit, apps, goals, watchers, or background systems produce activity."
+    : status.detail;
+  const emptyStateChip =
+    reflectQ.isFetching || refreshMutation.isPending || Boolean(response?.refresh_status.running)
+      ? "Collecting"
+      : "Waiting for activity";
 
   const constellationOption = useMemo(() => {
     const nodes: Array<Record<string, unknown>> = [];
@@ -1196,16 +1215,18 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
       },
       yAxis: {
         type: "value",
-        minInterval: 1,
+        min: 0,
         max: peak,
+        interval: peak,
         axisTick: { show: false },
         axisLine: { show: false },
         axisLabel: {
           color: "rgba(180, 210, 225, 0.45)",
           fontSize: 9,
           fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
-          showMinLabel: false,
-          formatter: (val: number) => (val === peak || val === 0 ? String(val) : ""),
+          showMinLabel: true,
+          showMaxLabel: true,
+          formatter: (val: number) => String(val),
         },
         splitLine: { show: false },
       },
@@ -1223,77 +1244,534 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     };
   }, [allUnits, period, response?.from, response?.to]);
 
-  const sourceDonutOption = useMemo(
-    () => ({
-      tooltip: { trigger: "item" },
-      legend: {
-        bottom: 0,
-        textStyle: { color: "rgba(255,255,255,0.7)" },
-      },
-      series: [
-        {
-          type: "pie",
-          radius: ["48%", "72%"],
-          center: ["50%", "43%"],
-          avoidLabelOverlap: true,
-          label: {
-            color: "rgba(255,255,255,0.86)",
-            formatter: "{b}",
+  const sortedClusters = useMemo(
+    () => [...clusters].sort((left, right) => right.unit_count - left.unit_count),
+    [clusters],
+  );
+  const topClusters = sortedClusters.slice(0, 5);
+  const leadCluster = sortedClusters[0] ?? null;
+  const mostChangedStyle = styleSignals
+    .slice()
+    .sort((left, right) => Math.abs(right.delta) - Math.abs(left.delta))[0];
+  const replayUnits = useMemo(
+    () =>
+      allUnits
+        .filter((unit) => Number.isFinite(Date.parse(unit.occurred_at)))
+        .sort((left, right) => Date.parse(left.occurred_at) - Date.parse(right.occurred_at))
+        .slice(0, 6),
+    [allUnits],
+  );
+  const showWeeklyReplay = replayUnits.length >= 3;
+  const recoveryFollowups = suggestedFollowups.filter((item) => item.kind === "recovery_advice");
+  const latestFollowups = suggestedFollowups.filter((item) => item.kind === "latest_developments");
+  const hasProblems =
+    recoveryFollowups.length > 0 ||
+    Boolean(response?.refresh_status.last_error) ||
+    (Boolean(response) && response?.embedding_status.mode !== "semantic" && totalUnits > 0);
+  const hasTodayStatus =
+    todayQ.isFetching ||
+    todayTotal > 0 ||
+    todayMeaningful > 0 ||
+    Boolean(todayResponse?.daily_digest_status.enabled) ||
+    Boolean(todayResponse?.daily_digest_status.summary);
+  const hasGroupingStatus =
+    (response?.embedding_status.total_units ?? 0) > 0 ||
+    Boolean(response?.embedding_status.detail);
+  const hasStudioSide = hasTodayStatus || suggestedFollowups.length > 0 || hasGroupingStatus;
+  const whatWentWrong =
+    response?.refresh_status.last_error ||
+    recoveryFollowups[0]?.detail ||
+    (response?.embedding_status.mode !== "semantic" && totalUnits > 0
+      ? "Semantic grouping is still catching up, so some patterns may be grouped by source activity first."
+      : "No major failure stood out in the reflected data. The main risk is letting the next step remain implicit.");
+  const achievementCards = [
+    {
+      label: "What you achieved",
+      value: `${clusters.length}`,
+      detail: `focus area${clusters.length === 1 ? "" : "s"} clarified from ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"}.`,
+      tone: "var(--green)",
+    },
+    {
+      label: "What went well",
+      value: `${Math.max(0, totalUnits - recoveryFollowups.length)}`,
+      detail: "signals moved cleanly enough to become a readable recap.",
+      tone: "var(--cyan)",
+    },
+    ...(hasProblems
+      ? [
+          {
+            label: "What went wrong",
+            value: `${recoveryFollowups.length}`,
+            detail:
+              recoveryFollowups.length > 0
+                ? "recovery follow-up surfaced from the period."
+                : "a system caveat needs attention.",
+            tone: "var(--red)",
           },
-          labelLine: { lineStyle: { color: "rgba(255,255,255,0.28)" } },
-          data: sourceRows.map((item) => ({
-            name: item.label,
-            value: item.count,
-            itemStyle: { color: item.color },
-          })),
-        },
-      ],
-    }),
-    [sourceRows],
-  );
+        ]
+      : []),
+    ...(recurringCount > 0
+      ? [
+          {
+            label: "Observations",
+            value: `${recurringCount}`,
+            detail: `recurring theme${recurringCount === 1 ? "" : "s"} connected to earlier work.`,
+            tone: "var(--orange)",
+          },
+        ]
+      : []),
+  ];
+  const dreamCards = [
+    {
+      title: leadCluster
+        ? `Carry ${clusterLabelById[leadCluster.id] ?? clusterDisplayLabel(leadCluster)} forward`
+        : "Let the next meaningful cluster emerge",
+      detail: leadCluster
+        ? leadCluster.plain_summary || clusterPlainSummary(leadCluster)
+        : "ArkReflect will turn the next real activity into a focused story once enough work is cached.",
+    },
+    ...(latestFollowups[0]
+      ? [
+          {
+            title: latestFollowups[0].title,
+            detail: latestFollowups[0].detail,
+          },
+        ]
+      : []),
+    ...(recurringCount > 0 && topClusters[0]
+      ? [
+          {
+            title: "Watch the recurring thread",
+            detail: relatedHistoryText(topClusters[0].related_history),
+          },
+        ]
+      : []),
+  ].filter((card) => card.title.trim() && card.detail.trim());
+  const storyTabs = [
+    { value: "studio" as const, label: "Reflection Studio", short: "Studio", count: totalUnits },
+    ...(topClusters.length > 0
+      ? [{ value: "patterns" as const, label: "Pattern Observatory", short: "Patterns", count: topClusters.length }]
+      : []),
+    ...(achievementCards.length > 0
+      ? [{ value: "achievements" as const, label: "Achievement Canvas", short: "Achievements", count: achievementCards.length }]
+      : []),
+    ...(dreamCards.length > 0
+      ? [{ value: "dreams" as const, label: "Dream Board", short: "Dreams", count: dreamCards.length }]
+      : []),
+    ...(showWeeklyReplay
+      ? [{ value: "replay" as const, label: "Weekly Replay", short: "Replay", count: replayUnits.length }]
+      : []),
+  ];
 
-  const radarOption = useMemo(
-    () => ({
-      tooltip: {
-        formatter: () =>
-          "Working style is shown as change versus your recent baseline, not raw counts.",
-      },
-      radar: {
-        radius: "68%",
-        indicator: styleSignals.map((signal) => ({
-          name: signal.label,
-          max: 100,
-        })),
-        splitNumber: 4,
-        axisName: { color: "rgba(255,255,255,0.72)", fontSize: 11 },
-        splitLine: { lineStyle: { color: "rgba(255,255,255,0.13)" } },
-        splitArea: { areaStyle: { color: ["rgba(255,255,255,0.02)", "rgba(255,255,255,0.05)"] } },
-        axisLine: { lineStyle: { color: "rgba(255,255,255,0.13)" } },
-      },
-      series: [
-        {
-          type: "radar",
-          data: [
-            {
-              name: "Change",
-              value: styleSignals.map((signal) => Math.max(0, Math.min(100, 50 + signal.delta * 160))),
-              areaStyle: { color: "rgba(78,141,255,0.22)" },
-              lineStyle: { color: "#4E8DFF", width: 2 },
-              itemStyle: { color: "#4E8DFF" },
-            },
-            {
-              name: "Baseline",
-              value: styleSignals.map(() => 50),
-              areaStyle: { color: "rgba(255,255,255,0.04)" },
-              lineStyle: { color: "rgba(255,255,255,0.38)", width: 1, type: "dashed" },
-              itemStyle: { color: "rgba(255,255,255,0.55)" },
-            },
-          ],
-        },
-      ],
-    }),
-    [styleSignals],
-  );
+  useEffect(() => {
+    if (storyTabs.some((tab) => tab.value === storyTab)) return;
+    setStoryTab("studio");
+  }, [storyTab, storyTabs]);
+
+  const renderStoryView = () => {
+    const panelSx = {
+      border: "1px solid var(--surface-border)",
+      borderRadius: "8px",
+      background:
+        "radial-gradient(circle at top left, var(--ui-rgba-0-255-170-040), transparent 38%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
+      boxShadow: "var(--surface-shadow-soft)",
+    };
+    const labelSx = {
+      fontFamily: "var(--font-mono)",
+      fontSize: "0.68rem",
+      letterSpacing: "0.14em",
+      textTransform: "uppercase",
+      color: "var(--text-dim)",
+      lineHeight: 1.35,
+    };
+    const titleSx = {
+      fontFamily: "var(--font-display)",
+      fontWeight: 750,
+      letterSpacing: 0,
+      lineHeight: 1.18,
+    };
+    const bodySx = {
+      color: "var(--text-secondary)",
+      lineHeight: 1.55,
+      fontSize: "0.9rem",
+    };
+    const periodName = period === "daily" ? "day" : period === "weekly" ? "week" : "month";
+    const focusTitle =
+      focusLabel === "No activity yet"
+        ? "ArkReflect is waiting for a clear focus."
+        : `This ${periodName} centered on ${focusLabel.toLowerCase()}.`;
+
+    return (
+      <Stack spacing={1.4}>
+        <Box
+          sx={{
+            ...panelSx,
+            p: { xs: 1.5, md: 2 },
+            background:
+              "linear-gradient(90deg, var(--ui-rgba-0-255-170-060), transparent 68%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
+          }}
+        >
+          <Stack
+            direction={{ xs: "column", md: "row" }}
+            spacing={1.4}
+            sx={{ alignItems: { xs: "flex-start", md: "center" }, justifyContent: "space-between" }}
+          >
+            <Box sx={{ minWidth: 0 }}>
+              <Typography sx={labelSx}>Reflection Studio</Typography>
+              <Typography sx={{ ...titleSx, fontSize: { xs: "1.45rem", md: "2rem" }, mt: 0.45 }}>
+                {focusTitle}
+              </Typography>
+              <Typography sx={{ ...bodySx, mt: 0.7, maxWidth: 880 }}>
+                {narrative[0] || "ArkReflect will summarize the period once enough activity is available."}
+              </Typography>
+            </Box>
+            <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap", rowGap: 0.75 }}>
+              <Chip className="arkreflect-pill" icon={<WorkHistoryRoundedIcon />} label={`${totalUnits} reflected`} />
+              <Chip className="arkreflect-pill" icon={<BubbleChartRoundedIcon />} label={`${clusters.length} focus areas`} />
+              <Chip className="arkreflect-pill" icon={<RefreshRoundedIcon />} label={status.title} />
+            </Stack>
+          </Stack>
+        </Box>
+
+        <Box
+          sx={{
+            ...panelSx,
+            p: 0.75,
+            display: "flex",
+            gap: 0.75,
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
+          {storyTabs.map((tab) => {
+            const active = storyTab === tab.value;
+            return (
+              <Button
+                key={tab.value}
+                variant={active ? "contained" : "outlined"}
+                onClick={() => setStoryTab(tab.value)}
+                sx={{
+                  minHeight: 34,
+                  borderRadius: "8px",
+                  color: active ? "#06100d" : "var(--button-text)",
+                  bgcolor: active ? "var(--green)" : "transparent",
+                  borderColor: active ? "var(--green)" : "var(--surface-border)",
+                  "&:hover": {
+                    bgcolor: active ? "var(--green)" : "var(--ui-rgba-0-255-170-060)",
+                    borderColor: "var(--surface-border-strong)",
+                  },
+                }}
+              >
+                {tab.short}
+                <Box component="span" sx={{ ml: 0.75, opacity: 0.72, fontFamily: "var(--font-mono)" }}>
+                  {tab.count}
+                </Box>
+              </Button>
+            );
+          })}
+        </Box>
+
+        {storyTab === "studio" ? (
+        <Grid2 container spacing={1.4}>
+          {sourceRows.length > 0 ? (
+          <Grid2 size={{ xs: 12, lg: 3 }}>
+            <Box sx={{ ...panelSx, p: 1.35, height: "100%" }}>
+              <Typography sx={labelSx}>Activity mix</Typography>
+              <Stack spacing={0.9} sx={{ mt: 1 }}>
+                {sourceRows.slice(0, 5).map((source) => {
+                  const pct = totalUnits > 0 ? Math.round((source.count / totalUnits) * 100) : 0;
+                  return (
+                    <Box key={source.source}>
+                      <Stack direction="row" sx={{ justifyContent: "space-between", mb: 0.45 }}>
+                        <Typography variant="caption">{source.label}</Typography>
+                        <Typography variant="caption">{source.count}</Typography>
+                      </Stack>
+                      <Box sx={{ height: 5, borderRadius: 999, bgcolor: "var(--ui-rgba-255-255-255-040)", overflow: "hidden" }}>
+                        <Box sx={{ height: "100%", width: `${Math.max(6, pct)}%`, bgcolor: tacticalAccent(source.color) }} />
+                      </Box>
+                    </Box>
+                  );
+                })}
+              </Stack>
+            </Box>
+          </Grid2>
+          ) : null}
+
+          <Grid2
+            size={{
+              xs: 12,
+              lg: sourceRows.length > 0 && hasStudioSide ? 6 : sourceRows.length > 0 || hasStudioSide ? 9 : 12,
+            }}
+          >
+            <Box sx={{ ...panelSx, p: { xs: 1.4, md: 1.8 }, minHeight: 430 }}>
+              <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ justifyContent: "space-between", mb: 1.5 }}>
+                <Box>
+                  <Typography sx={labelSx}>What we did</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: { xs: "1.25rem", md: "1.55rem" }, mt: 0.45 }}>
+                    {focusLabel === "No activity yet" ? "Waiting for a useful story." : focusLabel}
+                  </Typography>
+                </Box>
+                <Typography variant="caption" sx={{ alignSelf: { md: "end" } }}>
+                  {rangeLabel}
+                </Typography>
+              </Stack>
+              <Grid2 container spacing={1}>
+                {[
+                  {
+                    label: "What you achieved",
+                    text: `You moved ${clusters.length} focus area${clusters.length === 1 ? "" : "s"} from raw activity into a readable recap.`,
+                  },
+                  {
+                    label: "What went good",
+                    text:
+                      mostChangedStyle && Math.abs(mostChangedStyle.delta) > 0.08
+                        ? `${mostChangedStyle.label} stood out compared with your baseline.`
+                        : "The activity stayed balanced enough to summarize without one source overwhelming the range.",
+                  },
+                  ...(hasProblems ? [{ label: "What went wrong", text: whatWentWrong }] : []),
+                  ...(narrative[1] ? [{ label: "Observation", text: narrative[1] }] : []),
+                  ...(dreamCards[0] ? [{ label: "Dream", text: dreamCards[0].detail }] : []),
+                  {
+                    label: "Evidence",
+                    text: leadCluster
+                      ? `${leadCluster.unit_count} item${leadCluster.unit_count === 1 ? "" : "s"} support the leading focus.`
+                      : "Evidence appears here once a focus area is available.",
+                  },
+                ].map((item) => (
+                  <Grid2 key={item.label} size={{ xs: 12, sm: 6 }}>
+                    <Box
+                      sx={{
+                        p: 1.2,
+                        minHeight: 126,
+                        border: "1px solid var(--surface-border)",
+                        borderRadius: "8px",
+                        background: "var(--ui-rgba-255-255-255-020)",
+                      }}
+                    >
+                      <Typography sx={labelSx}>{item.label}</Typography>
+                      <Typography sx={{ ...bodySx, mt: 0.75 }}>{item.text}</Typography>
+                    </Box>
+                  </Grid2>
+                ))}
+              </Grid2>
+            </Box>
+          </Grid2>
+
+          {hasStudioSide ? (
+          <Grid2 size={{ xs: 12, lg: 3 }}>
+            <Stack spacing={1.4}>
+              {hasTodayStatus ? (
+                <Box sx={{ ...panelSx, p: 1.35 }}>
+                  <Typography sx={labelSx}>Today status</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: "1rem", mt: 0.55 }}>{todayDigestTitle}</Typography>
+                  <Typography sx={{ ...bodySx, mt: 0.65 }}>{todayDigestDetail}</Typography>
+                  <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7, mt: 1 }}>
+                    {todayTotal > 0 ? <Chip size="small" label={`${todayTotal} cached`} variant="outlined" /> : null}
+                    {todayMeaningful > 0 ? <Chip size="small" label={`${todayMeaningful} meaningful`} variant="outlined" /> : null}
+                  </Stack>
+                </Box>
+              ) : null}
+              {suggestedFollowups.length > 0 ? (
+                <Box sx={{ ...panelSx, p: 1.35 }}>
+                  <Typography sx={labelSx}>Follow-ups</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: "1.35rem", mt: 0.55 }}>
+                    {suggestedFollowups.length}
+                  </Typography>
+                  <Typography sx={{ ...bodySx, mt: 0.65 }}>
+                    {suggestedFollowups[0].title}
+                  </Typography>
+                </Box>
+              ) : null}
+              {hasGroupingStatus ? (
+                <Box sx={{ ...panelSx, p: 1.35 }}>
+                  <Typography sx={labelSx}>Grouping</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: "1.35rem", mt: 0.55 }}>
+                    {Math.round(embeddingCoverage * 100)}%
+                  </Typography>
+                  {response?.embedding_status.detail ? (
+                    <Typography sx={{ ...bodySx, mt: 0.65 }}>{response.embedding_status.detail}</Typography>
+                  ) : null}
+                </Box>
+              ) : null}
+            </Stack>
+          </Grid2>
+          ) : null}
+        </Grid2>
+        ) : null}
+
+        {storyTab === "patterns" ? (
+        <Grid2 container spacing={1.4}>
+          <Grid2 size={{ xs: 12, lg: 7 }}>
+            <Box className="arkreflect-panorama" sx={{ ...panelSx, p: 1.35, minHeight: 430 }}>
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1 }}>
+                <Box>
+                  <Typography sx={labelSx}>Pattern Observatory</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
+                    Themes and their evidence links
+                  </Typography>
+                </Box>
+                <Chip className="arkreflect-pill" icon={<BubbleChartRoundedIcon />} label={`${clusters.length} patterns`} />
+              </Stack>
+              <ReactECharts option={constellationOption} style={{ height: 345, width: "100%" }} />
+            </Box>
+          </Grid2>
+          <Grid2 size={{ xs: 12, lg: 5 }}>
+            <Box sx={{ ...panelSx, p: 1.35, minHeight: 430 }}>
+              <Typography sx={labelSx}>Observed patterns</Typography>
+              <Stack spacing={0.9} sx={{ mt: 1 }}>
+                {topClusters.map((cluster, index) => {
+                  const name = clusterLabelById[cluster.id] ?? clusterDisplayLabel(cluster);
+                  const source = sourceMeta(dominantSource(cluster));
+                  return (
+                    <Box
+                      key={cluster.id}
+                      sx={{
+                        display: "grid",
+                        gridTemplateColumns: "34px 1fr auto",
+                        gap: 1,
+                        alignItems: "center",
+                        p: 1,
+                        border: "1px solid var(--surface-border)",
+                        borderRadius: "8px",
+                        background: "var(--ui-rgba-255-255-255-020)",
+                      }}
+                    >
+                      <Box sx={{ color: tacticalAccent(source.color) }}>{sourceIcon(source.label)}</Box>
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography sx={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {name}
+                        </Typography>
+                        <Typography variant="caption">{relatedHistoryText(cluster.related_history)}</Typography>
+                      </Box>
+                      <Typography sx={{ fontFamily: "var(--font-mono)", color: tacticalAccent(source.color), fontWeight: 800 }}>
+                        {String(index + 1).padStart(2, "0")}
+                      </Typography>
+                    </Box>
+                  );
+                })}
+              </Stack>
+            </Box>
+          </Grid2>
+        </Grid2>
+        ) : null}
+
+        {storyTab === "achievements" ? (
+        <Box sx={{ ...panelSx, p: 1.35 }}>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1 }}>
+            <Box>
+              <Typography sx={labelSx}>Achievement Canvas</Typography>
+              <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
+                Wins, misses, and momentum
+              </Typography>
+            </Box>
+            <Chip className="arkreflect-pill" icon={<AutoGraphRoundedIcon />} label={`${learnedCount} learned signals`} />
+          </Stack>
+          <Grid2 container spacing={1}>
+            {achievementCards.map((card) => (
+              <Grid2 key={card.label} size={{ xs: 12, sm: 6, lg: 3 }}>
+                <Box
+                  sx={{
+                    p: 1.25,
+                    minHeight: 138,
+                    border: "1px solid var(--surface-border)",
+                    borderRadius: "8px",
+                    background: "var(--ui-rgba-255-255-255-020)",
+                  }}
+                >
+                  <Typography sx={labelSx}>{card.label}</Typography>
+                  <Typography sx={{ fontFamily: "var(--font-mono)", fontSize: "2rem", fontWeight: 850, color: card.tone, mt: 0.8 }}>
+                    {card.value}
+                  </Typography>
+                  <Typography sx={{ ...bodySx, mt: 0.5 }}>{card.detail}</Typography>
+                </Box>
+              </Grid2>
+            ))}
+          </Grid2>
+        </Box>
+        ) : null}
+
+        {storyTab === "dreams" ? (
+        <Box sx={{ ...panelSx, p: 1.35 }}>
+          <Typography sx={labelSx}>Dream Board</Typography>
+          <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35, mb: 1 }}>
+            What this period points toward
+          </Typography>
+          <Grid2 container spacing={1}>
+            {dreamCards.map((card, index) => (
+              <Grid2 key={card.title} size={{ xs: 12, md: index === 0 ? 6 : 3 }}>
+                <Box
+                  sx={{
+                    p: 1.25,
+                    minHeight: 150,
+                    border: "1px solid var(--surface-border)",
+                    borderRadius: "8px",
+                    background:
+                      index === 0
+                        ? "radial-gradient(circle at top left, var(--ui-rgba-100-160-230-180), transparent 46%), var(--ui-rgba-255-255-255-020)"
+                        : "var(--ui-rgba-255-255-255-020)",
+                  }}
+                >
+                  <Typography sx={labelSx}>Dream {index + 1}</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: "1rem", mt: 0.65 }}>{card.title}</Typography>
+                  <Typography sx={{ ...bodySx, mt: 0.65 }}>{card.detail}</Typography>
+                </Box>
+              </Grid2>
+            ))}
+          </Grid2>
+        </Box>
+        ) : null}
+
+        {storyTab === "replay" && showWeeklyReplay ? (
+          <Box sx={{ ...panelSx, p: 1.35 }}>
+            <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ justifyContent: "space-between", mb: 1 }}>
+              <Box>
+                <Typography sx={labelSx}>Weekly Replay</Typography>
+                <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
+                  Step through the story when enough timestamps exist
+                </Typography>
+              </Box>
+              <Chip className="arkreflect-pill" icon={<MonitorHeartRoundedIcon />} label={`${replayUnits.length} scenes`} />
+            </Stack>
+            <Grid2 container spacing={1.2}>
+              <Grid2 size={{ xs: 12, lg: 5 }}>
+                <ReactECharts option={activityOption} style={{ height: 170, width: "100%" }} />
+              </Grid2>
+              <Grid2 size={{ xs: 12, lg: 7 }}>
+                <Box
+                  sx={{
+                    display: "grid",
+                    gridTemplateColumns: { xs: "1fr", sm: "repeat(2, minmax(0, 1fr))", xl: "repeat(3, minmax(0, 1fr))" },
+                    gap: 1,
+                  }}
+                >
+                  {replayUnits.map((unit, index) => (
+                    <Box
+                      key={unit.id}
+                      sx={{
+                        p: 1,
+                        minHeight: 112,
+                        border: "1px solid var(--surface-border)",
+                        borderRadius: "8px",
+                        background: index === 0 ? "var(--ui-rgba-0-255-170-060)" : "var(--ui-rgba-255-255-255-020)",
+                      }}
+                    >
+                      <Typography sx={labelSx}>
+                        Scene {String(index + 1).padStart(2, "0")} - {formatUiDateTime(unit.occurred_at, { fallback: "time pending" })}
+                      </Typography>
+                      <Typography sx={{ fontWeight: 800, mt: 0.65 }}>{unitDisplayTitle(unit)}</Typography>
+                      <Typography sx={{ ...bodySx, mt: 0.45 }}>
+                        {(unit.summary || unit.content_preview || sourceMeta(unit.source_kind).group).slice(0, 132)}
+                      </Typography>
+                    </Box>
+                  ))}
+                </Box>
+              </Grid2>
+            </Grid2>
+          </Box>
+        ) : null}
+      </Stack>
+    );
+  };
 
   return (
     <WorkspacePageShell spacing={1.4}>
@@ -1368,573 +1846,130 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
 
       {reflectQ.error ? <Alert severity="error">{errMessage(reflectQ.error)}</Alert> : null}
       {refreshMutation.error ? <Alert severity="error">{errMessage(refreshMutation.error)}</Alert> : null}
-      <Box
-        className="list-shell arkreflect-status"
-        sx={{
-          p: 1.25,
-          borderColor: status.active ? "rgba(0,168,168,0.34)" : "rgba(255,255,255,0.1)",
-        }}
-      >
-        <Stack direction="row" spacing={1.1} sx={{ alignItems: "center" }}>
-          <InsightsRoundedIcon color={status.active ? "primary" : "disabled"} fontSize="small" />
-          <Box sx={{ minWidth: 0, flex: 1 }}>
-            <span className="arkreflect-section-eyebrow">Reflect Runtime</span>
-            <Typography variant="body2" sx={{ fontWeight: 800 }}>
-              {status.title}
-            </Typography>
-            <Typography variant="caption" className="arkreflect-section-subtitle">
-              {status.detail}
-            </Typography>
-          </Box>
-          <Chip
-            size="small"
-            label={
-              response?.embedding_status.mode === "semantic"
-                ? `${Math.round(embeddingCoverage * 100)}% grouped`
-                : "Preparing"
-            }
-            variant="outlined"
-          />
-        </Stack>
-        {status.active || reflectQ.isFetching ? <LinearProgress sx={{ mt: 1.1, borderRadius: 999 }} /> : null}
-      </Box>
 
-      <Box
-        className="list-shell arkreflect-status"
-        sx={{
-          p: 1.25,
-          borderColor:
-            todayResponse?.daily_digest_status.enabled && todayMeaningful > 0
-              ? "rgba(78,141,255,0.34)"
-              : "rgba(255,255,255,0.1)",
-        }}
-      >
-        <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ alignItems: { xs: "flex-start", md: "center" } }}>
-          <Stack direction="row" spacing={1.1} sx={{ alignItems: "center", minWidth: 0, flex: 1 }}>
-            <NotificationsActiveRoundedIcon
-              color={todayResponse?.daily_digest_status.enabled ? "primary" : "disabled"}
-              fontSize="small"
-            />
-            <Box sx={{ minWidth: 0 }}>
-              <span className="arkreflect-section-eyebrow">Today Status</span>
-              <Typography variant="body2" sx={{ fontWeight: 850 }}>
-                {todayDigestTitle}
-              </Typography>
-              <Typography variant="caption" className="arkreflect-section-subtitle">
-                {todayDigestDetail}
-              </Typography>
-            </Box>
-          </Stack>
-          <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap", rowGap: 0.75 }}>
-            <Chip size="small" label={`${todayTotal} cached`} variant="outlined" />
-            <Chip size="small" label={`${todayMeaningful} meaningful`} color={todayMeaningful > 0 ? "primary" : "default"} variant="outlined" />
-            {todayResponse?.daily_digest_status.summary &&
-            (!todayResponse.daily_digest_status.target_date ||
-              todayResponse.daily_digest_status.target_date ===
-                todayResponse.daily_digest_status.today_date) ? (
-              <Chip size="small" label="Summary prepared" color="success" variant="outlined" />
-            ) : null}
-          </Stack>
-        </Stack>
-        {todayResponse?.daily_digest_status.summary &&
-        (!todayResponse.daily_digest_status.target_date ||
-          todayResponse.daily_digest_status.target_date ===
-            todayResponse.daily_digest_status.today_date) ? (
-          <Typography
-            variant="body2"
-            sx={{
-              mt: 1,
-              whiteSpace: "pre-line",
-              color: "text.primary",
-              lineHeight: 1.55,
-            }}
-          >
-            {todayResponse.daily_digest_status.summary}
-          </Typography>
-        ) : null}
-        {todayQ.isFetching ? <LinearProgress sx={{ mt: 1.1, borderRadius: 999 }} /> : null}
-      </Box>
-
-      <Box className="list-shell arkreflect-narrative" sx={{ p: { xs: 1.4, md: 2 } }}>
-        <Stack spacing={1.3}>
-          <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
-            <InsightsRoundedIcon color="primary" />
-            <Box>
-              <span className="arkreflect-section-eyebrow">What I noticed</span>
-              <Typography variant="h6" sx={{ fontWeight: 850, lineHeight: 1.2 }}>
-                A plain-language read of this period
-              </Typography>
-              <Typography variant="body2" className="arkreflect-section-subtitle">
-                Before the charts. Numbers below.
-              </Typography>
-            </Box>
-          </Stack>
-          <Stack spacing={0.8}>
-            {narrative.map((line) => (
-              <Typography key={line} className="arkreflect-narrative-line" variant="body1">
-                {line}
-              </Typography>
-            ))}
-          </Stack>
-        </Stack>
-      </Box>
-
-      <Box
-        className="list-shell arkreflect-panorama"
-        sx={{
-          p: { xs: 1.2, md: 1.6 },
-        }}
-      >
-        <Box className="arkreflect-panorama-backdrop" />
-        <Box className="arkreflect-panorama-grid" />
-        <Stack
-          direction="row"
-          sx={{ justifyContent: "space-between", alignItems: "flex-start", mb: 1, position: "relative", zIndex: 3 }}
+      {/* === ARKREFLECT STORY VIEW === */}
+      {!hasReflectContent ? (
+        <Box
+          className="arkreflect-status"
+          sx={{
+            p: { xs: 2.2, md: 3 },
+            border: "1px solid rgba(120, 200, 220, 0.18)",
+            borderRadius: "3px",
+            background:
+              "linear-gradient(180deg, rgba(7, 13, 18, 0.96), rgba(5, 9, 12, 0.94))",
+            boxShadow: "0 24px 60px rgba(0, 0, 0, 0.34)",
+          }}
         >
-          <Box>
-            <span className="arkreflect-section-eyebrow">Panorama</span>
-            <Typography variant="h6" sx={{ fontWeight: 850, lineHeight: 1.2 }}>
-              Focus areas across this period
-            </Typography>
-            <Typography variant="body2" className="arkreflect-section-subtitle">
-              Islands are focus areas. Bridges connect this period to similar history.
-            </Typography>
-          </Box>
-          <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", justifyContent: "flex-end", gap: 0.7 }}>
-            <Chip
-              className="arkreflect-pill"
-              size="small"
-              icon={<BubbleChartRoundedIcon />}
-              label={`${clusters.length} focus areas`}
-            />
-            <Chip
-              className="arkreflect-pill"
-              size="small"
-              icon={<WorkHistoryRoundedIcon />}
-              label={`${recurringCount} recurring`}
-            />
-          </Stack>
-        </Stack>
-        {clusters.length > 0 ? (
-          <Box className="arkreflect-panorama-canvas">
-            <ReactECharts option={constellationOption} style={{ height: 460, width: "100%" }} />
-          </Box>
-        ) : (
-          <Box className="arkreflect-panorama-empty" sx={{ height: 420, display: "grid", placeItems: "center", textAlign: "center" }}>
-            <Stack spacing={0.8} sx={{ alignItems: "center" }}>
-              <BubbleChartRoundedIcon color="disabled" />
-              <Typography color="text.secondary">
-                {status.active ? "Preparing the first panorama." : "No activity found in this range."}
-              </Typography>
-            </Stack>
-          </Box>
-        )}
-      </Box>
-
-      <Grid2 container spacing={1.2}>
-        <Grid2 size={{ xs: 12, lg: 5 }}>
-          <Box className="list-shell arkreflect-grid-pane" sx={{ p: 1.2, minHeight: 360 }}>
-            <Stack direction="row" spacing={1} sx={{ alignItems: "center", px: 0.4 }}>
-              <AutoGraphRoundedIcon color="success" />
-              <Box>
-                <Typography variant="subtitle1" sx={{ fontWeight: 800 }}>
-                  Working style
-                </Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Change versus your recent baseline.
-                </Typography>
-              </Box>
-            </Stack>
-            <ReactECharts option={radarOption} style={{ height: 292, width: "100%" }} />
-          </Box>
-        </Grid2>
-        <Grid2 size={{ xs: 12, lg: 7 }}>
-          <Box className="list-shell arkreflect-grid-pane" sx={{ p: 1.2, minHeight: 360 }}>
-            <Stack direction="row" spacing={1} sx={{ alignItems: "center", px: 0.4 }}>
-              <MonitorHeartRoundedIcon color="info" />
-              <Box>
-                <Typography variant="subtitle1" sx={{ fontWeight: 800 }}>
-                  Background agent lane
-                </Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Apps, goals, watchers, Sentinel, ArkPulse, and ArkEvolve.
-                </Typography>
-              </Box>
-            </Stack>
+          <Stack
+            direction={{ xs: "column", md: "row" }}
+            spacing={2}
+            sx={{ alignItems: { xs: "flex-start", md: "center" } }}
+          >
             <Box
               sx={{
+                width: 46,
+                height: 46,
+                borderRadius: "6px",
+                border: "1px solid rgba(120, 200, 220, 0.28)",
+                color: "var(--cyan-glow)",
                 display: "grid",
-                gridTemplateColumns: {
-                  xs: "repeat(2, minmax(0, 1fr))",
-                  md: "repeat(3, minmax(0, 1fr))",
-                },
-                gap: 1,
-                mt: 1.2,
+                placeItems: "center",
+                background: "rgba(120, 200, 220, 0.07)",
+                flex: "0 0 auto",
               }}
             >
-              {(["app", "goal", "watcher", "sentinel", "arkpulse", "arkevolve"] as const).map(
-                (source) => {
-                  const meta = sourceMeta(source);
-                  const count = countForSource(response, source);
-                  const active = count > 0;
-                  const buckets = backgroundSparklines[source] ?? [];
-                  const bucketMax = buckets.reduce((m, v) => (v > m ? v : m), 0);
-                  const showSparkline = active && bucketMax > 0;
-                  return (
-                    <Box
-                      key={source}
-                      sx={{
-                        p: 1.2,
-                        borderRadius: "8px",
-                        border: `1px solid ${active ? `${meta.color}55` : "rgba(255,255,255,0.08)"}`,
-                        background: active
-                          ? `linear-gradient(180deg, ${meta.color}1f, rgba(7,13,18,0.4))`
-                          : "rgba(255,255,255,0.02)",
-                        minWidth: 0,
-                        position: "relative",
-                        overflow: "hidden",
-                      }}
-                    >
-                      <Stack
-                        direction="row"
-                        spacing={0.8}
-                        sx={{ alignItems: "center", mb: 0.6 }}
-                      >
-                        <Box
-                          sx={{
-                            width: 10,
-                            height: 10,
-                            borderRadius: "50%",
-                            flex: "0 0 auto",
-                            background: active ? meta.color : "rgba(255,255,255,0.2)",
-                            boxShadow: active ? `0 0 10px ${meta.color}` : "none",
-                          }}
-                        />
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            color: active ? "#edf7f4" : "rgba(255,255,255,0.42)",
-                            textTransform: "uppercase",
-                            letterSpacing: "0.08em",
-                            fontWeight: 700,
-                            fontSize: "0.68rem",
-                            whiteSpace: "nowrap",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                          }}
-                        >
-                          {meta.label}
-                        </Typography>
-                      </Stack>
-                      <Stack
-                        direction="row"
-                        spacing={1}
-                        sx={{ alignItems: "flex-end", justifyContent: "space-between" }}
-                      >
-                        <Typography
-                          variant="h5"
-                          sx={{
-                            fontWeight: 700,
-                            color: active ? meta.color : "rgba(255,255,255,0.3)",
-                            fontVariantNumeric: "tabular-nums",
-                            lineHeight: 1,
-                            fontFamily: "var(--font-display)",
-                          }}
-                        >
-                          {count}
-                        </Typography>
-                        {showSparkline ? (
-                          <Box
-                            sx={{
-                              display: "flex",
-                              alignItems: "flex-end",
-                              gap: "3px",
-                              height: 20,
-                              flex: "0 1 auto",
-                              minWidth: 56,
-                            }}
-                          >
-                            {buckets.map((value, idx) => {
-                              const heightPct =
-                                value > 0
-                                  ? Math.max(18, Math.round((value / bucketMax) * 100))
-                                  : 10;
-                              return (
-                                <Box
-                                  key={idx}
-                                  sx={{
-                                    width: 4,
-                                    height: `${heightPct}%`,
-                                    borderRadius: "1px",
-                                    background:
-                                      value > 0 ? meta.color : `${meta.color}33`,
-                                    opacity: value > 0 ? 0.92 : 0.35,
-                                    boxShadow:
-                                      value > 0 ? `0 0 4px ${meta.color}` : "none",
-                                    transition:
-                                      "height 240ms ease, opacity 240ms ease",
-                                  }}
-                                  title={`Bucket ${idx + 1}: ${value} event${value === 1 ? "" : "s"}`}
-                                />
-                              );
-                            })}
-                          </Box>
-                        ) : null}
-                      </Stack>
-                    </Box>
-                  );
-                },
-              )}
+              <AutoGraphRoundedIcon />
             </Box>
-          </Box>
-        </Grid2>
-      </Grid2>
-
-      <Grid2 container spacing={1.2}>
-        <Grid2 size={{ xs: 12, lg: 7 }}>
-          <Box className="list-shell arkreflect-grid-pane" sx={{ p: 1.2, minHeight: 168 }}>
-            <Typography variant="subtitle1" sx={{ fontWeight: 800, px: 0.4 }}>
-              Timeline ribbon
-            </Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ px: 0.4 }}>
-              The rhythm of this period.
-            </Typography>
-            {allUnits.length > 0 ? (
-              <ReactECharts option={activityOption} style={{ height: 110, width: "100%" }} />
-            ) : (
-              <Box sx={{ height: 110, display: "grid", placeItems: "center", textAlign: "center" }}>
-                <Typography color="text.secondary">No rhythm to show yet.</Typography>
-              </Box>
-            )}
-          </Box>
-        </Grid2>
-        <Grid2 size={{ xs: 12, lg: 5 }}>
-          <Box className="list-shell arkreflect-grid-pane" sx={{ p: 1.2, minHeight: 330 }}>
-            <Stack direction="row" spacing={1} sx={{ alignItems: "center", px: 0.4 }}>
-              <DonutLargeRoundedIcon color="warning" />
-              <Box>
-                <Typography variant="subtitle1" sx={{ fontWeight: 800 }}>
-                  What contributed
-                </Typography>
-                <Typography variant="body2" color="text.secondary">
-                  The sources behind the recap.
-                </Typography>
-              </Box>
-            </Stack>
-            {sourceRows.length > 0 ? (
-              <ReactECharts option={sourceDonutOption} style={{ height: 265, width: "100%" }} />
-            ) : (
-              <Box sx={{ height: 265, display: "grid", placeItems: "center", textAlign: "center" }}>
-                <Typography color="text.secondary">Sources will appear after the recap is prepared.</Typography>
-              </Box>
-            )}
-          </Box>
-        </Grid2>
-      </Grid2>
-
-      <Accordion
-        disableGutters
-        sx={{
-          bgcolor: "rgba(255,255,255,0.035)",
-          border: "1px solid rgba(255,255,255,0.1)",
-          borderRadius: "8px !important",
-          color: "text.primary",
-          boxShadow: "none",
-          "&:before": { display: "none" },
-        }}
-      >
-        <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
-          <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
-            <WorkHistoryRoundedIcon color="info" fontSize="small" />
-            <Typography sx={{ fontWeight: 800 }}>Examples and evidence</Typography>
-            <Chip size="small" label={`${totalUnits} item${totalUnits === 1 ? "" : "s"}`} />
+            <Box sx={{ flex: 1, minWidth: 0 }}>
+              <Typography
+                sx={{
+                  fontFamily: "var(--font-display)",
+                  fontSize: { xs: "1.25rem", md: "1.45rem" },
+                  fontWeight: 750,
+                  color: "rgba(237,247,244,0.96)",
+                  mb: 0.5,
+                }}
+              >
+                {status.active ? status.title : "Still collecting data"}
+              </Typography>
+              <Typography
+                sx={{
+                  maxWidth: 820,
+                  color: "rgba(213,228,225,0.72)",
+                  lineHeight: 1.55,
+                }}
+              >
+                {emptyStateDetail}
+              </Typography>
+            </Box>
+            <Chip
+              className="arkreflect-pill"
+              label={emptyStateChip}
+              icon={status.active ? <RefreshRoundedIcon /> : <WorkHistoryRoundedIcon />}
+              sx={{ flex: "0 0 auto" }}
+            />
           </Stack>
-        </AccordionSummary>
-        <AccordionDetails sx={{ pt: 0.5, pb: 1 }}>
-          {(() => {
-            const MAX_CLUSTERS = 6;
-            const ranked = [...clusters].sort((a, b) => b.unit_count - a.unit_count).slice(0, MAX_CLUSTERS);
-            const hiddenClusters = clusters.length - ranked.length;
-            const monoFont = "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace";
-            const headerCellSx = {
-              fontSize: 8.5,
-              fontFamily: monoFont,
-              color: "rgba(180,210,225,0.42)",
-              letterSpacing: 1.2,
-              fontWeight: 600,
-              textTransform: "uppercase" as const,
-              py: 0.5,
-            };
-            return (
-              <Box>
+          <LinearProgress
+            variant={status.active ? "indeterminate" : "determinate"}
+            value={status.active ? undefined : 0}
+            sx={{ mt: 2.4, mb: 2 }}
+          />
+          <Grid2 container spacing={1.2}>
+            {[
+              { label: "Range", value: selectedRangeLabel || "Selected period" },
+              {
+                label: "Cached units",
+                value: String(response?.cache_status.cached_units ?? totalUnits),
+              },
+              {
+                label: "Source signals",
+                value: String(sourceSignalCount),
+              },
+            ].map((item) => (
+              <Grid2 key={item.label} size={{ xs: 12, sm: 4 }}>
                 <Box
                   sx={{
-                    display: "grid",
-                    gridTemplateColumns: "28px 44px 1fr 56px 88px 96px",
-                    columnGap: 1.2,
-                    px: 0.8,
-                    borderBottom: "1px solid rgba(120,200,220,0.14)",
-                    alignItems: "center",
+                    p: 1.4,
+                    border: "1px solid rgba(120, 200, 220, 0.12)",
+                    borderRadius: "3px",
+                    background: "rgba(255,255,255,0.025)",
+                    minHeight: 78,
                   }}
                 >
-                  <Box sx={headerCellSx}>idx</Box>
-                  <Box sx={headerCellSx}>code</Box>
-                  <Box sx={headerCellSx}>cluster</Box>
-                  <Box sx={{ ...headerCellSx, textAlign: "right" }}>units</Box>
-                  <Box sx={headerCellSx}>recent</Box>
-                  <Box sx={headerCellSx}>signal</Box>
+                  <Typography
+                    sx={{
+                      fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+                      fontSize: "0.66rem",
+                      letterSpacing: "0.16em",
+                      textTransform: "uppercase",
+                      color: "rgba(180, 210, 225, 0.52)",
+                      mb: 0.8,
+                    }}
+                  >
+                    {item.label}
+                  </Typography>
+                  <Typography
+                    sx={{
+                      color: "rgba(237,247,244,0.9)",
+                      fontWeight: 700,
+                      lineHeight: 1.25,
+                    }}
+                  >
+                    {item.value}
+                  </Typography>
                 </Box>
-                {ranked.map((cluster, i) => {
-                  const source = dominantSource(cluster);
-                  const meta = sourceMeta(source);
-                  const stroke = tacticalAccent(meta.color);
-                  const code = tacticalCode(source);
-                  const idx = String(i + 1).padStart(2, "0");
-                  const dedup = new Set<string>();
-                  let uniqueCount = 0;
-                  let mostRecent = 0;
-                  for (const u of cluster.units) {
-                    const k = unitDisplayTitle(u).trim().toLowerCase();
-                    if (!dedup.has(k)) {
-                      dedup.add(k);
-                      uniqueCount += 1;
-                    }
-                    const ts = Date.parse(u.occurred_at);
-                    if (Number.isFinite(ts) && ts > mostRecent) mostRecent = ts;
-                  }
-                  const recentLabel = mostRecent > 0
-                    ? formatUiDateTime(new Date(mostRecent).toISOString(), { fallback: "—" })
-                    : "—";
-                  const recurring = cluster.related_history.mode === "recurring";
-                  const title = (clusterLabelById[cluster.id] ?? clusterDisplayLabel(cluster)).trim();
-                  return (
-                    <Box
-                      key={cluster.id}
-                      sx={{
-                        display: "grid",
-                        gridTemplateColumns: "28px 44px 1fr 56px 88px 96px",
-                        columnGap: 1.2,
-                        px: 0.8,
-                        py: 0.7,
-                        alignItems: "center",
-                        borderBottom: "1px solid rgba(120,200,220,0.06)",
-                        transition: "background 160ms ease",
-                        "&:hover": { background: "rgba(120,200,220,0.04)" },
-                      }}
-                    >
-                      <Box sx={{ fontSize: 9.5, fontFamily: monoFont, color: "rgba(180,210,225,0.5)", letterSpacing: 0.6 }}>
-                        {idx}
-                      </Box>
-                      <Box
-                        sx={{
-                          fontSize: 9.5,
-                          fontFamily: monoFont,
-                          color: stroke,
-                          letterSpacing: 0.8,
-                          fontWeight: 600,
-                          border: `1px solid ${stroke}`,
-                          borderRadius: 0.5,
-                          px: 0.5,
-                          py: 0.1,
-                          textAlign: "center",
-                          width: "fit-content",
-                          opacity: 0.92,
-                        }}
-                      >
-                        {code}
-                      </Box>
-                      <Box sx={{ minWidth: 0 }}>
-                        <Typography
-                          sx={{
-                            fontSize: 12,
-                            fontFamily: monoFont,
-                            fontWeight: 600,
-                            color: "rgba(232,242,250,0.92)",
-                            letterSpacing: 0.3,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {title.toUpperCase()}
-                        </Typography>
-                        {uniqueCount < cluster.unit_count ? (
-                          <Typography
-                            sx={{
-                              fontSize: 9,
-                              fontFamily: monoFont,
-                              color: "rgba(180,210,225,0.4)",
-                              letterSpacing: 0.4,
-                              mt: 0.1,
-                            }}
-                          >
-                            {uniqueCount} unique · {cluster.unit_count - uniqueCount} repeat{cluster.unit_count - uniqueCount === 1 ? "" : "s"}
-                          </Typography>
-                        ) : null}
-                      </Box>
-                      <Box
-                        sx={{
-                          fontSize: 11,
-                          fontFamily: monoFont,
-                          color: stroke,
-                          fontWeight: 700,
-                          textAlign: "right",
-                          letterSpacing: 0.4,
-                        }}
-                      >
-                        {String(cluster.unit_count).padStart(3, "0")}
-                      </Box>
-                      <Box
-                        sx={{
-                          fontSize: 9.5,
-                          fontFamily: monoFont,
-                          color: "rgba(180,210,225,0.55)",
-                          letterSpacing: 0.4,
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                        }}
-                      >
-                        {recentLabel}
-                      </Box>
-                      <Box
-                        sx={{
-                          fontSize: 9,
-                          fontFamily: monoFont,
-                          color: recurring ? stroke : "rgba(180,210,225,0.45)",
-                          letterSpacing: 0.6,
-                          fontWeight: 500,
-                        }}
-                      >
-                        {recurring ? "◆ RECURRING" : "◇ NEW"}
-                      </Box>
-                    </Box>
-                  );
-                })}
-                <Box
-                  sx={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    px: 0.8,
-                    pt: 1,
-                    fontSize: 8.5,
-                    fontFamily: monoFont,
-                    color: "rgba(180,210,225,0.42)",
-                    letterSpacing: 0.8,
-                  }}
-                >
-                  <span>◢ TOP {ranked.length} BY ACTIVITY</span>
-                  <span>
-                    {hiddenClusters > 0
-                      ? `${hiddenClusters} CLUSTER${hiddenClusters === 1 ? "" : "S"} OMITTED · ${totalUnits} TOTAL UNITS`
-                      : `${totalUnits} TOTAL UNITS`}
-                  </span>
-                </Box>
-              </Box>
-            );
-          })()}
-        </AccordionDetails>
-      </Accordion>
+              </Grid2>
+            ))}
+          </Grid2>
+          {response?.refresh_status.last_error ? (
+            <Alert severity="warning" sx={{ mt: 2 }}>
+              {response.refresh_status.last_error}
+            </Alert>
+          ) : null}
+        </Box>
+      ) : (
+        renderStoryView()
+      )}
 
       {response?.generated_at ? (
         <Typography variant="caption" color="text.secondary" sx={{ px: 0.5 }}>

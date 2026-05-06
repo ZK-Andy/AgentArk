@@ -497,10 +497,10 @@ fn parse_strategy_candidate_profile(
 }
 
 fn is_foreign_key_constraint_error(error: &sea_orm::DbErr) -> bool {
-    error
-        .to_string()
-        .to_ascii_lowercase()
-        .contains("foreign key constraint failed")
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("foreign key constraint failed")
+        || text.contains("violates foreign key constraint")
+        || text.contains("sqlstate(23503)")
 }
 
 fn decrypt_swarm_delegation_model(model: &mut swarm_delegation::Model) {
@@ -2328,8 +2328,8 @@ impl Storage {
         Condition::any()
             .add(knowledge_item::Column::Source.is_null())
             .add(knowledge_item::Column::Source.is_not_in([
-                crate::core::product_help::CURATED_SOURCE,
-                crate::core::product_help::RUNTIME_SOURCE,
+                crate::core::agentark_knowledge::CURATED_SOURCE,
+                crate::core::agentark_knowledge::RUNTIME_SOURCE,
             ]))
     }
 
@@ -3188,7 +3188,14 @@ impl Storage {
 
     #[allow(dead_code)]
     pub async fn insert_execution_run(&self, run: &crate::core::ExecutionRun) -> Result<()> {
-        execution_run::Entity::insert(execution_run::ActiveModel {
+        let degradation = encrypt_storage_string(&serde_json::to_string(&run.degradation)?)?;
+        let last_error = encrypt_optional_storage_string(run.last_error.as_deref())?;
+        let result_summary = encrypt_optional_storage_string(run.result_summary.as_deref())?;
+        let request_message = encrypt_optional_storage_string(run.request_message.as_deref())?;
+        let attempted_models =
+            encrypt_storage_string(&serde_json::to_string(&run.attempted_models)?)?;
+
+        let insert_result = execution_run::Entity::insert(execution_run::ActiveModel {
             id: Set(run.id.clone()),
             kind: Set(run.kind.clone()),
             request_id: Set(run.request_id.clone()),
@@ -3199,22 +3206,14 @@ impl Storage {
             attempt: Set(run.attempt as i32),
             deadline_at: Set(run.deadline_at.clone()),
             cancellation_requested: Set(run.cancellation_requested),
-            degradation: Set(encrypt_storage_string(&serde_json::to_string(
-                &run.degradation,
-            )?)?),
-            last_error: Set(encrypt_optional_storage_string(run.last_error.as_deref())?),
-            result_summary: Set(encrypt_optional_storage_string(
-                run.result_summary.as_deref(),
-            )?),
+            degradation: Set(degradation.clone()),
+            last_error: Set(last_error.clone()),
+            result_summary: Set(result_summary.clone()),
             trace_id: Set(run.trace_id.clone()),
             conversation_id: Set(run.conversation_id.clone()),
             channel: Set(run.channel.clone()),
-            request_message: Set(encrypt_optional_storage_string(
-                run.request_message.as_deref(),
-            )?),
-            attempted_models: Set(encrypt_storage_string(&serde_json::to_string(
-                &run.attempted_models,
-            )?)?),
+            request_message: Set(request_message.clone()),
+            attempted_models: Set(attempted_models.clone()),
             created_at: Set(run.created_at.clone()),
             updated_at: Set(run.updated_at.clone()),
         })
@@ -3242,7 +3241,65 @@ impl Storage {
                 .to_owned(),
         )
         .exec(&self.db)
-        .await?;
+        .await;
+        if let Err(error) = insert_result {
+            if run.trace_id.is_some() && is_foreign_key_constraint_error(&error) {
+                tracing::warn!(
+                    "Retrying execution run upsert '{}' without trace_id after FK failure: {}",
+                    run.id,
+                    error
+                );
+                execution_run::Entity::insert(execution_run::ActiveModel {
+                    id: Set(run.id.clone()),
+                    kind: Set(run.kind.clone()),
+                    request_id: Set(run.request_id.clone()),
+                    status: Set(run.status.as_str().to_string()),
+                    current_stage: Set(run.current_stage.clone()),
+                    lease_owner: Set(run.lease_owner.clone()),
+                    lease_expires_at: Set(run.lease_expires_at.clone()),
+                    attempt: Set(run.attempt as i32),
+                    deadline_at: Set(run.deadline_at.clone()),
+                    cancellation_requested: Set(run.cancellation_requested),
+                    degradation: Set(degradation),
+                    last_error: Set(last_error),
+                    result_summary: Set(result_summary),
+                    trace_id: Set(None),
+                    conversation_id: Set(run.conversation_id.clone()),
+                    channel: Set(run.channel.clone()),
+                    request_message: Set(request_message),
+                    attempted_models: Set(attempted_models),
+                    created_at: Set(run.created_at.clone()),
+                    updated_at: Set(run.updated_at.clone()),
+                })
+                .on_conflict(
+                    OnConflict::column(execution_run::Column::Id)
+                        .update_columns([
+                            execution_run::Column::RequestId,
+                            execution_run::Column::Status,
+                            execution_run::Column::CurrentStage,
+                            execution_run::Column::LeaseOwner,
+                            execution_run::Column::LeaseExpiresAt,
+                            execution_run::Column::Attempt,
+                            execution_run::Column::DeadlineAt,
+                            execution_run::Column::CancellationRequested,
+                            execution_run::Column::Degradation,
+                            execution_run::Column::LastError,
+                            execution_run::Column::ResultSummary,
+                            execution_run::Column::TraceId,
+                            execution_run::Column::ConversationId,
+                            execution_run::Column::Channel,
+                            execution_run::Column::RequestMessage,
+                            execution_run::Column::AttemptedModels,
+                            execution_run::Column::UpdatedAt,
+                        ])
+                        .to_owned(),
+                )
+                .exec(&self.db)
+                .await?;
+            } else {
+                return Err(error.into());
+            }
+        }
         Ok(())
     }
 
@@ -5230,6 +5287,15 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn get_memory_capture_event(
+        &self,
+        id: &str,
+    ) -> Result<Option<memory_capture_event::Model>> {
+        Ok(memory_capture_event::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
+    }
+
     pub async fn list_memory_capture_events_by_statuses(
         &self,
         statuses: &[&str],
@@ -6696,10 +6762,7 @@ impl Storage {
     }
 
     /// Create a conversation only if another path has not already created it.
-    pub async fn create_conversation_if_absent(
-        &self,
-        conv: &conversation::Model,
-    ) -> Result<bool> {
+    pub async fn create_conversation_if_absent(&self, conv: &conversation::Model) -> Result<bool> {
         if self.get_conversation(&conv.id).await?.is_some() {
             return Ok(false);
         }
@@ -7053,6 +7116,16 @@ impl Storage {
         }
     }
 
+    pub async fn get_message(&self, id: &str) -> Result<Option<message::Model>> {
+        let mut message = message::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        if let Some(message) = &mut message {
+            message.content = decrypt_storage_string(&message.content);
+        }
+        Ok(message)
+    }
+
     /// Get messages for a conversation
     pub async fn get_messages(
         &self,
@@ -7175,10 +7248,30 @@ impl Storage {
 
     // ==================== Documents ====================
 
-    fn user_visible_document_filter() -> SimpleExpr {
-        document::Column::Id
-            .starts_with(crate::core::product_help::DOCUMENT_ID_PREFIX.to_string())
-            .not()
+    fn user_visible_document_filter() -> Condition {
+        // Internal AgentArk manuals/capability docs are indexed for retrieval,
+        // but they are not user-uploaded library documents.
+        Condition::all()
+            .add(
+                document::Column::Id
+                    .starts_with(crate::core::agentark_knowledge::DOCUMENT_ID_PREFIX.to_string())
+                    .not(),
+            )
+            .add(
+                document::Column::ContentType
+                    .starts_with(
+                        crate::core::agentark_knowledge::INTERNAL_DOCUMENT_CONTENT_TYPE_PREFIX
+                            .to_string(),
+                    )
+                    .not(),
+            )
+    }
+
+    fn document_is_user_visible_after_load(doc: &document::Model) -> bool {
+        !crate::core::agentark_knowledge::is_agentark_knowledge_document_id(&doc.id)
+            && !crate::core::agentark_knowledge::is_internal_agentark_document_content_type(
+                &doc.content_type,
+            )
     }
 
     /// Insert a document and all chunks atomically so partial uploads do not leak
@@ -7236,8 +7329,11 @@ impl Storage {
             "DELETE FROM document_chunks WHERE document_id LIKE {}",
             sql_string_literal(&pattern)
         );
-        txn.execute(Statement::from_string(DbBackend::Postgres, delete_chunks_sql))
-            .await?;
+        txn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            delete_chunks_sql,
+        ))
+        .await?;
         let delete_docs_sql = format!(
             "DELETE FROM documents WHERE id LIKE {}",
             sql_string_literal(&pattern)
@@ -7297,6 +7393,7 @@ impl Storage {
         for doc in &mut docs {
             doc.filename = decrypt_storage_string(&doc.filename);
         }
+        docs.retain(Self::document_is_user_visible_after_load);
         Ok(docs)
     }
 
@@ -7335,6 +7432,7 @@ impl Storage {
         for doc in &mut docs {
             doc.filename = decrypt_storage_string(&doc.filename);
         }
+        docs.retain(Self::document_is_user_visible_after_load);
         Ok(docs)
     }
 
@@ -7365,6 +7463,15 @@ impl Storage {
         &self,
         document_id: &str,
     ) -> Result<Vec<document_chunk::Model>> {
+        let visible = document::Entity::find_by_id(document_id.to_string())
+            .filter(Self::user_visible_document_filter())
+            .one(&self.db)
+            .await?
+            .is_some();
+        if !visible {
+            return Ok(Vec::new());
+        }
+
         let mut chunks = document_chunk::Entity::find()
             .filter(document_chunk::Column::DocumentId.eq(document_id))
             .order_by_asc(document_chunk::Column::ChunkIndex)
@@ -7506,6 +7613,15 @@ impl Storage {
     /// Delete a document and its chunks
     pub async fn delete_document(&self, id: &str) -> Result<()> {
         let txn = self.db.begin().await?;
+        let visible = document::Entity::find_by_id(id.to_string())
+            .filter(Self::user_visible_document_filter())
+            .one(&txn)
+            .await?
+            .is_some();
+        if !visible {
+            txn.commit().await?;
+            return Ok(());
+        }
         document_chunk::Entity::delete_many()
             .filter(document_chunk::Column::DocumentId.eq(id))
             .exec(&txn)

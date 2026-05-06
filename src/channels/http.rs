@@ -2,19 +2,19 @@
 
 use anyhow::Result;
 use axum::{
-    Json, Router,
     extract::{
+        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
         ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, MatchedPath, Multipart, Path,
         Query, Request, State,
-        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{
-        Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
     },
     routing::{any, delete, get, post, put},
+    Json, Router,
 };
 use chrono::{Datelike, Timelike};
 use futures::{SinkExt, StreamExt};
@@ -26,12 +26,12 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{
-    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as TungsteniteMessage};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod actions;
@@ -93,8 +93,8 @@ pub(crate) use autonomy_control::run_autonomy_analysis_tick;
 pub use locked_control::serve_locked;
 
 pub(crate) use self::sentinel_panel::{
-    BackgroundLearningJobUpdate, load_background_learning_feed,
-    record_background_learning_job_result,
+    load_background_learning_feed, record_background_learning_job_result,
+    BackgroundLearningJobUpdate,
 };
 use analytics_control::*;
 use api_docs_control::*;
@@ -141,23 +141,23 @@ use crate::core::config::{
     TunnelTailscaleConfig,
 };
 use crate::core::data_lifecycle::{
-    DataLifecycleSettings, load_data_lifecycle_settings, save_data_lifecycle_settings,
+    load_data_lifecycle_settings, save_data_lifecycle_settings, DataLifecycleSettings,
 };
 use crate::core::llm_provider::{
-    HUGGINGFACE_API_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID, OPENAI_DEVICE_REDIRECT_URI,
-    OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL, OPENAI_DEVICE_VERIFY_URL,
-    OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL, canonical_provider_id,
-    display_openai_base_url, force_refresh_codex_cli_api_key, is_openrouter_base_url,
-    normalize_openai_base_url, openai_provider_label, persist_codex_cli_oauth_tokens,
-    provider_allows_model_discovery, resolve_codex_cli_api_key, resolve_openai_request_config,
+    canonical_provider_id, display_openai_base_url, force_refresh_codex_cli_api_key,
+    is_openrouter_base_url, normalize_openai_base_url, openai_provider_label,
+    persist_codex_cli_oauth_tokens, provider_allows_model_discovery, resolve_codex_cli_api_key,
+    resolve_openai_request_config, HUGGINGFACE_API_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID,
+    OPENAI_DEVICE_REDIRECT_URI, OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL,
+    OPENAI_DEVICE_VERIFY_URL, OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL,
 };
 use crate::core::self_evolve::skill_evolution::{
     self, SkillImpactAssessment, SkillMetricsSnapshot, SkillWindowDirection,
 };
 use crate::core::{
-    Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace, LlmProvider,
-    ModelRole, ModelSlot, RecommendedAction, RiskEnvelope, RiskLevel, Task, TaskApproval,
-    TaskQueue, TaskStatus, TrustPolicy, UserProfile, score_action_risk,
+    score_action_risk, Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace,
+    LlmProvider, ModelRole, ModelSlot, RecommendedAction, RiskEnvelope, RiskLevel, Task,
+    TaskApproval, TaskQueue, TaskStatus, TrustPolicy, UserProfile,
 };
 use crate::hooks;
 
@@ -858,6 +858,10 @@ pub struct ChatRequest {
     /// involves the page the user has open. Never freeform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arkorbit_context: Option<serde_json::Value>,
+    #[serde(default)]
+    pub accepted_suggestion_id: Option<String>,
+    #[serde(default)]
+    pub sentinel_proposal_id: Option<String>,
 }
 
 fn default_channel() -> String {
@@ -1466,6 +1470,11 @@ pub async fn serve(
                 false
             }
         };
+        validate_control_plane_listener_posture(
+            deployment_mode,
+            &bind_addr,
+            cookie_secure_default,
+        )?;
         validate_public_app_listener_posture(
             deployment_mode,
             public_app_bind_addr.as_deref(),
@@ -2315,8 +2324,8 @@ pub async fn serve(
         .route("/memory/knowledge", get(list_knowledge_items))
         .route("/memory/knowledge", post(create_knowledge_item))
         .route(
-            "/memory/knowledge/sync-product-docs",
-            post(sync_product_help_knowledge),
+            "/memory/knowledge/sync-agentark-knowledge",
+            post(sync_agentark_knowledge),
         )
         .route(
             "/memory/knowledge/{id}",
@@ -2732,30 +2741,16 @@ pub async fn serve(
         let state_for_tunnel = state.clone();
         crate::spawn_logged!("src/channels/http.rs:5444", async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let mut start_infrastructure = false;
             match tunnel::auto_start_selected_app_tunnel(&state_for_tunnel).await {
                 Ok(Some(url)) => tracing::info!(
                     "Auto-restored app-only public tunnel for saved app exposure: {}",
                     url
                 ),
-                Ok(None) => start_infrastructure = true,
+                Ok(None) => tracing::info!(
+                    "No saved public app exposure; remote tunnel infrastructure was not auto-started"
+                ),
                 Err(error) => {
                     tracing::warn!("Skipped app-only public tunnel auto-restore: {}", error);
-                    start_infrastructure = true;
-                }
-            }
-            if start_infrastructure {
-                match tunnel::auto_start_tunnel_infrastructure(&state_for_tunnel).await {
-                    Ok(Some(url)) => tracing::info!(
-                        "Public tunnel infrastructure auto-started without an exposed target: {}",
-                        url
-                    ),
-                    Ok(None) => {
-                        tracing::info!("Public tunnel infrastructure auto-started; URL is pending")
-                    }
-                    Err(error) => {
-                        tracing::warn!("Public tunnel infrastructure auto-start failed: {}", error)
-                    }
                 }
             }
         });

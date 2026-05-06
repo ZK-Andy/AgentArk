@@ -37,8 +37,10 @@
 # =============================================================================
 # MANUAL DOCKER RUN (requires an external Postgres database):
 #
+# Replace <external-password> with the password for your external database.
+#
 #   docker run -d -p 8990:8990 \
-#     -e AGENTARK_DATABASE_URL=postgres://agentark:agentark@host.docker.internal:5432/agentark \
+#     -e AGENTARK_DATABASE_URL=postgres://agentark:<external-password>@host.docker.internal:5432/agentark \
 #     -v agentark-data:/app/data \
 #     -v agentark-config:/app/config \
 #     --name agentark \

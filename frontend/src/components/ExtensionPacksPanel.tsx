@@ -22,6 +22,7 @@ import MoreVertIcon from "@mui/icons-material/MoreVert";
 import Grid2 from "@mui/material/Grid";
 import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { api } from "../api/client";
+import { formatUiDateTime } from "../lib/dateFormat";
 import type { ExtensionPackView } from "../types";
 
 type ExtensionPackMode = "all" | "integrations" | "messaging" | "connectors" | "channels";
@@ -1441,7 +1442,11 @@ export function ExtensionPacksPanel({ mode = "all" }: { mode?: ExtensionPackMode
                   <Typography variant="caption" sx={{
                     color: "text.secondary"
                   }}>
-                    {new Date(event.received_at).toLocaleString()}
+                    {formatUiDateTime(event.received_at, {
+                      fallback: event.received_at || "-",
+                      includeSeconds: true,
+                      includeYear: true,
+                    })}
                   </Typography>
                   {event.outcome ? (
                     <Typography variant="caption" sx={{

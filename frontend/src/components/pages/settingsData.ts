@@ -24,6 +24,7 @@ export const SETTINGS_QUERY_KEYS = {
 export const CORE_SETTINGS_STALE_TIME_MS = 30_000;
 export const SETTINGS_BACKGROUND_STALE_TIME_MS = 60_000;
 export const SETTINGS_CACHE_GC_TIME_MS = 15 * 60_000;
+export const MODEL_SLOT_INDEX_ID_PREFIX = "__slot_idx_";
 
 export const fetchSettings = () => api.rawGet("/settings");
 export const fetchAvailableMessagingChannels = () =>
@@ -45,6 +46,31 @@ export const fetchSettingsObservabilityLogs = () =>
   api.rawGet("/settings/observability/logs?limit=40");
 export const fetchSettingsSecrets = () => api.rawGet("/settings/secrets");
 export const fetchArkPulseLog = () => api.rawGet("/arkpulse?limit=40");
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function normalizeModelSlotRows(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.reduce<Record<string, unknown>[]>((rows, item, index) => {
+    if (!isPlainRecord(item)) return rows;
+    const id = typeof item.id === "string" ? item.id.trim() : "";
+    rows.push({
+      ...item,
+      id: id || `${MODEL_SLOT_INDEX_ID_PREFIX}${index}`,
+    });
+    return rows;
+  }, []);
+}
+
+export function modelsPayloadFromSettings(value: unknown): Record<string, unknown> {
+  const settings = isPlainRecord(value) ? value : {};
+  return {
+    models: normalizeModelSlotRows(settings.model_pool),
+    smart_routing: Boolean(settings.smart_routing),
+  };
+}
 
 type SettingsPrefetch = {
   queryKey: QueryKey;
@@ -91,11 +117,6 @@ export function prefetchCoreSettingsData(queryClient: QueryClient): void {
       queryFn: fetchSettingsMedia,
       staleTime: CORE_SETTINGS_STALE_TIME_MS,
     },
-    {
-      queryKey: SETTINGS_QUERY_KEYS.models,
-      queryFn: fetchModels,
-      staleTime: CORE_SETTINGS_STALE_TIME_MS,
-    },
   ]);
 }
 
@@ -116,13 +137,6 @@ export function prefetchSettingsTabData(
     queries.push({
       queryKey: SETTINGS_QUERY_KEYS.availableMessagingChannels,
       queryFn: fetchAvailableMessagingChannels,
-      staleTime: CORE_SETTINGS_STALE_TIME_MS,
-    });
-  }
-  if (tab === 0 || tab === 1) {
-    queries.push({
-      queryKey: SETTINGS_QUERY_KEYS.models,
-      queryFn: fetchModels,
       staleTime: CORE_SETTINGS_STALE_TIME_MS,
     });
   }

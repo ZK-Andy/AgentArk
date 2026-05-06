@@ -32,6 +32,7 @@ import Grid2 from "@mui/material/Grid";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState, type ReactNode } from "react";
 import { api } from "../../api/client";
+import { formatUiTime } from "../../lib/dateFormat";
 import { formatChannelSource } from "../channelLabels";
 import { LiveEventConsole } from "../LiveEventConsole";
 import { MetricBarCard } from "../analytics/MetricBarCard";
@@ -97,14 +98,7 @@ function formatTraceStepTime(raw: string): string {
   const durationPart = match[2]?.trim() || "";
   const date = new Date(isoPart);
   if (Number.isNaN(date.getTime())) return raw;
-  const time = date
-    .toLocaleTimeString(undefined, {
-      hour: "numeric",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: true,
-    })
-    .replace(/\b(am|pm)\b/g, (value) => value.toUpperCase());
+  const time = formatUiTime(date, { fallback: raw, includeSeconds: true });
   return durationPart ? `${time} ${durationPart}` : time;
 }
 
@@ -419,6 +413,15 @@ function stringList(value: unknown): string[] {
   return value.map((item) => str(item, "").trim()).filter(Boolean);
 }
 
+function promotionGateSummary(data: JsonRecord): string {
+  const report = asRecord(data.promotion_gate_report);
+  return (
+    str(report.summary, "").trim() ||
+    str(data.promotion_gate_summary, "").trim() ||
+    str(data.promotion_gate, "").trim()
+  );
+}
+
 function percentageLabel(value: unknown, digits = 1): string {
   const parsed = num(value, Number.NaN);
   if (!Number.isFinite(parsed)) return "";
@@ -676,7 +679,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
           `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
         );
       if (candidateSource) chips.push(candidateSource);
-      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      rationale = `Gate: ${promotionGateSummary(data) || "unknown"}`;
       if (num(data.wins, -1) >= 0 || num(data.losses, -1) >= 0) {
         evidence.push(
           `Wins/Losses: ${num(data.wins, 0)} / ${num(data.losses, 0)}`,
@@ -745,7 +748,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
           `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
         );
       if (candidateSource) chips.push(candidateSource);
-      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      rationale = `Gate: ${promotionGateSummary(data) || "unknown"}`;
       if (routerChanged.length)
         evidence.push(`Router changes: ${routerChanged.join(", ")}`);
       if (primaryResponseChanged.length)
@@ -835,7 +838,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
           `Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`,
         );
       if (candidateSource) chips.push(candidateSource);
-      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      rationale = `Gate: ${promotionGateSummary(data) || "unknown"}`;
       if (changedItems.length)
         evidence.push(`Changed: ${changedItems.join(", ")}`);
       if (changePreview.length)

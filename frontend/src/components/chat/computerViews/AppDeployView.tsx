@@ -12,6 +12,7 @@ import InsertDriveFileRounded from "@mui/icons-material/InsertDriveFileRounded";
 import ChevronRightRounded from "@mui/icons-material/ChevronRightRounded";
 
 import type { ChatStepCard, ComputerPaneFile } from "../types";
+import { firstSurfaceUri, surfacePayloads } from "../surface";
 
 export interface AppDeployViewProps {
   card: ChatStepCard;
@@ -29,9 +30,6 @@ interface DeployPayload {
   url?: string;
   files: DeployFile[];
 }
-
-const PATH_REGEX = /[\w./\\-]+\.[A-Za-z0-9]{1,8}/g;
-const URL_REGEX = /https?:\/\/[^\s"'<>)\]]+/i;
 
 function safeParse(body: string): unknown {
   try {
@@ -118,6 +116,20 @@ function mergeDeployFiles(
 }
 
 function parsePayload(card: ChatStepCard): DeployPayload {
+  const surfaceUrl = firstSurfaceUri(card);
+  const surfaceFiles = normalizeFiles(
+    surfacePayloads(card)
+      .map((item) => {
+        if (item.path) {
+          return {
+            path: item.path,
+            content: item.text || (typeof item.json === "string" ? item.json : ""),
+          };
+        }
+        return null;
+      })
+      .filter(Boolean),
+  );
   const body =
     card.payloadView?.body ||
     card.rawDetailFull ||
@@ -127,8 +139,8 @@ function parsePayload(card: ChatStepCard): DeployPayload {
     "";
   const parsed = safeParse(body);
   let appId: string | undefined;
-  let url: string | undefined;
-  let files: DeployFile[] = [];
+  let url: string | undefined = surfaceUrl || undefined;
+  let files: DeployFile[] = surfaceFiles;
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const rec = parsed as Record<string, unknown>;
     if (typeof rec.app_id === "string") appId = rec.app_id;
@@ -142,20 +154,6 @@ function parsePayload(card: ChatStepCard): DeployPayload {
         .filter((value): value is string => typeof value === "string")
         .filter(isDeployFilePath)
         .map((path) => ({ path }));
-    }
-  }
-  if (!url) {
-    const m = body.match(URL_REGEX);
-    if (m) url = m[0];
-  }
-  if (files.length === 0 && body && !parsed) {
-    const seen = new Set<string>();
-    const matches = body.match(PATH_REGEX) ?? [];
-    for (const path of matches) {
-      if (!isDeployFilePath(path)) continue;
-      if (seen.has(path)) continue;
-      seen.add(path);
-      files.push({ path });
     }
   }
   return { appId, url, files };

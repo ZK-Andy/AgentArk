@@ -43,6 +43,7 @@ public actor CompanionWebSocketClient {
     }
 
     public func connect() async throws {
+        await requestLocalNotificationPermissionIfNeeded()
         let identity = try tokenStore.load()
         var request = URLRequest(url: webSocketURL)
         if let identity {
@@ -65,6 +66,7 @@ public actor CompanionWebSocketClient {
     }
 
     public func claimPairing(sessionId: String, code: String, publicKey: String? = nil) async throws {
+        await requestLocalNotificationPermissionIfNeeded()
         let pending = PendingPairing(sessionId: sessionId, code: code, publicKey: publicKey ?? (try tokenStore.devicePublicKey()))
         pendingPairing = pending
         try await sendPairingClaim(pending)
@@ -172,6 +174,13 @@ public actor CompanionWebSocketClient {
     private func resendPendingPairing() async throws {
         guard let pendingPairing else { return }
         try await sendPairingClaim(pendingPairing)
+    }
+
+    private func requestLocalNotificationPermissionIfNeeded() async {
+        guard capabilities.contains("notifications") || capabilities.contains("approval_prompt") else {
+            return
+        }
+        _ = await CompanionLocalNotifications.requestAuthorizationIfAvailable()
     }
 
     private struct PendingPairing: Sendable {

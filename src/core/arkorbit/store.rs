@@ -5,7 +5,7 @@
 //! firmware files under `src/core/arkorbit/l0` during source-tree runs, which
 //! win over the embedded L0 fallback compiled into the binary.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
@@ -72,6 +72,14 @@ const FETCH_PROXY_MANIFEST: &str = include_str!(concat!(
 const FETCH_PROXY_INDEX: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/core/arkorbit/l0/widgets/fetch-proxy/index.js"
+));
+const APP_SHELL_MANIFEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/core/arkorbit/l0/widgets/app-shell/manifest.json"
+));
+const APP_SHELL_INDEX: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/core/arkorbit/l0/widgets/app-shell/index.js"
 ));
 const SKILL_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -230,7 +238,7 @@ impl LayeredStore {
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            if rel.starts_with(".tmp/") {
+            if !orbit_file_is_user_artifact_path(&rel) {
                 continue;
             }
             let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -251,6 +259,7 @@ impl LayeredStore {
     pub fn write_orbit_file(&self, orbit_id: &str, rel_path: &str, content: &[u8]) -> Result<()> {
         let rel = validate_writable_orbit_path(rel_path)?;
         let root = self.ensure_orbit_dir(orbit_id)?;
+        validate_orbit_file_content(&root, &rel, content)?;
         let path = root.join(rel);
         self.atomic_write_under_orbit(orbit_id, &path, content)
     }
@@ -342,13 +351,6 @@ impl LayeredStore {
         self.resolve_l0_path(&l0_rel)
     }
 
-    pub fn l0_skill_catalog(&self) -> String {
-        match self.resolve_l0_path(Path::new("skills").join("SKILL.md").as_path()) {
-            Ok(Some(resolved)) => String::from_utf8_lossy(&resolved.bytes).into_owned(),
-            _ => SKILL_MD.to_string(),
-        }
-    }
-
     fn resolve_l0_path(&self, rel: &Path) -> Result<Option<ResolvedModule>> {
         let rel = clean_relative_path(rel.to_string_lossy().as_ref())?;
         for root in &self.l0_roots {
@@ -407,12 +409,34 @@ pub fn validate_writable_orbit_path(raw: &str) -> Result<PathBuf> {
 
 pub fn validate_readable_orbit_path(raw: &str) -> Result<PathBuf> {
     let path = clean_relative_path(raw)?;
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if orbit_file_is_system_path(&normalized) {
+        bail!("arkorbit: system chat files are not exposed through the orbit file API");
+    }
     let parts = path_parts(&path);
     match parts.as_slice() {
-        ["index.html"] | ["orbit.json"] | ["messages.jsonl"] => Ok(path),
+        ["index.html"] | ["orbit.json"] => Ok(path),
         [prefix, ..] if matches!(*prefix, "mod" | "data" | "assets") => Ok(path),
         _ => bail!("arkorbit: readable path must be inside the orbit file namespace"),
     }
+}
+
+pub fn orbit_file_is_user_artifact_path(path: &str) -> bool {
+    if orbit_file_is_system_path(path) {
+        return false;
+    }
+    path.starts_with("mod/") || path.starts_with("assets/") || path.starts_with("data/")
+}
+
+fn orbit_file_is_system_path(path: &str) -> bool {
+    let normalized = path.trim().replace('\\', "/");
+    normalized.is_empty()
+        || normalized.starts_with(".tmp/")
+        || normalized == "index.html"
+        || normalized == "orbit.json"
+        || normalized == "messages.jsonl"
+        || normalized == "data/chat-session.txt"
+        || normalized.starts_with("data/chat-history/")
 }
 
 fn clean_relative_path(raw: &str) -> Result<PathBuf> {
@@ -462,6 +486,306 @@ fn canonicalize_existing_under(root: &Path, candidate: &Path) -> Result<PathBuf>
     Ok(candidate_canon)
 }
 
+fn validate_orbit_file_content(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    if !is_browser_javascript_path(rel) {
+        return Ok(());
+    }
+    let source = std::str::from_utf8(content)
+        .with_context(|| format!("arkorbit: {} must be valid UTF-8", rel.display()))?;
+    validate_widget_module_contract(rel, source)?;
+    validate_browser_javascript_syntax(root, rel, content)
+}
+
+fn is_browser_javascript_path(rel: &Path) -> bool {
+    matches!(
+        rel.extension().and_then(|value| value.to_str()),
+        Some("js" | "mjs")
+    )
+}
+
+fn is_widget_entry_module_path(rel: &Path) -> bool {
+    let parts = path_parts(rel);
+    matches!(parts.as_slice(), ["mod", _, "index.js" | "index.mjs"])
+}
+
+fn validate_widget_module_contract(rel: &Path, source: &str) -> Result<()> {
+    if !is_widget_entry_module_path(rel) {
+        return Ok(());
+    }
+    if has_named_render_export(source) {
+        Ok(())
+    } else {
+        bail!(
+            "arkorbit: widget module {} must export a named render(el, ctx) function",
+            rel.display()
+        )
+    }
+}
+
+fn has_named_render_export(source: &str) -> bool {
+    let stripped = strip_javascript_comments_and_strings(source);
+    contains_exported_render_declaration(&stripped) || contains_render_in_export_list(&stripped)
+}
+
+fn contains_exported_render_declaration(source: &str) -> bool {
+    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    [
+        "export function render",
+        "export async function render",
+        "export const render",
+        "export let render",
+        "export var render",
+    ]
+    .iter()
+    .any(|needle| contains_phrase_with_identifier_boundary(&normalized, needle))
+}
+
+fn contains_phrase_with_identifier_boundary(source: &str, phrase: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(relative) = source[offset..].find(phrase) {
+        let start = offset + relative;
+        let end = start + phrase.len();
+        let before = source[..start].chars().next_back();
+        let after = source[end..].chars().next();
+        let before_ok = before.map_or(true, |ch| !is_javascript_identifier_continue(ch));
+        let after_ok = after.map_or(true, |ch| !is_javascript_identifier_continue(ch));
+        if before_ok && after_ok {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn is_javascript_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+}
+
+fn contains_render_in_export_list(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    while let Some(relative) = source[index..].find("export") {
+        index += relative + "export".len();
+        let rest = source[index..].trim_start();
+        if !rest.starts_with('{') {
+            continue;
+        }
+        let offset = source[index..].find('{').unwrap_or(0);
+        let start = index + offset + 1;
+        let mut depth = 1i32;
+        let mut end = start;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        if depth == 0 {
+            let list = &source[start..end];
+            if list
+                .split(',')
+                .map(str::trim)
+                .any(export_specifier_exports_render)
+            {
+                return true;
+            }
+            index = end + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+fn export_specifier_exports_render(specifier: &str) -> bool {
+    let parts = specifier.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["render"] => true,
+        [_, "as", "render"] => true,
+        _ => false,
+    }
+}
+
+fn strip_javascript_comments_and_strings(source: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Code,
+        LineComment,
+        BlockComment,
+        Single,
+        Double,
+        Template,
+    }
+
+    let mut out = String::with_capacity(source.len());
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    let mut mode = Mode::Code;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        let next = bytes.get(i + 1).copied().map(char::from);
+        match mode {
+            Mode::Code => match (ch, next) {
+                ('/', Some('/')) => {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    mode = Mode::LineComment;
+                    continue;
+                }
+                ('/', Some('*')) => {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    mode = Mode::BlockComment;
+                    continue;
+                }
+                ('\'', _) => {
+                    out.push(' ');
+                    mode = Mode::Single;
+                }
+                ('"', _) => {
+                    out.push(' ');
+                    mode = Mode::Double;
+                }
+                ('`', _) => {
+                    out.push(' ');
+                    mode = Mode::Template;
+                }
+                _ => out.push(ch),
+            },
+            Mode::LineComment => {
+                if ch == '\n' {
+                    out.push('\n');
+                    mode = Mode::Code;
+                } else {
+                    out.push(' ');
+                }
+            }
+            Mode::BlockComment => {
+                if ch == '*' && next == Some('/') {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    mode = Mode::Code;
+                    continue;
+                }
+                out.push(if ch == '\n' { '\n' } else { ' ' });
+            }
+            Mode::Single | Mode::Double | Mode::Template => {
+                let quote = match mode {
+                    Mode::Single => '\'',
+                    Mode::Double => '"',
+                    Mode::Template => '`',
+                    _ => unreachable!(),
+                };
+                if ch == '\\' {
+                    out.push(' ');
+                    if i + 1 < bytes.len() {
+                        out.push(' ');
+                        i += 2;
+                        continue;
+                    }
+                } else if ch == quote {
+                    out.push(' ');
+                    mode = Mode::Code;
+                } else {
+                    out.push(if ch == '\n' { '\n' } else { ' ' });
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn validate_browser_javascript_syntax(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    let tmp_dir = root.join(".tmp");
+    std::fs::create_dir_all(&tmp_dir)?;
+    let tmp = tmp_dir.join(format!("syntax-{}.mjs", Uuid::new_v4()));
+    std::fs::write(&tmp, content)?;
+    let outcome = run_node_syntax_check(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(error) if is_node_not_found_error(&error) => {
+            tracing::warn!(
+                target: "arkorbit.fs",
+                path = %rel.display(),
+                "Skipping ArkOrbit JavaScript syntax validation because node is unavailable"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "arkorbit: refusing to write invalid browser JavaScript to {}",
+                rel.display()
+            )
+        }),
+    }
+}
+
+fn run_node_syntax_check(path: &Path) -> Result<()> {
+    let mut command = std::process::Command::new("node");
+    command
+        .arg("--check")
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!("node_not_found"),
+        Err(error) => return Err(error.into()),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            if output.status.success() {
+                return Ok(());
+            }
+            bail!("{}", summarize_process_output(&output));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("syntax validation timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn is_node_not_found_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == "node_not_found")
+}
+
+fn summarize_process_output(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let summary = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if summary.is_empty() {
+        format!("node --check exited with status {}", output.status)
+    } else {
+        summary
+    }
+}
+
 fn embedded_l0(path: &str) -> Option<&'static str> {
     match path {
         "runtime/host.js" => Some(HOST_JS),
@@ -480,6 +804,8 @@ fn embedded_l0(path: &str) -> Option<&'static str> {
         "widgets/todo/index.js" => Some(TODO_INDEX),
         "widgets/fetch-proxy/manifest.json" => Some(FETCH_PROXY_MANIFEST),
         "widgets/fetch-proxy/index.js" => Some(FETCH_PROXY_INDEX),
+        "widgets/app-shell/manifest.json" => Some(APP_SHELL_MANIFEST),
+        "widgets/app-shell/index.js" => Some(APP_SHELL_INDEX),
         _ => None,
     }
 }
@@ -579,6 +905,49 @@ mod tests {
     }
 
     #[test]
+    fn orbit_file_listing_hides_system_chat_and_manifest_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = LayeredStore::new(tmp.path());
+        let orbit_id = Uuid::new_v4().to_string();
+        let root = store.ensure_orbit_dir(&orbit_id).unwrap();
+
+        std::fs::write(root.join("messages.jsonl"), b"{}").unwrap();
+        std::fs::write(root.join("index.html"), b"<html></html>").unwrap();
+        std::fs::write(root.join("orbit.json"), b"{}").unwrap();
+        std::fs::create_dir_all(root.join("data").join("chat-history")).unwrap();
+        std::fs::write(
+            root.join("data").join("chat-session.txt"),
+            orbit_id.as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("data").join("chat-history").join("session.jsonl"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(root.join("data").join("widgets.json"), b"[]").unwrap();
+        std::fs::create_dir_all(root.join("mod").join("demo")).unwrap();
+        std::fs::write(root.join("mod").join("demo").join("index.js"), b"").unwrap();
+
+        let files = store.list_orbit_files(&orbit_id).unwrap();
+        let paths = files
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["data/widgets.json", "mod/demo/index.js"]);
+    }
+
+    #[test]
+    fn generic_file_read_rejects_system_chat_files() {
+        assert!(validate_readable_orbit_path("messages.jsonl").is_err());
+        assert!(validate_readable_orbit_path("data/chat-session.txt").is_err());
+        assert!(validate_readable_orbit_path("data/chat-history/session.jsonl").is_err());
+        validate_readable_orbit_path("data/widgets.json").unwrap();
+        validate_readable_orbit_path("mod/demo/index.js").unwrap();
+    }
+
+    #[test]
     fn resolver_prefers_l2_module_over_l0() {
         let tmp = TempDir::new().unwrap();
         let store = LayeredStore::new(tmp.path());
@@ -599,6 +968,74 @@ mod tests {
     }
 
     #[test]
+    fn javascript_write_rejects_invalid_browser_syntax_when_validator_is_available() {
+        if !node_syntax_validator_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let store = LayeredStore::new(tmp.path());
+        let orbit_id = Uuid::new_v4().to_string();
+
+        let err = store
+            .write_orbit_file(
+                &orbit_id,
+                "mod/broken/index.js",
+                b"export function render(el { el.textContent = 'broken'; }",
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid browser JavaScript"));
+        assert!(!store
+            .orbit_dir(&orbit_id)
+            .join("mod")
+            .join("broken")
+            .join("index.js")
+            .exists());
+    }
+
+    #[test]
+    fn widget_module_write_requires_named_render_export() {
+        let tmp = TempDir::new().unwrap();
+        let store = LayeredStore::new(tmp.path());
+        let orbit_id = Uuid::new_v4().to_string();
+
+        let err = store
+            .write_orbit_file(
+                &orbit_id,
+                "mod/broken/index.js",
+                b"export default function Widget() {}",
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("must export a named render"));
+        assert!(!store
+            .orbit_dir(&orbit_id)
+            .join("mod")
+            .join("broken")
+            .join("index.js")
+            .exists());
+    }
+
+    #[test]
+    fn widget_module_contract_accepts_common_named_render_exports() {
+        assert!(has_named_render_export(
+            "export function render(el, ctx) {}"
+        ));
+        assert!(has_named_render_export(
+            "async function draw() {}\nexport { draw as render };"
+        ));
+        assert!(has_named_render_export(
+            "const render = () => {};\nexport { render };"
+        ));
+        assert!(!has_named_render_export(
+            "export default function render() {}"
+        ));
+        assert!(!has_named_render_export(
+            "// export function render() {}\nexport const other = 1;"
+        ));
+    }
+
+    #[test]
     fn resolver_serves_embedded_runtime() {
         let tmp = TempDir::new().unwrap();
         let store = LayeredStore::new(tmp.path());
@@ -616,7 +1053,7 @@ mod tests {
         let store = LayeredStore::new(tmp.path());
         let orbit_id = Uuid::new_v4().to_string();
         store
-            .write_orbit_file(&orbit_id, "data/widgets.json", br#"[{"id":"weather"}]"#)
+            .write_orbit_file(&orbit_id, "data/widgets.json", br#"[{"id":"demo"}]"#)
             .unwrap();
         let resolved = store
             .resolve_module(&orbit_id, "data/widgets.json")
@@ -634,20 +1071,14 @@ mod tests {
         store
             .write_orbit_file(
                 &orbit_id,
-                "mod/weather/index.js",
+                "mod/demo/index.js",
                 b"export function render() {}",
             )
             .unwrap();
 
-        assert!(store.remove_orbit_module_dir(&orbit_id, "weather").unwrap());
-        assert!(
-            !store
-                .orbit_dir(&orbit_id)
-                .join("mod")
-                .join("weather")
-                .exists()
-        );
-        assert!(!store.remove_orbit_module_dir(&orbit_id, "weather").unwrap());
+        assert!(store.remove_orbit_module_dir(&orbit_id, "demo").unwrap());
+        assert!(!store.orbit_dir(&orbit_id).join("mod").join("demo").exists());
+        assert!(!store.remove_orbit_module_dir(&orbit_id, "demo").unwrap());
     }
 
     #[test]
@@ -657,8 +1088,18 @@ mod tests {
         let orbit_id = Uuid::new_v4().to_string();
 
         let err = store
-            .remove_orbit_module_dir(&orbit_id, "weather/index.js")
+            .remove_orbit_module_dir(&orbit_id, "demo/index.js")
             .unwrap_err();
         assert!(err.to_string().contains("one path segment"));
+    }
+
+    fn node_syntax_validator_available() -> bool {
+        std::process::Command::new("node")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 }

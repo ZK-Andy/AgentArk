@@ -204,6 +204,9 @@ pub(super) async fn security_status(State(state): State<AppState>) -> Response {
     let master_mgr = crate::crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
     let is_set = master_mgr.is_password_set();
     let bootstrap_active = master_mgr.is_bootstrap_password_active().unwrap_or(false);
+    let install_managed_active = master_mgr
+        .is_install_managed_password_active()
+        .unwrap_or(false);
     let internal_service_tokens =
         crate::clients::describe_internal_service_tokens(&config_dir).unwrap_or_default();
     let internal_service_rotation_supported = !internal_service_tokens
@@ -218,6 +221,10 @@ pub(super) async fn security_status(State(state): State<AppState>) -> Response {
         Some(
             "Using a per-install bootstrap password. Set a custom master password to fully own recovery and rotation.",
         )
+    } else if install_managed_active {
+        Some(
+            "Using an install-managed encryption secret. Set a custom master password to fully own recovery and remote access login.",
+        )
     } else {
         None
     };
@@ -226,10 +233,11 @@ pub(super) async fn security_status(State(state): State<AppState>) -> Response {
         StatusCode::OK,
         Json(serde_json::json!({
             "master_password_set": is_set,
-            "custom_master_password_set": is_set && !bootstrap_active,
-            "using_default": bootstrap_active,
+            "custom_master_password_set": is_set && !bootstrap_active && !install_managed_active,
+            "using_default": bootstrap_active || install_managed_active,
             "bootstrap_password_active": bootstrap_active,
-            "encryption_mode": if is_set { "password" } else { "keyfile" },
+            "install_managed_password_active": install_managed_active,
+            "encryption_mode": if install_managed_active { "install_managed_secret" } else if is_set { "password" } else { "keyfile" },
             "security_warning": warning,
             "internal_service_rotation_supported": internal_service_rotation_supported,
             "internal_service_tokens": internal_service_tokens
@@ -243,6 +251,17 @@ pub(super) fn current_runtime_encryption_key(
 ) -> anyhow::Result<std::sync::Arc<crate::crypto::KeyManager>> {
     if let Some(key) = crate::core::config::global_key_manager() {
         return Ok(key);
+    }
+    if crate::crypto::master::MasterPasswordManager::docker_stack_requires_install_master_secret() {
+        let secret = crate::crypto::master::MasterPasswordManager::read_install_master_secret()?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Install-managed encryption secret is missing at {}",
+                    crate::crypto::master::INSTALL_MASTER_SECRET_PATH
+                )
+            })?;
+        let master_mgr = crate::crypto::master::MasterPasswordManager::new(config_dir, config_dir);
+        return master_mgr.unlock(&secret);
     }
     Ok(std::sync::Arc::new(
         crate::crypto::KeyManager::load_or_create(&config_dir.join(".keyfile"))?,
@@ -350,8 +369,11 @@ pub(super) async fn set_master_password(
     };
     let master_mgr = crate::crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
     let bootstrap_active = master_mgr.is_bootstrap_password_active().unwrap_or(false);
+    let install_managed_active = master_mgr
+        .is_install_managed_password_active()
+        .unwrap_or(false);
 
-    if master_mgr.is_password_set() && !bootstrap_active {
+    if master_mgr.is_password_set() && !bootstrap_active && !install_managed_active {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -457,19 +479,55 @@ pub(super) async fn change_master_password(
         (agent.config_dir.clone(), agent.data_dir.clone())
     };
     let master_mgr = crate::crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
+    let bootstrap_active = master_mgr.is_bootstrap_password_active().unwrap_or(false);
+    let install_managed_active = master_mgr
+        .is_install_managed_password_active()
+        .unwrap_or(false);
 
     let current_pw = if req.current_password.is_empty() {
-        match master_mgr.bootstrap_password_if_active() {
-            Ok(Some(pw)) => pw,
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "Current password is required"
-                    })),
-                )
-                    .into_response();
+        if bootstrap_active {
+            match master_mgr.bootstrap_password_if_active() {
+                Ok(Some(pw)) => pw,
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "Current password is required"
+                        })),
+                    )
+                        .into_response();
+                }
             }
+        } else if install_managed_active {
+            match crate::crypto::master::MasterPasswordManager::read_install_master_secret() {
+                Ok(Some(pw)) => pw,
+                Ok(None) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "Install-managed encryption secret is missing"
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": error.to_string()
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Current password is required"
+                })),
+            )
+                .into_response();
         }
     } else {
         req.current_password.clone()
@@ -591,51 +649,106 @@ pub(super) async fn remove_master_password(
         }
     };
 
-    match master_mgr.prepare_keyfile_encryption() {
-        Ok(new_key) => {
-            if let Err(e) = rotate_application_encryption(
-                &state,
-                &config_dir,
-                old_secrets_key,
-                old_storage_key,
-                new_key.clone(),
-                || master_mgr.commit_password_removal(),
-            )
-            .await
-            {
+    let prepared_install_secret =
+        if crate::crypto::master::MasterPasswordManager::docker_stack_requires_install_master_secret(
+        ) {
+            let secret =
+                match crate::crypto::master::MasterPasswordManager::read_install_master_secret() {
+                    Ok(Some(secret)) => secret,
+                    Ok(None) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "Install-managed encryption secret is missing"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": error.to_string()
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+            match master_mgr.prepare_install_managed_password(&secret) {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!("Failed to prepare install-managed encryption secret: {}", error)
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            None
+        };
+
+    let keyfile_key = if prepared_install_secret.is_none() {
+        match master_mgr.prepare_keyfile_encryption() {
+            Ok(key) => Some(key),
+            Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
-                        "error": format!("Failed to remove password safely: {}", e)
+                        "error": format!("Failed to remove password: {}", e)
                     })),
                 )
                     .into_response();
             }
-
-            tracing::info!("Master password removed, reverted to keyfile encryption in-memory");
-            if tunnel_auth::control_plane_tunnel_is_active(&state).await {
-                tunnel::stop_tunnel_internal(&state).await;
-                tracing::info!(
-                    "Stopped active control-plane tunnel after removing the custom master password"
-                );
-            }
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "message": "Master password removed.",
-                    "restart_scheduled": false
-                })),
-            )
-                .into_response()
         }
-        Err(e) => (
+    } else {
+        None
+    };
+    let new_key = prepared_install_secret
+        .as_ref()
+        .map(|prepared| prepared.key_manager.clone())
+        .or(keyfile_key)
+        .expect("remove password target key should be prepared");
+    let reverting_to_install_managed = prepared_install_secret.is_some();
+    if let Err(e) = rotate_application_encryption(
+        &state,
+        &config_dir,
+        old_secrets_key,
+        old_storage_key,
+        new_key.clone(),
+        || match prepared_install_secret {
+            Some(prepared) => master_mgr.commit_prepared_password(prepared),
+            None => master_mgr.commit_password_removal(),
+        },
+    )
+    .await
+    {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "error": format!("Failed to remove password: {}", e)
+                "error": format!("Failed to remove password safely: {}", e)
             })),
         )
-            .into_response(),
+            .into_response();
     }
+
+    tracing::info!("Master password removed or reverted to install-managed encryption in-memory");
+    if tunnel_auth::control_plane_tunnel_is_active(&state).await {
+        tunnel::stop_tunnel_internal(&state).await;
+        tracing::info!(
+            "Stopped active control-plane tunnel after removing the custom master password"
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "message": if reverting_to_install_managed { "Master password reverted to install-managed encryption." } else { "Master password removed." },
+            "restart_scheduled": false
+        })),
+    )
+        .into_response()
 }

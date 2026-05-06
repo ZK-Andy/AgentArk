@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 pub fn internal_api_base_url() -> String {
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
@@ -63,22 +63,6 @@ pub fn is_disallowed_public_hostname(host: &str) -> bool {
         || normalized.ends_with(".local")
         || normalized == "0.0.0.0"
         || normalized == "[::]"
-}
-
-pub fn production_tls_required() -> bool {
-    std::env::var("AGENTARK_ENV")
-        .map(|value| value.eq_ignore_ascii_case("production"))
-        .unwrap_or(false)
-        || std::env::var("AGENTARK_REQUIRE_TLS")
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-}
-
-pub fn allow_insecure_local_transport() -> bool {
-    std::env::var("AGENTARK_ALLOW_INSECURE_LOCAL_TRANSPORT")
-        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-        || !production_tls_required()
 }
 
 pub fn validate_no_userinfo(url: &reqwest::Url) -> Result<()> {

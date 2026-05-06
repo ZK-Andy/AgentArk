@@ -435,7 +435,9 @@ Write-Host "    agentark stop       Stop AgentArk"
 Write-Host "    agentark update     Install the latest tagged release and restart"
 Write-Host "    agentark logs       View logs"
 Write-Host "    agentark status     Show status"
+Write-Host "    agentark backup     Backup Docker volumes"
 Write-Host ""
 Write-Host "  App data is stored in Docker volumes and survives updates." -ForegroundColor Yellow
-Write-Host "  Postgres has its own volume; use 'docker compose down -v' to reset everything." -ForegroundColor Yellow
+Write-Host "  Postgres and install secrets live in Docker volumes; use 'agentark backup' before moving installs." -ForegroundColor Yellow
+Write-Host "  Use 'docker compose down -v' only for a full reset." -ForegroundColor Yellow
 Write-Host ""

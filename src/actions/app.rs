@@ -32,7 +32,9 @@ const LOCAL_RUNTIME_STDERR_LOG_FILE: &str = ".agentark_runtime_stderr.log";
 pub(crate) const APP_QUALITY_REPORT_FILE: &str = "quality_report.json";
 pub(crate) const APP_SUB_GOALS_FILE: &str = "sub_goals.json";
 const LOCAL_RUNTIME_LOG_TAIL_BYTES: usize = 4096;
-const DYNAMIC_RUNTIME_READY_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_DYNAMIC_RUNTIME_READY_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_DYNAMIC_RUNTIME_INSTALL_TIMEOUT_SECS: u64 = 1_800;
+const DEFAULT_DOCKER_LAUNCH_TIMEOUT_SECS: u64 = 120;
 const DYNAMIC_RUNTIME_READY_POLL_MS: u64 = 500;
 const DYNAMIC_RUNTIME_PROGRESS_INTERVAL_SECS: u64 = 5;
 const APP_ACCESS_BOOTSTRAP_TTL_SECS: i64 = 10 * 60;
@@ -51,6 +53,46 @@ fn startup_restore_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|value| value.get().clamp(2, 8))
         .unwrap_or(4)
+}
+
+fn env_timeout_secs(name: &str, default_value: u64, min_value: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= min_value)
+        .unwrap_or(default_value)
+}
+
+fn dynamic_runtime_ready_timeout_secs() -> u64 {
+    env_timeout_secs(
+        "AGENTARK_APP_RUNTIME_READY_TIMEOUT_SECS",
+        DEFAULT_DYNAMIC_RUNTIME_READY_TIMEOUT_SECS,
+        5,
+    )
+}
+
+fn dynamic_runtime_install_timeout_secs() -> u64 {
+    env_timeout_secs(
+        "AGENTARK_APP_INSTALL_TIMEOUT_SECS",
+        DEFAULT_DYNAMIC_RUNTIME_INSTALL_TIMEOUT_SECS,
+        30,
+    )
+}
+
+fn docker_launch_timeout_secs() -> u64 {
+    env_timeout_secs(
+        "AGENTARK_APP_DOCKER_LAUNCH_TIMEOUT_SECS",
+        DEFAULT_DOCKER_LAUNCH_TIMEOUT_SECS,
+        15,
+    )
+}
+
+fn app_access_guard_enabled_for_deploy(
+    expose_public: bool,
+    requested_access_guard_enabled: bool,
+    has_access_secret: bool,
+) -> bool {
+    requested_access_guard_enabled || (!expose_public && has_access_secret)
 }
 
 fn configured_runtime_image() -> Option<String> {
@@ -314,7 +356,6 @@ fn record_static_asset_reference(
     raw_ref: &str,
     available_files: &HashSet<String>,
     missing_refs: &mut Vec<String>,
-    root_absolute_refs: &mut Vec<String>,
 ) {
     match resolve_static_asset_reference(owner_file, raw_ref) {
         Some(StaticAssetReference::Bundled(path)) => {
@@ -326,10 +367,15 @@ fn record_static_asset_reference(
             }
         }
         Some(StaticAssetReference::RootAbsolute(path)) => {
-            root_absolute_refs.push(format!(
-                "{} references root-relative asset {}",
-                owner_file, path
-            ));
+            let bundled_path = normalize_static_bundle_path(path.trim_start_matches('/'));
+            if let Some(bundled_path) = bundled_path {
+                if !available_files.contains(&bundled_path) {
+                    missing_refs.push(format!(
+                        "{} references missing root-relative local asset {}",
+                        owner_file, path
+                    ));
+                }
+            }
         }
         None => {}
     }
@@ -344,7 +390,6 @@ fn validate_static_app_asset_references(
         .collect();
     validate_static_app_html_structure(files)?;
     let mut missing_refs: Vec<String> = Vec::new();
-    let mut root_absolute_refs: Vec<String> = Vec::new();
 
     let html_selectors = [
         ("link[href]", "href"),
@@ -380,7 +425,6 @@ fn validate_static_app_asset_references(
                             raw,
                             &available_files,
                             &mut missing_refs,
-                            &mut root_absolute_refs,
                         );
                     }
                 }
@@ -394,7 +438,6 @@ fn validate_static_app_asset_references(
                                 candidate,
                                 &available_files,
                                 &mut missing_refs,
-                                &mut root_absolute_refs,
                             );
                         }
                     }
@@ -407,36 +450,22 @@ fn validate_static_app_asset_references(
                     &raw_ref,
                     &available_files,
                     &mut missing_refs,
-                    &mut root_absolute_refs,
                 );
             }
         }
     }
 
-    if missing_refs.is_empty() && root_absolute_refs.is_empty() {
+    if missing_refs.is_empty() {
         return Ok(());
     }
 
     missing_refs.sort();
     missing_refs.dedup();
-    root_absolute_refs.sort();
-    root_absolute_refs.dedup();
     let mut details = Vec::new();
     if !missing_refs.is_empty() {
         details.push(format!(
             "missing bundled files: {}",
             missing_refs
-                .iter()
-                .take(8)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
-    }
-    if !root_absolute_refs.is_empty() {
-        details.push(format!(
-            "root-relative asset paths will not resolve under the app URL; use relative paths instead: {}",
-            root_absolute_refs
                 .iter()
                 .take(8)
                 .cloned()
@@ -455,6 +484,7 @@ async fn restart_delegated_runtime(
     title: &str,
     access_guard_enabled: bool,
     access_key: &str,
+    expose_public: bool,
 ) -> Result<serde_json::Value> {
     let executor = control_plane_executor_client()
         .ok_or_else(|| anyhow::anyhow!("Executor service is not configured"))?;
@@ -507,6 +537,9 @@ async fn restart_delegated_runtime(
         "access_key": access_key,
         "access_password": access_key,
         "access_guard_enabled": access_guard_enabled,
+        "public_access_guard_enabled": access_guard_enabled || expose_public,
+        "expose_public": expose_public,
+        "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
         "port": raw.get("port").cloned().unwrap_or(serde_json::Value::Null),
         "runtime_preference": raw
             .get("runtime_mode")
@@ -870,9 +903,7 @@ fn load_readme_hints(dir: &Path) -> Option<(String, RepoReadmeHints)> {
     Some((relative, extract_readme_hints(&content)))
 }
 
-fn load_node_manifest(dir: &Path) -> Option<RepoNodeManifest> {
-    let raw = read_text_file_limited(&dir.join("package.json"), MAX_REPO_TEXT_FILE_BYTES)?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+fn parse_node_manifest_value(parsed: &serde_json::Value) -> RepoNodeManifest {
     let mut manifest = RepoNodeManifest {
         name: parsed
             .get("name")
@@ -902,7 +933,17 @@ fn load_node_manifest(dir: &Path) -> Option<RepoNodeManifest> {
             }
         }
     }
-    Some(manifest)
+    manifest
+}
+
+fn parse_node_manifest_text(raw: &str) -> Option<RepoNodeManifest> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    Some(parse_node_manifest_value(&parsed))
+}
+
+fn load_node_manifest(dir: &Path) -> Option<RepoNodeManifest> {
+    let raw = read_text_file_limited(&dir.join("package.json"), MAX_REPO_TEXT_FILE_BYTES)?;
+    parse_node_manifest_text(&raw)
 }
 
 fn load_python_dependency_text(dir: &Path) -> String {
@@ -1181,6 +1222,20 @@ fn build_node_commands(
     manifest: &RepoNodeManifest,
     root_has_workspaces: bool,
 ) -> Option<(RepoServiceKind, String, String)> {
+    build_node_commands_from_manifest(relative_dir, manifest, root_has_workspaces, |entry| {
+        dir.join(entry).exists()
+    })
+}
+
+fn build_node_commands_from_manifest<F>(
+    relative_dir: &str,
+    manifest: &RepoNodeManifest,
+    root_has_workspaces: bool,
+    entry_file_exists: F,
+) -> Option<(RepoServiceKind, String, String)>
+where
+    F: Fn(&str) -> bool,
+{
     let kind = classify_node_service_kind(manifest, relative_dir);
     let install_command = if relative_dir.trim().is_empty() || root_has_workspaces {
         "npm install --omit=dev".to_string()
@@ -1231,13 +1286,13 @@ fn build_node_commands(
         } else {
             build_node_run_command(manifest, relative_dir, "dev", &[], root_has_workspaces)
         }
-    } else if dir.join("server.js").exists() {
+    } else if entry_file_exists("server.js") {
         let path = build_relative_file_arg(relative_dir, "server.js");
         format!("node {}", shell_quote_arg(&path))
-    } else if dir.join("app.js").exists() {
+    } else if entry_file_exists("app.js") {
         let path = build_relative_file_arg(relative_dir, "app.js");
         format!("node {}", shell_quote_arg(&path))
-    } else if dir.join("index.js").exists() && matches!(kind, RepoServiceKind::Backend) {
+    } else if entry_file_exists("index.js") && matches!(kind, RepoServiceKind::Backend) {
         let path = build_relative_file_arg(relative_dir, "index.js");
         format!("node {}", shell_quote_arg(&path))
     } else {
@@ -1245,6 +1300,365 @@ fn build_node_commands(
     };
 
     Some((kind, install_command, entry_command))
+}
+
+#[derive(Debug, Clone)]
+struct GeneratedBundleLifecycleInference {
+    install_command: Option<String>,
+    entry_command: String,
+    runtime_reason: String,
+}
+
+fn text_files_from_effective_bundle(
+    files: &serde_json::Map<String, serde_json::Value>,
+) -> HashMap<String, String> {
+    files
+        .iter()
+        .filter_map(|(path, value)| {
+            value.as_str().map(|content| {
+                (
+                    normalize_repo_relative_path(Path::new(path)),
+                    content.to_string(),
+                )
+            })
+        })
+        .filter(|(path, _)| !path.is_empty())
+        .collect()
+}
+
+fn bundle_parent_dir(path: &str, filename: &str) -> Option<String> {
+    let normalized = normalize_repo_relative_path(Path::new(path));
+    if normalized == filename {
+        return Some(String::new());
+    }
+    normalized
+        .strip_suffix(&format!("/{}", filename))
+        .map(|parent| parent.trim_matches('/').to_string())
+}
+
+fn bundle_candidate_dirs_with_file(files: &HashMap<String, String>, filename: &str) -> Vec<String> {
+    let mut dirs = files
+        .keys()
+        .filter_map(|path| bundle_parent_dir(path, filename))
+        .collect::<Vec<_>>();
+    dirs.sort_by_key(|dir| (dir.matches('/').count(), dir.len(), dir.clone()));
+    dirs.dedup();
+    dirs
+}
+
+fn bundle_file_path(relative_dir: &str, filename: &str) -> String {
+    normalize_repo_relative_path(Path::new(&build_relative_file_arg(relative_dir, filename)))
+}
+
+fn bundle_file_exists(files: &HashMap<String, String>, relative_dir: &str, filename: &str) -> bool {
+    files.contains_key(&bundle_file_path(relative_dir, filename))
+}
+
+fn bundle_file_text<'a>(
+    files: &'a HashMap<String, String>,
+    relative_dir: &str,
+    filename: &str,
+) -> Option<&'a str> {
+    files
+        .get(&bundle_file_path(relative_dir, filename))
+        .map(String::as_str)
+}
+
+fn infer_generated_node_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    let root_has_workspaces = files
+        .get("package.json")
+        .and_then(|raw| parse_node_manifest_text(raw))
+        .map(|manifest| manifest.has_workspaces)
+        .unwrap_or(false);
+
+    for relative_dir in bundle_candidate_dirs_with_file(files, "package.json") {
+        let Some(manifest) = bundle_file_text(files, &relative_dir, "package.json")
+            .and_then(parse_node_manifest_text)
+        else {
+            continue;
+        };
+        let Some((_kind, install_command, entry_command)) = build_node_commands_from_manifest(
+            &relative_dir,
+            &manifest,
+            root_has_workspaces,
+            |entry| bundle_file_exists(files, &relative_dir, entry),
+        ) else {
+            continue;
+        };
+        return Some(GeneratedBundleLifecycleInference {
+            install_command: Some(install_command),
+            entry_command,
+            runtime_reason: "generated bundle contains a runnable Node package manifest"
+                .to_string(),
+        });
+    }
+    None
+}
+
+fn generated_python_dependency_text(files: &HashMap<String, String>, relative_dir: &str) -> String {
+    let mut combined = String::new();
+    for candidate in ["requirements.txt", "pyproject.toml"] {
+        if let Some(text) = bundle_file_text(files, relative_dir, candidate) {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(text);
+        }
+    }
+    combined.to_ascii_lowercase()
+}
+
+fn generated_python_install_command(
+    files: &HashMap<String, String>,
+    relative_dir: &str,
+) -> Option<String> {
+    if bundle_file_exists(files, relative_dir, "requirements.txt") {
+        return Some(format!(
+            "pip install -r {} -q",
+            shell_quote_arg(&build_relative_file_arg(relative_dir, "requirements.txt"))
+        ));
+    }
+    if bundle_file_exists(files, relative_dir, "pyproject.toml") {
+        return Some(if relative_dir.trim().is_empty() {
+            "pip install -e .".to_string()
+        } else {
+            format!("pip install -e {}", shell_quote_arg(relative_dir))
+        });
+    }
+    None
+}
+
+fn generated_python_entry_content<'a>(
+    files: &'a HashMap<String, String>,
+    relative_dir: &str,
+    candidates: &[&str],
+) -> Option<(String, &'a str)> {
+    for candidate in candidates {
+        if let Some(text) = bundle_file_text(files, relative_dir, candidate) {
+            return Some((candidate.to_string(), text));
+        }
+    }
+    None
+}
+
+fn infer_generated_python_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    let mut dirs = Vec::new();
+    for filename in [
+        "requirements.txt",
+        "pyproject.toml",
+        "manage.py",
+        "server.py",
+        "app.py",
+        "main.py",
+        "run.py",
+        "streamlit_app.py",
+    ] {
+        dirs.extend(bundle_candidate_dirs_with_file(files, filename));
+    }
+    dirs.sort_by_key(|dir| (dir.matches('/').count(), dir.len(), dir.clone()));
+    dirs.dedup();
+
+    for relative_dir in dirs {
+        let dependency_text = generated_python_dependency_text(files, &relative_dir);
+        let install_command = generated_python_install_command(files, &relative_dir);
+
+        if bundle_file_exists(files, &relative_dir, "manage.py") {
+            return Some(GeneratedBundleLifecycleInference {
+                install_command,
+                entry_command: format!(
+                    "python {} runserver 0.0.0.0:{{PORT}}",
+                    shell_quote_arg(&build_relative_file_arg(&relative_dir, "manage.py"))
+                ),
+                runtime_reason: "generated bundle contains a Python web project entry point"
+                    .to_string(),
+            });
+        }
+
+        if dependency_text.contains("streamlit") {
+            if let Some((entry, _)) = generated_python_entry_content(
+                files,
+                &relative_dir,
+                &["app.py", "main.py", "streamlit_app.py"],
+            ) {
+                return Some(GeneratedBundleLifecycleInference {
+                    install_command,
+                    entry_command: format!(
+                        "streamlit run {} --server.address 0.0.0.0 --server.port {{PORT}}",
+                        shell_quote_arg(&build_relative_file_arg(&relative_dir, &entry))
+                    ),
+                    runtime_reason: "generated bundle contains a Streamlit application".to_string(),
+                });
+            }
+        }
+
+        for entry in ["main.py", "app.py", "server.py", "api.py"] {
+            if let Some(text) = bundle_file_text(files, &relative_dir, entry) {
+                if text.contains("FastAPI(") || text.contains("from fastapi import") {
+                    let module = entry.trim_end_matches(".py");
+                    let app_dir_arg = if relative_dir.trim().is_empty() {
+                        "."
+                    } else {
+                        relative_dir.as_str()
+                    };
+                    return Some(GeneratedBundleLifecycleInference {
+                        install_command,
+                        entry_command: format!(
+                            "uvicorn --app-dir {} {}:app --host 0.0.0.0 --port {{PORT}}",
+                            shell_quote_arg(app_dir_arg),
+                            module
+                        ),
+                        runtime_reason: "generated bundle contains a FastAPI application"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+
+        for entry in ["app.py", "main.py", "server.py", "wsgi.py"] {
+            if let Some(text) = bundle_file_text(files, &relative_dir, entry) {
+                if text.contains("Flask(") || text.contains("from flask import") {
+                    return Some(GeneratedBundleLifecycleInference {
+                        install_command,
+                        entry_command: format!(
+                            "flask --app {} run --host 0.0.0.0 --port {{PORT}}",
+                            shell_quote_arg(&build_relative_file_arg(&relative_dir, entry))
+                        ),
+                        runtime_reason: "generated bundle contains a Flask application".to_string(),
+                    });
+                }
+            }
+        }
+
+        if dependency_text.contains("gradio") {
+            if let Some((entry, _)) =
+                generated_python_entry_content(files, &relative_dir, &["app.py", "main.py"])
+            {
+                return Some(GeneratedBundleLifecycleInference {
+                    install_command,
+                    entry_command: format!(
+                        "python {}",
+                        shell_quote_arg(&build_relative_file_arg(&relative_dir, &entry))
+                    ),
+                    runtime_reason: "generated bundle contains a Gradio application".to_string(),
+                });
+            }
+        }
+
+        if let Some((entry, _)) = generated_python_entry_content(
+            files,
+            &relative_dir,
+            &["server.py", "app.py", "main.py", "run.py"],
+        ) {
+            return Some(GeneratedBundleLifecycleInference {
+                install_command,
+                entry_command: format!(
+                    "python {}",
+                    shell_quote_arg(&build_relative_file_arg(&relative_dir, &entry))
+                ),
+                runtime_reason: "generated bundle contains a Python server entry point".to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn infer_generated_rust_bundle_lifecycle(
+    files: &HashMap<String, String>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    for relative_dir in bundle_candidate_dirs_with_file(files, "Cargo.toml") {
+        let entry_command = if relative_dir.trim().is_empty() {
+            "cargo run".to_string()
+        } else {
+            format!(
+                "cargo run --manifest-path {}",
+                shell_quote_arg(&build_relative_file_arg(&relative_dir, "Cargo.toml"))
+            )
+        };
+        return Some(GeneratedBundleLifecycleInference {
+            install_command: None,
+            entry_command,
+            runtime_reason: "generated bundle contains a Cargo manifest".to_string(),
+        });
+    }
+    None
+}
+
+fn infer_generated_bundle_lifecycle(
+    files: &serde_json::Map<String, serde_json::Value>,
+) -> Option<GeneratedBundleLifecycleInference> {
+    let text_files = text_files_from_effective_bundle(files);
+    infer_generated_node_bundle_lifecycle(&text_files)
+        .or_else(|| infer_generated_python_bundle_lifecycle(&text_files))
+        .or_else(|| infer_generated_rust_bundle_lifecycle(&text_files))
+}
+
+fn set_generated_app_lifecycle_meta(
+    meta: &mut serde_json::Value,
+    inferred: &GeneratedBundleLifecycleInference,
+) {
+    let install_missing = app_meta_lifecycle_command(meta, "install_command").is_none();
+    let Some(obj) = meta.as_object_mut() else {
+        return;
+    };
+
+    obj.insert(
+        "entry_command".to_string(),
+        serde_json::Value::String(inferred.entry_command.clone()),
+    );
+    obj.insert(
+        "start_command".to_string(),
+        serde_json::Value::String(inferred.entry_command.clone()),
+    );
+    obj.insert(
+        "runtime_required".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    obj.insert(
+        "runtime_reason".to_string(),
+        serde_json::Value::String(inferred.runtime_reason.clone()),
+    );
+    obj.insert(
+        "updated_at".to_string(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+
+    let commands = obj
+        .entry("commands".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !commands.is_object() {
+        *commands = serde_json::json!({});
+    }
+    if let Some(commands) = commands.as_object_mut() {
+        commands.insert(
+            "start".to_string(),
+            serde_json::Value::String(inferred.entry_command.clone()),
+        );
+        commands.insert(
+            "entry".to_string(),
+            serde_json::Value::String(inferred.entry_command.clone()),
+        );
+        if install_missing {
+            if let Some(install) = inferred.install_command.as_ref() {
+                commands.insert(
+                    "install".to_string(),
+                    serde_json::Value::String(install.clone()),
+                );
+            }
+        }
+    }
+
+    if install_missing {
+        if let Some(install) = inferred.install_command.as_ref() {
+            obj.insert(
+                "install_command".to_string(),
+                serde_json::Value::String(install.clone()),
+            );
+        }
+    }
 }
 
 fn collect_env_example_inputs(scope_root: &Path) -> Vec<AppRequiredInput> {
@@ -1890,12 +2304,11 @@ async fn deploy_repo_bundle(
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     let access_secret = access_secret_from_arguments(arguments)?;
-    let access_guard_enabled = requested_access_guard_enabled || access_secret.is_some();
-    if expose_public && access_secret.is_none() {
-        anyhow::bail!(
-            "Public apps require an explicit access password. Provide access_password when expose_public=true."
-        );
-    }
+    let access_guard_enabled = app_access_guard_enabled_for_deploy(
+        expose_public,
+        requested_access_guard_enabled,
+        access_secret.is_some(),
+    );
     let runtime_image = arguments.get("runtime_image").cloned();
 
     let fingerprint = repo_deploy_fingerprint(
@@ -2150,11 +2563,16 @@ async fn deploy_repo_bundle(
                         .and_then(|value| value.as_str())
                         .or_else(|| parsed.get("access_key").and_then(|value| value.as_str()))
                         .unwrap_or_default();
+                    let delegated_expose_public = parsed
+                        .get("expose_public")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(expose_public);
                     match restart_delegated_runtime(
                         app_id,
                         delegated_title,
                         delegated_access_guard_enabled,
                         delegated_access_key,
+                        delegated_expose_public,
                     )
                     .await
                     .with_context(|| {
@@ -2243,6 +2661,7 @@ async fn deploy_repo_bundle(
         "readme_file": readme_file,
         "readme_mentions_compose": readme_mentions_compose,
         "created_at": chrono::Utc::now().to_rfc3339(),
+        "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
         "services": deployed_services,
     });
     tokio::fs::write(
@@ -2276,6 +2695,7 @@ async fn deploy_repo_bundle(
         "service_count": deployed_services.len(),
         "deployed_count": success_like_count,
         "failed_count": failure_count,
+        "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
         "services": deployed_services,
     })
     .to_string())
@@ -2486,12 +2906,78 @@ fn build_dynamic_container_run_args(
     image: &str,
     container_name: String,
     env_file_path: Option<&Path>,
+    network_container_ref: Option<&str>,
     launch_script: String,
 ) -> Vec<String> {
     let mount = normalize_mount_path(app_dir);
     let mut args = vec![
         "run".to_string(),
         "-d".to_string(),
+        "--memory".to_string(),
+        "512m".to_string(),
+        "--memory-swap".to_string(),
+        "512m".to_string(),
+        "--cpus".to_string(),
+        "0.5".to_string(),
+        "--pids-limit".to_string(),
+        "128".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges=true".to_string(),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--user".to_string(),
+        "65532:65532".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp:size=64m,noexec,nosuid,nodev".to_string(),
+        "--name".to_string(),
+        container_name,
+        "-v".to_string(),
+        format!("{}:/workspace", mount),
+        "-w".to_string(),
+        "/workspace".to_string(),
+        "--label".to_string(),
+        "agentark.managed=true".to_string(),
+        "--label".to_string(),
+        format!("agentark.app_id={}", app_id),
+        "--entrypoint".to_string(),
+        "/bin/sh".to_string(),
+        "-e".to_string(),
+        format!("PORT={}", port),
+        "-e".to_string(),
+        "HOST=0.0.0.0".to_string(),
+    ];
+    if let Some(container_ref) = network_container_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push("--network".to_string());
+        args.push(format!("container:{}", container_ref));
+    } else {
+        args.push("-p".to_string());
+        args.push(format!("127.0.0.1:{0}:{0}", port));
+    }
+    if let Some(path) = env_file_path {
+        args.push("--env-file".to_string());
+        args.push(path.to_string_lossy().to_string());
+    }
+    args.push(image.to_string());
+    args.push("-lc".to_string());
+    args.push(launch_script);
+    args
+}
+
+fn build_dynamic_container_install_args(
+    app_id: &str,
+    app_dir: &Path,
+    port: u16,
+    image: &str,
+    container_name: String,
+    env_file_path: Option<&Path>,
+    install_script: String,
+) -> Vec<String> {
+    let mount = normalize_mount_path(app_dir);
+    let mut args = vec![
+        "run".to_string(),
         "--rm".to_string(),
         "--memory".to_string(),
         "512m".to_string(),
@@ -2511,8 +2997,8 @@ fn build_dynamic_container_run_args(
         "/tmp:size=64m,noexec,nosuid,nodev".to_string(),
         "--name".to_string(),
         container_name,
-        "-p".to_string(),
-        format!("127.0.0.1:{0}:{0}", port),
+        "--entrypoint".to_string(),
+        "/bin/sh".to_string(),
         "-v".to_string(),
         format!("{}:/workspace", mount),
         "-w".to_string(),
@@ -2531,9 +3017,8 @@ fn build_dynamic_container_run_args(
         args.push(path.to_string_lossy().to_string());
     }
     args.push(image.to_string());
-    args.push("sh".to_string());
     args.push("-lc".to_string());
-    args.push(launch_script);
+    args.push(install_script);
     args
 }
 
@@ -2815,15 +3300,12 @@ async fn run_docker(
     let fut = cmd.output();
     tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
         .await
-        .map_err(|_| anyhow::anyhow!("docker command timed out"))?
+        .map_err(|_| anyhow::anyhow!("docker command timed out after {}s", timeout_secs))?
         .map_err(|e| anyhow::anyhow!("failed to execute docker: {}", e))
 }
 
 async fn discover_current_agent_image() -> Option<String> {
-    let container_ref = std::env::var("HOSTNAME")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())?;
+    let container_ref = current_container_ref_from_env()?;
     let args = vec![
         "inspect".to_string(),
         "-f".to_string(),
@@ -2839,6 +3321,33 @@ async fn discover_current_agent_image() -> Option<String> {
         None
     } else {
         Some(image)
+    }
+}
+
+fn current_container_ref_from_env() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn discover_current_container_ref() -> Option<String> {
+    let container_ref = current_container_ref_from_env()?;
+    let args = vec![
+        "inspect".to_string(),
+        "-f".to_string(),
+        "{{.Id}}".to_string(),
+        container_ref.clone(),
+    ];
+    let output = run_docker(&args, None, 20).await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
     }
 }
 
@@ -3638,6 +4147,14 @@ fn with_node_bin_path(app_dir: &Path) -> Option<String> {
         .and_then(|os| os.into_string().ok())
 }
 
+fn node_modules_populated(app_dir: &Path) -> bool {
+    let modules = app_dir.join("node_modules");
+    modules.is_dir()
+        && std::fs::read_dir(&modules)
+            .map(|iter| iter.take(2).count() > 0)
+            .unwrap_or(false)
+}
+
 /// True if the app declares Python dependencies. Used to decide whether to
 /// bootstrap a per-app venv when the entry/install commands don't obviously
 /// look like Python (e.g. a Makefile target that wraps `pytest`).
@@ -3660,14 +4177,8 @@ fn detect_node_install_command(app_dir: &Path) -> Option<&'static str> {
     if !app_dir.join("package.json").is_file() {
         return None;
     }
-    let modules = app_dir.join("node_modules");
-    if modules.is_dir() {
-        let populated = std::fs::read_dir(&modules)
-            .map(|iter| iter.take(2).count() > 0)
-            .unwrap_or(false);
-        if populated {
-            return None;
-        }
+    if node_modules_populated(app_dir) {
+        return None;
     }
     if app_dir.join("pnpm-lock.yaml").is_file() {
         Some("pnpm install")
@@ -3676,6 +4187,40 @@ fn detect_node_install_command(app_dir: &Path) -> Option<&'static str> {
     } else {
         Some("npm install")
     }
+}
+
+fn install_command_is_node_dependency_install(command: &str) -> bool {
+    let Ok(args) = split_command_args(command, "install_command") else {
+        return false;
+    };
+    let Some(program) = args.first().map(|value| command_program_name(value)) else {
+        return false;
+    };
+    match program.as_str() {
+        "npm" => args
+            .iter()
+            .skip(1)
+            .any(|arg| matches!(arg.as_str(), "install" | "i" | "ci")),
+        "pnpm" => args
+            .iter()
+            .skip(1)
+            .any(|arg| matches!(arg.as_str(), "install" | "i")),
+        "yarn" => args
+            .get(1)
+            .map(|arg| matches!(arg.as_str(), "install" | "add"))
+            .unwrap_or(true),
+        "bun" => args
+            .iter()
+            .skip(1)
+            .any(|arg| matches!(arg.as_str(), "install" | "i")),
+        _ => false,
+    }
+}
+
+fn should_skip_redundant_install_command(app_dir: &Path, command: &str) -> bool {
+    app_dir.join("package.json").is_file()
+        && node_modules_populated(app_dir)
+        && install_command_is_node_dependency_install(command)
 }
 
 /// Walk PATH and return true if any candidate program resolves to an existing
@@ -4151,11 +4696,17 @@ pub async fn launch_dynamic_container(
 
     let mut entry_cmd = validate_app_command(entry_command, "entry_command")?;
     entry_cmd = apply_app_mount_base_to_vite_entry_command(&entry_cmd, app_dir, app_id)?;
-    let install_cmd = if let Some(cmd) = install_command {
+    let mut install_cmd = if let Some(cmd) = install_command {
         Some(validate_app_command(cmd, "install_command")?)
     } else {
         None
     };
+    if install_cmd
+        .as_deref()
+        .is_some_and(|cmd| should_skip_redundant_install_command(app_dir, cmd))
+    {
+        install_cmd = None;
+    }
     let uses_python_runtime = command_looks_python_related(&entry_cmd)
         || install_cmd
             .as_deref()
@@ -4165,22 +4716,26 @@ pub async fn launch_dynamic_container(
         entry_cmd = normalize_python_runtime_command_for_container(&entry_cmd);
     }
 
-    let mut script_parts: Vec<String> = Vec::new();
-    script_parts.push("set -e".to_string());
-    script_parts.push("export PATH=\"/workspace/node_modules/.bin:$PATH\"".to_string());
-    script_parts
+    let mut setup_parts: Vec<String> = Vec::new();
+    setup_parts.push("set -e".to_string());
+    setup_parts.push("export PATH=\"/workspace/node_modules/.bin:$PATH\"".to_string());
+    setup_parts
         .push("export PYTHONPATH=\"/workspace/_deps${PYTHONPATH:+:$PYTHONPATH}\"".to_string());
     if uses_python_runtime {
-        script_parts.push(
+        setup_parts.push(
             "if [ ! -x /workspace/.venv/bin/python ]; then python3 -m venv /workspace/.venv || python -m venv /workspace/.venv || true; fi".to_string(),
         );
-        script_parts.push(
+        setup_parts.push(
             "if [ -x /workspace/.venv/bin/python ]; then . /workspace/.venv/bin/activate; fi"
                 .to_string(),
         );
-        script_parts.push("export PIP_DISABLE_PIP_VERSION_CHECK=1".to_string());
-        script_parts.push("export PIP_BREAK_SYSTEM_PACKAGES=1".to_string());
+        setup_parts.push("export PIP_DISABLE_PIP_VERSION_CHECK=1".to_string());
+        setup_parts.push("export PIP_BREAK_SYSTEM_PACKAGES=1".to_string());
     }
+    let image = resolve_runtime_image(runtime_image).await;
+    let network_container_ref = discover_current_container_ref().await;
+    let env_file_path = write_runtime_env_file(app_dir, extra_env).await?;
+
     if let Some(ref cmd) = install_cmd {
         let trimmed = cmd.trim();
         if !trimmed.is_empty() {
@@ -4189,16 +4744,58 @@ pub async fn launch_dynamic_container(
             } else {
                 trimmed.to_string()
             };
-            script_parts.push(normalized);
+            let mut install_parts = setup_parts.clone();
+            install_parts.push(normalized);
+            let install_script = install_parts
+                .join(" && ")
+                .replace("{PORT}", &port.to_string());
+            let install_container_name = format!(
+                "{}-install-{}",
+                app_container_name(app_id),
+                uuid::Uuid::new_v4().to_string()[..8].to_string()
+            );
+            let install_args = build_dynamic_container_install_args(
+                app_id,
+                app_dir,
+                port,
+                &image,
+                install_container_name,
+                env_file_path.as_deref(),
+                install_script,
+            );
+            let install_output =
+                run_docker(&install_args, None, dynamic_runtime_install_timeout_secs()).await;
+            match install_output {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    let _ = env_file_path
+                        .as_ref()
+                        .map(|path| std::fs::remove_file(path));
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let detail = if !stderr.trim().is_empty() {
+                        stderr.trim().to_string()
+                    } else {
+                        stdout.trim().to_string()
+                    };
+                    anyhow::bail!("install_command failed for app {}: {}", app_id, detail);
+                }
+                Err(error) => {
+                    let _ = env_file_path
+                        .as_ref()
+                        .map(|path| std::fs::remove_file(path));
+                    return Err(error)
+                        .with_context(|| format!("install_command failed for app {}", app_id));
+                }
+            }
         }
     }
-    script_parts.push(entry_cmd.trim().to_string());
-    let launch_script = script_parts
+
+    let mut launch_parts = setup_parts;
+    launch_parts.push(entry_cmd.trim().to_string());
+    let launch_script = launch_parts
         .join(" && ")
         .replace("{PORT}", &port.to_string());
-
-    let image = resolve_runtime_image(runtime_image).await;
-    let env_file_path = write_runtime_env_file(app_dir, extra_env).await?;
     let args = build_dynamic_container_run_args(
         app_id,
         app_dir,
@@ -4206,10 +4803,11 @@ pub async fn launch_dynamic_container(
         &image,
         container_name,
         env_file_path.as_deref(),
+        network_container_ref.as_deref(),
         launch_script,
     );
 
-    let output = run_docker(&args, None, 90).await;
+    let output = run_docker(&args, None, docker_launch_timeout_secs()).await;
     if let Some(path) = env_file_path {
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -4244,7 +4842,7 @@ pub async fn launch_dynamic_process(
         "entry_command",
     )?;
 
-    let install_command = if let Some(cmd) = install_command {
+    let mut install_command = if let Some(cmd) = install_command {
         Some(validate_app_command(
             &cmd.replace("{PORT}", &port.to_string()),
             "install_command",
@@ -4252,6 +4850,12 @@ pub async fn launch_dynamic_process(
     } else {
         None
     };
+    if install_command
+        .as_deref()
+        .is_some_and(|cmd| should_skip_redundant_install_command(app_dir, cmd))
+    {
+        install_command = None;
+    }
 
     let mut runtime_env: HashMap<String, String> = HashMap::new();
     runtime_env.insert("PORT".to_string(), port.to_string());
@@ -4327,7 +4931,7 @@ pub async fn launch_dynamic_process(
             "install_command",
             app_dir,
             &runtime_env,
-            600,
+            dynamic_runtime_install_timeout_secs(),
             &stream_tx,
             "install",
         )
@@ -4366,7 +4970,7 @@ pub async fn launch_dynamic_process(
             "node_install",
             app_dir,
             &runtime_env,
-            600,
+            dynamic_runtime_install_timeout_secs(),
             &stream_tx,
             "install",
         )
@@ -4437,6 +5041,30 @@ pub async fn launch_dynamic_process(
 pub enum DynamicRuntimeHandle {
     Container(String),
     Process(Box<tokio::process::Child>),
+}
+
+pub async fn stop_dynamic_runtime_handle(app_id: &str, handle: &mut DynamicRuntimeHandle) {
+    match handle {
+        DynamicRuntimeHandle::Container(container_id) => {
+            if let Err(error) = stop_container(container_id.as_str()).await {
+                tracing::warn!(
+                    app_id = %app_id,
+                    container_id = %container_id.as_str(),
+                    error = %error,
+                    "Failed to stop unregistered app container after readiness failure"
+                );
+            }
+        }
+        DynamicRuntimeHandle::Process(child) => {
+            if let Err(error) = stop_child_process(child.as_mut(), app_id).await {
+                tracing::warn!(
+                    app_id = %app_id,
+                    error = %error,
+                    "Failed to stop unregistered app process after readiness failure"
+                );
+            }
+        }
+    }
 }
 
 pub struct DynamicRuntimeLaunch<'a> {
@@ -5303,6 +5931,24 @@ fn app_meta_managed_files(meta: &Option<serde_json::Value>) -> Vec<String> {
 }
 
 fn collect_existing_app_bundle_paths_sync(app_dir: &Path) -> Result<Vec<String>> {
+    fn should_skip_restored_app_path(relative: &str) -> bool {
+        let mut parts = relative.split('/').filter(|part| !part.is_empty());
+        if let Some(first) = parts.next() {
+            if matches!(
+                first,
+                ".agentark" | ".git" | ".venv" | "venv" | "node_modules" | "__pycache__" | "target"
+            ) {
+                return true;
+            }
+        }
+        let file_name = relative.rsplit('/').next().unwrap_or(relative);
+        file_name == ".app_meta.json"
+            || file_name.starts_with(".agentark_runtime_")
+            || file_name == "package-lock.json"
+            || file_name == "yarn.lock"
+            || file_name == "pnpm-lock.yaml"
+    }
+
     fn visit(root: &Path, current: &Path, out: &mut Vec<String>) -> Result<()> {
         for entry in std::fs::read_dir(current)
             .with_context(|| format!("Failed to read app directory '{}'", current.display()))?
@@ -5310,6 +5956,15 @@ fn collect_existing_app_bundle_paths_sync(app_dir: &Path) -> Result<Vec<String>>
             let entry = entry?;
             let path = entry.path();
             let file_type = entry.file_type()?;
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|value| value.to_str())
+                .map(|value| value.replace('\\', "/"))
+                .unwrap_or_default();
+            if should_skip_restored_app_path(&relative) {
+                continue;
+            }
             if file_type.is_dir() {
                 visit(root, &path, out)?;
                 continue;
@@ -5317,12 +5972,6 @@ fn collect_existing_app_bundle_paths_sync(app_dir: &Path) -> Result<Vec<String>>
             if !file_type.is_file() {
                 continue;
             }
-            let relative = path
-                .strip_prefix(root)
-                .ok()
-                .and_then(|value| value.to_str())
-                .map(|value| value.replace('\\', "/"))
-                .unwrap_or_default();
             let Ok(relative) = normalize_app_bundle_relative_path(&relative, "existing app files")
             else {
                 continue;
@@ -5596,7 +6245,7 @@ pub async fn app_deploy_preflight(
         );
     }
 
-    let has_entry_command = arguments
+    let has_explicit_entry_command = arguments
         .get("entry_command")
         .or_else(|| arguments.get("start_command"))
         .or_else(|| {
@@ -5613,13 +6262,14 @@ pub async fn app_deploy_preflight(
             .and_then(|value| app_meta_lifecycle_command(value, "entry_command"))
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false);
-    if !has_entry_command {
-        let effective_files =
-            effective_app_files_for_validation(existing_app_dir.as_deref(), &existing_meta, &plan)
-                .await?;
-        if effective_files.is_empty() {
-            anyhow::bail!("Static app bundle would be empty after applying this deploy");
-        }
+    let effective_files =
+        effective_app_files_for_validation(existing_app_dir.as_deref(), &existing_meta, &plan)
+            .await?;
+    if effective_files.is_empty() {
+        anyhow::bail!("App bundle would be empty after applying this deploy");
+    }
+    let inferred_lifecycle = infer_generated_bundle_lifecycle(&effective_files);
+    if !has_explicit_entry_command && inferred_lifecycle.is_none() {
         validate_static_app_asset_references(&effective_files)?;
     }
     Ok(())
@@ -5736,6 +6386,9 @@ pub fn generate_access_key() -> String {
     format!("ak_{}", uuid::Uuid::new_v4().simple())
 }
 
+pub const APP_DEPLOY_CONTROL_HINT: &str =
+    "Open the Apps page for start, stop, restart, logs, App Guard, public exposure, and delete controls.";
+
 fn app_unix_now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -5793,6 +6446,22 @@ async fn load_app_meta_json(app_dir: &Path) -> serde_json::Value {
     meta
 }
 
+async fn read_existing_app_meta_json(app_dir: &Path) -> Result<serde_json::Value> {
+    let meta_path = app_dir.join(".app_meta.json");
+    let bytes = tokio::fs::read(&meta_path)
+        .await
+        .with_context(|| format!("Failed to read app metadata '{}'", meta_path.display()))?;
+    let meta: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("Failed to parse app metadata '{}'", meta_path.display()))?;
+    if !meta.is_object() {
+        anyhow::bail!(
+            "App metadata '{}' is not a JSON object",
+            meta_path.display()
+        );
+    }
+    Ok(meta)
+}
+
 async fn write_app_meta_json(app_dir: &Path, meta: &serde_json::Value) -> Result<()> {
     let meta_path = app_dir.join(".app_meta.json");
     let bytes = serde_json::to_vec_pretty(meta)?;
@@ -5800,31 +6469,41 @@ async fn write_app_meta_json(app_dir: &Path, meta: &serde_json::Value) -> Result
     Ok(())
 }
 
-async fn persist_app_access_guard_meta(app_dir: &Path, access_guard_enabled: bool) -> Result<()> {
-    let mut meta = load_app_meta_json(app_dir).await;
-    meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
-    if let Some(obj) = meta.as_object_mut() {
-        obj.remove("access_key");
-    }
+async fn update_existing_app_meta_json<F>(app_dir: &Path, update: F) -> Result<()>
+where
+    F: FnOnce(&mut serde_json::Value),
+{
+    let mut meta = read_existing_app_meta_json(app_dir).await?;
+    update(&mut meta);
     write_app_meta_json(app_dir, &meta).await?;
     Ok(())
 }
 
+async fn persist_app_access_guard_meta(app_dir: &Path, access_guard_enabled: bool) -> Result<()> {
+    update_existing_app_meta_json(app_dir, |meta| {
+        meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("access_key");
+        }
+    })
+    .await
+}
+
 async fn persist_app_enabled_meta(app_dir: &Path, enabled: bool) -> Result<()> {
-    let mut meta = load_app_meta_json(app_dir).await;
-    meta["enabled"] = serde_json::Value::Bool(enabled);
-    write_app_meta_json(app_dir, &meta).await?;
-    Ok(())
+    update_existing_app_meta_json(app_dir, |meta| {
+        meta["enabled"] = serde_json::Value::Bool(enabled);
+    })
+    .await
 }
 
 async fn persist_app_last_accessed_meta(
     app_dir: &Path,
     last_accessed: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let mut meta = load_app_meta_json(app_dir).await;
-    meta["last_accessed"] = serde_json::Value::String(last_accessed.to_rfc3339());
-    write_app_meta_json(app_dir, &meta).await?;
-    Ok(())
+    update_existing_app_meta_json(app_dir, |meta| {
+        meta["last_accessed"] = serde_json::Value::String(last_accessed.to_rfc3339());
+    })
+    .await
 }
 
 fn parse_app_meta_datetime(
@@ -6077,8 +6756,32 @@ impl AppRegistry {
             .retain(|_, session| session.app_id != app_id);
     }
 
-    async fn issue_access_bootstrap_grant(&self, app_id: &str) -> Option<String> {
-        if !self.access_guard_enabled(app_id).await || !self.is_enabled(app_id).await {
+    async fn access_guard_enabled_for_surface(&self, app_id: &str, public_surface: bool) -> bool {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        };
+        if let Some(app) = app_handle {
+            let app = app.read().await;
+            return if public_surface {
+                app.access_guard_enabled || app.expose_public
+            } else {
+                app.access_guard_enabled
+            };
+        }
+        false
+    }
+
+    async fn issue_access_bootstrap_grant(
+        &self,
+        app_id: &str,
+        public_surface: bool,
+    ) -> Option<String> {
+        if !self
+            .access_guard_enabled_for_surface(app_id, public_surface)
+            .await
+            || !self.is_enabled(app_id).await
+        {
             return None;
         }
         let now = app_unix_now_ts();
@@ -6107,7 +6810,18 @@ impl AppRegistry {
 
     pub async fn issue_access_url(&self, app_id: &str) -> Option<String> {
         if self.access_guard_enabled(app_id).await {
-            let grant = self.issue_access_bootstrap_grant(app_id).await?;
+            let grant = self.issue_access_bootstrap_grant(app_id, false).await?;
+            Some(relative_app_bootstrap_url(app_id, &grant))
+        } else if self.get_dir(app_id).await.is_some() {
+            Some(relative_app_root_url(app_id))
+        } else {
+            None
+        }
+    }
+
+    pub async fn issue_public_access_url(&self, app_id: &str) -> Option<String> {
+        if self.public_access_guard_enabled(app_id).await {
+            let grant = self.issue_access_bootstrap_grant(app_id, true).await?;
             Some(relative_app_bootstrap_url(app_id, &grant))
         } else if self.get_dir(app_id).await.is_some() {
             Some(relative_app_root_url(app_id))
@@ -6131,7 +6845,9 @@ impl AppRegistry {
     }
 
     pub async fn create_access_session(&self, app_id: &str) -> Option<String> {
-        if !self.access_guard_enabled(app_id).await || !self.is_enabled(app_id).await {
+        if !self.access_guard_enabled_for_surface(app_id, true).await
+            || !self.is_enabled(app_id).await
+        {
             return None;
         }
         let now = app_unix_now_ts();
@@ -6183,7 +6899,7 @@ impl AppRegistry {
             apps.get(app_id).cloned()
         }?;
         let app = app_handle.read().await;
-        if !app.access_guard_enabled {
+        if !app.access_guard_enabled && !app.expose_public {
             return Some(String::new());
         }
         Some(app.access_key.clone())
@@ -6247,7 +6963,7 @@ impl AppRegistry {
             let app_dir = app.app_dir.clone();
             let is_isolated_runtime = app.container_id.is_some();
             let created_at = app.created_at.to_rfc3339();
-            let access_key = if app.access_guard_enabled {
+            let access_key = if app.access_guard_enabled || app.expose_public {
                 app.access_key.clone()
             } else {
                 String::new()
@@ -6356,8 +7072,14 @@ impl AppRegistry {
             let apps = self.apps.read().await;
             apps.get(app_id).cloned()
         }?;
-        let app = app_handle.read().await;
-        app.port
+        let port = {
+            let app = app_handle.read().await;
+            if !app.enabled || app.is_static || app.restoring {
+                return None;
+            }
+            app.port
+        }?;
+        runtime_port_accepts_connections(port).await.then_some(port)
     }
 
     /// Get the app directory path
@@ -6417,7 +7139,10 @@ impl AppRegistry {
     /// Register and start a dynamic app
     pub async fn register_dynamic(&self, id: String, registration: DynamicAppRegistration) {
         let now = chrono::Utc::now();
-        let access_key_to_persist = if registration.access_guard_enabled {
+        let access_key_to_persist = if (registration.access_guard_enabled
+            || registration.expose_public)
+            && !registration.access_key.trim().is_empty()
+        {
             Some(registration.access_key.clone())
         } else {
             None
@@ -6458,7 +7183,10 @@ impl AppRegistry {
 
     pub async fn register_stored(&self, id: String, registration: StoredAppRegistration) {
         let now = chrono::Utc::now();
-        let access_key_to_persist = if registration.access_guard_enabled {
+        let access_key_to_persist = if (registration.access_guard_enabled
+            || registration.expose_public)
+            && !registration.access_key.trim().is_empty()
+        {
             Some(registration.access_key.clone())
         } else {
             None
@@ -6567,7 +7295,7 @@ impl AppRegistry {
             if !app.enabled {
                 return false;
             }
-            if !app.access_guard_enabled {
+            if !app.access_guard_enabled && !app.expose_public {
                 return true;
             }
             return crate::security::constant_time_eq(
@@ -6578,7 +7306,7 @@ impl AppRegistry {
         false
     }
 
-    /// Whether app requires an access key guard.
+    /// Whether local app serving requires an access key guard.
     pub async fn access_guard_enabled(&self, app_id: &str) -> bool {
         let app_handle = {
             let apps = self.apps.read().await;
@@ -6586,6 +7314,23 @@ impl AppRegistry {
         };
         if let Some(app) = app_handle {
             return app.read().await.access_guard_enabled;
+        }
+        false
+    }
+
+    /// Whether public app serving requires an access key guard.
+    pub async fn public_access_guard_enabled(&self, app_id: &str) -> bool {
+        self.access_guard_enabled_for_surface(app_id, true).await
+    }
+
+    /// Whether this app is explicitly exposed through the public app surface.
+    pub async fn expose_public(&self, app_id: &str) -> bool {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        };
+        if let Some(app) = app_handle {
+            return app.read().await.expose_public;
         }
         false
     }
@@ -6641,19 +7386,19 @@ impl AppRegistry {
 
         let (app_dir, access_key) = {
             let mut app = app_handle.write().await;
-            if !enabled && app.expose_public {
-                anyhow::bail!("Public apps must keep App Guard enabled with an access password.");
-            }
             let explicit_secret = access_secret
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            let next_key = if enabled {
+            let key_required = enabled || app.expose_public;
+            let next_key = if key_required {
                 if let Some(secret) = explicit_secret {
                     secret.to_string()
                 } else if regenerate_key {
                     generate_access_key()
                 } else if !app.access_key.trim().is_empty() {
                     app.access_key.clone()
+                } else if app.expose_public {
+                    generate_access_key()
                 } else {
                     anyhow::bail!("Access password required");
                 }
@@ -6666,7 +7411,8 @@ impl AppRegistry {
         };
 
         persist_app_access_guard_meta(&app_dir, enabled).await?;
-        self.persist_access_key_secret(app_id, enabled.then_some(access_key.as_str()))
+        let persist_secret = enabled || self.public_access_guard_enabled(app_id).await;
+        self.persist_access_key_secret(app_id, persist_secret.then_some(access_key.as_str()))
             .await?;
         self.clear_access_tokens_for_app(app_id).await;
         Ok(access_key)
@@ -7090,7 +7836,7 @@ impl AppRegistry {
                 }
 
                 let meta_path = path.join(".app_meta.json");
-                let meta: Option<serde_json::Value> = match tokio::fs::read(&meta_path).await {
+                let mut meta: Option<serde_json::Value> = match tokio::fs::read(&meta_path).await {
                     Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                         Ok(value) if value.is_object() => Some(value),
                         Ok(_) => {
@@ -7130,6 +7876,42 @@ impl AppRegistry {
                     }
                 };
 
+                let stored_entry_command = meta
+                    .as_ref()
+                    .and_then(|m| app_meta_lifecycle_command(m, "entry_command"));
+                if stored_entry_command.is_none() {
+                    if let Ok(effective_files) =
+                        load_existing_managed_app_text_files(&path, &meta).await
+                    {
+                        if let Some(inferred) = infer_generated_bundle_lifecycle(&effective_files) {
+                            let mut updated = meta
+                                .clone()
+                                .filter(|value| value.is_object())
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            set_generated_app_lifecycle_meta(&mut updated, &inferred);
+                            if let Err(error) = tokio::fs::write(
+                                &meta_path,
+                                serde_json::to_string_pretty(&updated)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    app_id = %id,
+                                    error = %error,
+                                    "Failed to persist inferred app lifecycle metadata during restore"
+                                );
+                            } else {
+                                tracing::info!(
+                                    app_id = %id,
+                                    "Inferred dynamic app lifecycle from stored generated bundle"
+                                );
+                                meta = Some(updated);
+                            }
+                        }
+                    }
+                }
+
                 let title = meta
                     .as_ref()
                     .and_then(|m| m.get("title").and_then(|t| t.as_str()))
@@ -7167,20 +7949,22 @@ impl AppRegistry {
                             .collect()
                     })
                     .unwrap_or_default();
-                let access_guard_enabled = meta
-                    .as_ref()
-                    .and_then(|m| m.get("access_guard_enabled").and_then(|v| v.as_bool()))
-                    .unwrap_or(false);
-                let access_key = if access_guard_enabled {
-                    self.load_persisted_access_key(&id)
-                        .unwrap_or_else(generate_access_key)
-                } else {
-                    String::new()
-                };
+                let persisted_access_key = self
+                    .load_persisted_access_key(&id)
+                    .filter(|value| !value.trim().is_empty());
                 let expose_public = meta
                     .as_ref()
                     .and_then(|m| m.get("expose_public").and_then(|v| v.as_bool()))
                     .unwrap_or(false);
+                let access_guard_enabled = meta
+                    .as_ref()
+                    .and_then(|m| m.get("access_guard_enabled").and_then(|v| v.as_bool()))
+                    .unwrap_or_else(|| persisted_access_key.is_some());
+                let access_key = if access_guard_enabled || expose_public {
+                    persisted_access_key.unwrap_or_else(generate_access_key)
+                } else {
+                    String::new()
+                };
                 let enabled = meta
                     .as_ref()
                     .and_then(|m| m.get("enabled").and_then(|v| v.as_bool()))
@@ -7373,28 +8157,29 @@ impl AppRegistry {
     }
 }
 
-async fn wait_for_dynamic_runtime_ready(
-    registry: &AppRegistry,
+pub async fn runtime_port_accepts_connections(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+pub async fn wait_for_runtime_port_open(
     app_id: &str,
     port: u16,
     stream_tx: &Option<Sender<StreamEvent>>,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(DYNAMIC_RUNTIME_READY_TIMEOUT_SECS);
+        + std::time::Duration::from_secs(dynamic_runtime_ready_timeout_secs());
     let mut last_progress_at = tokio::time::Instant::now()
         - std::time::Duration::from_secs(DYNAMIC_RUNTIME_PROGRESS_INTERVAL_SECS);
 
     loop {
-        if !registry.runtime_is_alive(app_id).await {
-            anyhow::bail!("App {} stopped before it opened port {}", app_id, port);
-        }
-
-        if let Ok(Ok(_stream)) = tokio::time::timeout(
-            std::time::Duration::from_millis(1200),
-            tokio::net::TcpStream::connect(("127.0.0.1", port)),
-        )
-        .await
-        {
+        if runtime_port_accepts_connections(port).await {
             return Ok(());
         }
 
@@ -7403,7 +8188,7 @@ async fn wait_for_dynamic_runtime_ready(
                 "App {} did not accept connections on port {} within {}s",
                 app_id,
                 port,
-                DYNAMIC_RUNTIME_READY_TIMEOUT_SECS
+                dynamic_runtime_ready_timeout_secs()
             );
         }
 
@@ -7419,6 +8204,42 @@ async fn wait_for_dynamic_runtime_ready(
             last_progress_at = tokio::time::Instant::now();
         }
 
+        tokio::time::sleep(std::time::Duration::from_millis(
+            DYNAMIC_RUNTIME_READY_POLL_MS,
+        ))
+        .await;
+    }
+}
+
+async fn wait_for_dynamic_runtime_ready(
+    registry: &AppRegistry,
+    app_id: &str,
+    port: u16,
+    stream_tx: &Option<Sender<StreamEvent>>,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(dynamic_runtime_ready_timeout_secs());
+    loop {
+        if !registry.runtime_is_alive(app_id).await {
+            anyhow::bail!("App {} stopped before it opened port {}", app_id, port);
+        }
+        if runtime_port_accepts_connections(port).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "App {} did not accept connections on port {} within {}s",
+                app_id,
+                port,
+                dynamic_runtime_ready_timeout_secs()
+            );
+        }
+        emit_phase_progress(
+            stream_tx,
+            AppDeployProgressPhase::StartingRuntime,
+            format!("Waiting for server readiness on port {}", port),
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(
             DYNAMIC_RUNTIME_READY_POLL_MS,
         ))
@@ -7512,6 +8333,14 @@ pub async fn app_deploy(
     llm_env: &HashMap<String, String>,
     stream_tx: Option<Sender<StreamEvent>>,
 ) -> Result<String> {
+    let deploy_started = std::time::Instant::now();
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_start",
+        repo_bundle = should_deploy_repo_bundle(arguments),
+        argument_keys = arguments.as_object().map(|obj| obj.len()).unwrap_or(0),
+        "app deploy timing start"
+    );
     if should_deploy_repo_bundle(arguments) {
         return deploy_repo_bundle(
             config_dir, data_dir, arguments, registry, llm_env, stream_tx,
@@ -7519,7 +8348,18 @@ pub async fn app_deploy(
         .await;
     }
 
+    let stage_started = std::time::Instant::now();
     let plan = app_deploy_apply_plan_from_arguments(data_dir, arguments).await?;
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_parse_plan",
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        file_writes = plan.file_writes.len(),
+        file_patches = plan.file_patches.len(),
+        delete_paths = plan.delete_paths.len(),
+        mode = %plan.mode.as_str(),
+        "app deploy timing stage"
+    );
     let file_count = plan
         .file_writes
         .len()
@@ -7537,6 +8377,7 @@ pub async fn app_deploy(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
+    let stage_started = std::time::Instant::now();
     let existing_target = if let Some(app_id) = requested_app_id.as_deref() {
         let existing_app = registry
             .list()
@@ -7599,6 +8440,14 @@ pub async fn app_deploy(
     } else {
         None
     };
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_existing_target_lookup",
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        requested_app_id = requested_app_id.is_some(),
+        updating_existing = existing_target.is_some(),
+        "app deploy timing stage"
+    );
     if plan.mode == AppDeployMode::Patch && existing_target.is_none() {
         anyhow::bail!("mode='patch' requires app_id for an existing deployed app");
     }
@@ -7694,12 +8543,9 @@ pub async fn app_deploy(
             .as_ref()
             .and_then(|value| value.get("runtime_required").and_then(|v| v.as_bool()))
     });
-    let mut runtime_required = requested_runtime_required
-        .or(persisted_runtime_required)
-        .unwrap_or_else(|| entry_command.is_some());
     let runtime_required_was_inferred =
         requested_runtime_required.is_none() && persisted_runtime_required.is_none();
-    let runtime_reason = arguments
+    let mut runtime_reason = arguments
         .get("runtime_reason")
         .and_then(|v| v.as_str())
         .map(str::trim)
@@ -7734,12 +8580,11 @@ pub async fn app_deploy(
             .and_then(|target| target.access_key.clone())
             .filter(|value| !value.trim().is_empty());
     }
-    let access_guard_enabled = requested_access_guard_enabled || access_secret.is_some();
-    if expose_public && access_secret.is_none() {
-        anyhow::bail!(
-            "Public apps require an explicit access password. Provide access_password when expose_public=true."
-        );
-    }
+    let access_guard_enabled = app_access_guard_enabled_for_deploy(
+        expose_public,
+        requested_access_guard_enabled,
+        access_secret.is_some(),
+    );
     let mut required_inputs = parse_required_inputs(arguments);
     if required_inputs.is_empty() {
         required_inputs = existing_target
@@ -7772,6 +8617,60 @@ pub async fn app_deploy(
             })
             .unwrap_or_default();
     }
+    let updating_existing = existing_target.is_some();
+    let app_id = existing_target
+        .as_ref()
+        .map(|target| target.app_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
+    let public_access_guard_enabled = access_guard_enabled || expose_public;
+    let access_key = if public_access_guard_enabled {
+        access_secret.unwrap_or_else(generate_access_key)
+    } else {
+        String::new()
+    };
+    let app_dir = existing_target
+        .as_ref()
+        .map(|target| target.app_dir.clone())
+        .unwrap_or_else(|| data_dir.join("apps").join(&app_id));
+    let previous_meta = existing_target
+        .as_ref()
+        .and_then(|target| target.meta.clone());
+    let stage_started = std::time::Instant::now();
+    let effective_files = effective_app_files_for_validation(
+        if updating_existing {
+            Some(app_dir.as_path())
+        } else {
+            None
+        },
+        &previous_meta,
+        &plan,
+    )
+    .await?;
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_effective_file_graph",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        effective_file_count = effective_files.len(),
+        "app deploy timing stage"
+    );
+    if effective_files.is_empty() {
+        anyhow::bail!("App bundle would be empty after applying this deploy");
+    }
+    if let Some(inferred) = infer_generated_bundle_lifecycle(&effective_files) {
+        if entry_command.is_none() {
+            entry_command = Some(inferred.entry_command.clone());
+        }
+        if install_command.is_none() {
+            install_command = inferred.install_command.clone();
+        }
+        if runtime_reason.is_none() {
+            runtime_reason = Some(inferred.runtime_reason.clone());
+        }
+    }
+    let mut runtime_required = requested_runtime_required
+        .or(persisted_runtime_required)
+        .unwrap_or_else(|| entry_command.is_some());
     if entry_command.is_none() {
         runtime_required = false;
     } else if !runtime_required {
@@ -7795,44 +8694,37 @@ pub async fn app_deploy(
         validate_app_command(command, "stop_command")?;
     }
     let is_static = entry_command.is_none();
-
-    let updating_existing = existing_target.is_some();
-    let app_id = existing_target
-        .as_ref()
-        .map(|target| target.app_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
-    let access_key = if access_guard_enabled {
-        access_secret.unwrap_or_else(generate_access_key)
-    } else {
-        String::new()
-    };
-    let app_dir = existing_target
-        .as_ref()
-        .map(|target| target.app_dir.clone())
-        .unwrap_or_else(|| data_dir.join("apps").join(&app_id));
-    let previous_meta = existing_target
-        .as_ref()
-        .and_then(|target| target.meta.clone());
-    let effective_files = effective_app_files_for_validation(
-        if updating_existing {
-            Some(app_dir.as_path())
-        } else {
-            None
-        },
-        &previous_meta,
-        &plan,
-    )
-    .await?;
-    if effective_files.is_empty() {
-        anyhow::bail!("App bundle would be empty after applying this deploy");
-    }
     if is_static {
+        let stage_started = std::time::Instant::now();
         validate_static_app_asset_references(&effective_files)?;
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_static_asset_validation",
+            app_id = %app_id,
+            duration_ms = stage_started.elapsed().as_millis() as u64,
+            "app deploy timing stage"
+        );
     }
     if updating_existing {
+        let stage_started = std::time::Instant::now();
         registry.stop_runtime(&app_id).await?;
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_stop_existing_runtime",
+            app_id = %app_id,
+            duration_ms = stage_started.elapsed().as_millis() as u64,
+            "app deploy timing stage"
+        );
     }
+    let stage_started = std::time::Instant::now();
     tokio::fs::create_dir_all(&app_dir).await?;
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_create_app_dir",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        "app deploy timing stage"
+    );
 
     tracing::info!(
         "{} app '{}' (id={}, static={})",
@@ -7860,7 +8752,17 @@ pub async fn app_deploy(
         ),
     )
     .await;
+    let stage_started = std::time::Instant::now();
     let apply_outcome = app_deploy_apply(&app_dir, &plan, &previous_meta, &stream_tx).await?;
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_apply_files",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        written_files = apply_outcome.written_names.len(),
+        deleted_files = apply_outcome.deleted_names.len(),
+        "app deploy timing stage"
+    );
     let changed_files = apply_outcome.written_names.len();
     let completed_ops = changed_files.saturating_add(apply_outcome.deleted_names.len());
     if completed_ops == 0 {
@@ -7887,6 +8789,7 @@ pub async fn app_deploy(
     )
     .await;
 
+    let stage_started = std::time::Instant::now();
     let (resolved_env, missing_sensitive, missing_config) = resolve_required_env_values(
         config_dir,
         data_dir,
@@ -7895,6 +8798,17 @@ pub async fn app_deploy(
         &config_values,
     )
     .await?;
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_resolve_required_env",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        required_inputs = required_inputs.len(),
+        resolved_env = resolved_env.len(),
+        missing_sensitive = missing_sensitive.len(),
+        missing_config = missing_config.len(),
+        "app deploy timing stage"
+    );
 
     let required_secret_keys: Vec<String> = required_inputs
         .iter()
@@ -7987,17 +8901,26 @@ pub async fn app_deploy(
         "required_config": required_config_keys.clone(),
         "config_values": config_values.clone(),
         "access_guard_enabled": access_guard_enabled,
+        "public_access_guard_enabled": public_access_guard_enabled,
         "enabled": true,
         "conversation_id": conversation_id,
         "created_at": created_at,
         "updated_at": chrono::Utc::now().to_rfc3339(),
         "last_accessed": chrono::Utc::now().to_rfc3339(),
     });
+    let stage_started = std::time::Instant::now();
     tokio::fs::write(
         app_dir.join(".app_meta.json"),
         serde_json::to_string_pretty(&meta)?,
     )
     .await?;
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_write_metadata",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        "app deploy timing stage"
+    );
     emit_phase_progress(
         &stream_tx,
         AppDeployProgressPhase::PreparingRuntime,
@@ -8058,8 +8981,19 @@ pub async fn app_deploy(
             "access_key": access_key,
             "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
+            "public_access_guard_enabled": public_access_guard_enabled,
+            "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
         });
         attach_external_deployment_result(&mut response, external_deployment);
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_total",
+            app_id = %app_id,
+            app_type = "static",
+            duration_ms = deploy_started.elapsed().as_millis() as u64,
+            updated_existing = updating_existing,
+            "app deploy timing total"
+        );
         return Ok(response.to_string());
     }
 
@@ -8094,6 +9028,17 @@ pub async fn app_deploy(
             ),
         )
         .await;
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_total",
+            app_id = %app_id,
+            app_type = "dynamic_needs_inputs",
+            duration_ms = deploy_started.elapsed().as_millis() as u64,
+            updated_existing = updating_existing,
+            missing_sensitive = missing_sensitive.len(),
+            missing_config = missing_config.len(),
+            "app deploy timing total"
+        );
         return Ok(serde_json::json!({
             "status": "needs_secrets",
             "type": "dynamic",
@@ -8106,6 +9051,8 @@ pub async fn app_deploy(
             "access_key": access_key,
             "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
+            "public_access_guard_enabled": public_access_guard_enabled,
+            "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
             "required_inputs": required_inputs,
             "required_secrets": required_secret_keys.clone(),
             "required_env": required_secret_keys,
@@ -8164,8 +9111,19 @@ pub async fn app_deploy(
             "access_key": access_key,
             "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
+            "public_access_guard_enabled": public_access_guard_enabled,
+            "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
         });
         attach_external_deployment_result(&mut response, external_deployment);
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_total",
+            app_id = %app_id,
+            app_type = "dynamic_delegated",
+            duration_ms = deploy_started.elapsed().as_millis() as u64,
+            updated_existing = updating_existing,
+            "app deploy timing total"
+        );
         return Ok(response.to_string());
     }
 
@@ -8175,6 +9133,7 @@ pub async fn app_deploy(
         .and_then(|v| v.as_u64())
         .map(|p| p as u16);
 
+    let stage_started = std::time::Instant::now();
     let port = match port {
         Some(p) => p,
         None => registry.find_available_port().await.ok_or_else(|| {
@@ -8185,6 +9144,14 @@ pub async fn app_deploy(
             )
         })?,
     };
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_port_selection",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        port,
+        "app deploy timing stage"
+    );
     emit_phase_progress(
         &stream_tx,
         AppDeployProgressPhase::PreparingRuntime,
@@ -8222,7 +9189,8 @@ pub async fn app_deploy(
     )
     .await;
 
-    let runtime_handle = launch_dynamic_runtime(DynamicRuntimeLaunch {
+    let stage_started = std::time::Instant::now();
+    let mut runtime_handle = launch_dynamic_runtime(DynamicRuntimeLaunch {
         app_id: &app_id,
         app_dir: &app_dir,
         entry_command: entry,
@@ -8234,26 +9202,15 @@ pub async fn app_deploy(
         stream_tx: stream_tx.clone(),
     })
     .await?;
-    let (container_id, child, runtime_label) = match runtime_handle {
-        DynamicRuntimeHandle::Container(container_id) => {
-            emit_phase_progress(
-                &stream_tx,
-                AppDeployProgressPhase::StartingRuntime,
-                "Server container started",
-            )
-            .await;
-            (Some(container_id), None, "container")
-        }
-        DynamicRuntimeHandle::Process(child) => {
-            emit_phase_progress(
-                &stream_tx,
-                AppDeployProgressPhase::StartingRuntime,
-                "Docker unavailable; started local app process",
-            )
-            .await;
-            (None, Some(*child), "local_process")
-        }
-    };
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_launch_runtime",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        port,
+        has_install_command = effective_install_cmd.is_some(),
+        "app deploy timing stage"
+    );
     let app_dir_for_diagnostics = app_dir.clone();
     let app_dir_for_external = app_dir.clone();
     let proxy_path_mode = proxy_path_mode_for_entry_command(Some(entry), &app_dir, &app_id);
@@ -8265,6 +9222,65 @@ pub async fn app_deploy(
         );
     }
 
+    emit_phase_progress(
+        &stream_tx,
+        AppDeployProgressPhase::StartingRuntime,
+        "Waiting for server readiness",
+    )
+    .await;
+    let stage_started = std::time::Instant::now();
+    if let Err(wait_err) = wait_for_runtime_port_open(&app_id, port, &stream_tx).await {
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_wait_runtime_ready",
+            app_id = %app_id,
+            duration_ms = stage_started.elapsed().as_millis() as u64,
+            port,
+            success = false,
+            error = %wait_err,
+            "app deploy timing stage failed"
+        );
+        stop_dynamic_runtime_handle(&app_id, &mut runtime_handle).await;
+        let log_tail =
+            read_local_runtime_log_tail(&app_dir_for_diagnostics, LOCAL_RUNTIME_LOG_TAIL_BYTES)
+                .await;
+        if log_tail.is_empty() {
+            anyhow::bail!("{}", wait_err);
+        }
+        anyhow::bail!("{}. Recent runtime logs:\n{}", wait_err, log_tail);
+    }
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_wait_runtime_ready",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        port,
+        success = true,
+        "app deploy timing stage"
+    );
+
+    let (container_id, child, runtime_label) = match runtime_handle {
+        DynamicRuntimeHandle::Container(container_id) => {
+            emit_phase_progress(
+                &stream_tx,
+                AppDeployProgressPhase::StartingRuntime,
+                "Server container is accepting connections",
+            )
+            .await;
+            (Some(container_id), None, "container")
+        }
+        DynamicRuntimeHandle::Process(child) => {
+            emit_phase_progress(
+                &stream_tx,
+                AppDeployProgressPhase::StartingRuntime,
+                "Local app process is accepting connections",
+            )
+            .await;
+            (None, Some(*child), "local_process")
+        }
+    };
+
+    let stage_started = std::time::Instant::now();
     registry
         .register_dynamic(
             app_id.clone(),
@@ -8282,28 +9298,14 @@ pub async fn app_deploy(
             },
         )
         .await;
-
-    emit_phase_progress(
-        &stream_tx,
-        AppDeployProgressPhase::StartingRuntime,
-        "Waiting for server readiness",
-    )
-    .await;
-    if let Err(wait_err) = wait_for_dynamic_runtime_ready(registry, &app_id, port, &stream_tx).await
-    {
-        if updating_existing {
-            let _ = registry.stop_runtime(&app_id).await;
-        } else {
-            let _ = registry.stop(&app_id).await;
-        }
-        let log_tail =
-            read_local_runtime_log_tail(&app_dir_for_diagnostics, LOCAL_RUNTIME_LOG_TAIL_BYTES)
-                .await;
-        if log_tail.is_empty() {
-            anyhow::bail!("{}", wait_err);
-        }
-        anyhow::bail!("{}. Recent runtime logs:\n{}", wait_err, log_tail);
-    }
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_register_dynamic",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        port,
+        "app deploy timing stage"
+    );
 
     let url = format!("/apps/{}/", app_id);
     let access_url = registry
@@ -8318,6 +9320,7 @@ pub async fn app_deploy(
     )
     .await;
 
+    let stage_started = std::time::Instant::now();
     let external_deployment = maybe_publish_external_deployment(
         config_dir,
         data_dir,
@@ -8328,6 +9331,14 @@ pub async fn app_deploy(
         &stream_tx,
     )
     .await;
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_external_publish",
+        app_id = %app_id,
+        duration_ms = stage_started.elapsed().as_millis() as u64,
+        requested = arguments.get("deploy_target").is_some(),
+        "app deploy timing stage"
+    );
     let mut response = serde_json::json!({
         "status": "deployed",
         "type": "dynamic",
@@ -8343,8 +9354,21 @@ pub async fn app_deploy(
         "access_key": access_key,
         "access_password": access_key,
         "access_guard_enabled": access_guard_enabled,
+        "public_access_guard_enabled": public_access_guard_enabled,
+        "apps_page_hint": APP_DEPLOY_CONTROL_HINT,
     });
     attach_external_deployment_result(&mut response, external_deployment);
+    tracing::debug!(
+        target: "agentark.turn_timing",
+        stage = "app_deploy_total",
+        app_id = %app_id,
+        app_type = "dynamic",
+        runtime = runtime_label,
+        duration_ms = deploy_started.elapsed().as_millis() as u64,
+        updated_existing = updating_existing,
+        port,
+        "app deploy timing total"
+    );
     Ok(response.to_string())
 }
 
@@ -8353,6 +9377,72 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn deploy_access_guard_defaults_off_for_local_private_apps() {
+        assert!(!app_access_guard_enabled_for_deploy(false, false, false));
+    }
+
+    #[test]
+    fn deploy_access_guard_defaults_off_for_local_public_apps() {
+        assert!(!app_access_guard_enabled_for_deploy(true, false, false));
+    }
+
+    #[test]
+    fn public_exposure_does_not_force_local_guard() {
+        assert!(!app_access_guard_enabled_for_deploy(true, false, true));
+        assert!(app_access_guard_enabled_for_deploy(true, true, false));
+    }
+
+    #[test]
+    fn deploy_access_guard_enables_for_explicit_local_guard_or_password() {
+        assert!(app_access_guard_enabled_for_deploy(false, true, false));
+        assert!(app_access_guard_enabled_for_deploy(false, false, true));
+    }
+
+    #[test]
+    fn static_validation_accepts_root_relative_bundled_assets() {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "index.html".to_string(),
+            serde_json::Value::String(
+                r#"<html><head><link rel="stylesheet" href="/style.css"></head><body><script src="/app.js"></script></body></html>"#
+                    .to_string(),
+            ),
+        );
+        files.insert(
+            "style.css".to_string(),
+            serde_json::Value::String(r#"body{background:url('/bg.png')}"#.to_string()),
+        );
+        files.insert(
+            "app.js".to_string(),
+            serde_json::Value::String("console.log('ok')".to_string()),
+        );
+        files.insert(
+            "bg.png".to_string(),
+            serde_json::Value::String("placeholder".to_string()),
+        );
+
+        validate_static_app_asset_references(&files)
+            .expect("root-relative bundled files are valid");
+    }
+
+    #[test]
+    fn static_validation_rejects_missing_root_relative_assets() {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "index.html".to_string(),
+            serde_json::Value::String(
+                r#"<html><head><script src="/missing.js"></script></head><body></body></html>"#
+                    .to_string(),
+            ),
+        );
+
+        let error = validate_static_app_asset_references(&files)
+            .expect_err("missing root-relative asset should be reported")
+            .to_string();
+        assert!(error.contains("missing root-relative local asset /missing.js"));
+    }
 
     #[test]
     fn app_deploy_phase_status_payload_uses_explicit_phase_metadata() {
@@ -8381,6 +9471,210 @@ mod tests {
 
     fn write_package_json(dir: &Path, body: &str) {
         std::fs::write(dir.join("package.json"), body).expect("write package.json");
+    }
+
+    fn generated_node_server_bundle_files() -> serde_json::Map<String, serde_json::Value> {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "package.json".to_string(),
+            serde_json::Value::String(
+                r#"{"scripts":{"start":"node server.js"},"dependencies":{"express":"^4.18.0"}}"#
+                    .to_string(),
+            ),
+        );
+        files.insert(
+            "server.js".to_string(),
+            serde_json::Value::String(
+                "const express = require('express');\nconst app = express();\napp.use(express.static('public'));\napp.get('/api/papers', (_req, res) => res.json({papers: []}));\napp.listen(process.env.PORT || 3000);\n"
+                    .to_string(),
+            ),
+        );
+        files.insert(
+            "public/index.html".to_string(),
+            serde_json::Value::String(
+                "<!doctype html><html><body><script src=\"/client.js\"></script></body></html>"
+                    .to_string(),
+            ),
+        );
+        files
+    }
+
+    #[test]
+    fn generated_node_server_bundle_infers_dynamic_lifecycle() {
+        let inference = infer_generated_bundle_lifecycle(&generated_node_server_bundle_files())
+            .expect("node server bundle should infer a runtime lifecycle");
+
+        assert_eq!(inference.entry_command, "npm run start");
+        assert_eq!(
+            inference.install_command.as_deref(),
+            Some("npm install --omit=dev")
+        );
+        assert!(inference.runtime_reason.contains("Node package manifest"));
+    }
+
+    #[test]
+    fn static_bundle_without_runtime_shape_does_not_infer_lifecycle() {
+        let mut files = serde_json::Map::new();
+        files.insert(
+            "index.html".to_string(),
+            serde_json::Value::String("<!doctype html><html><body>demo</body></html>".to_string()),
+        );
+
+        assert!(
+            infer_generated_bundle_lifecycle(&files).is_none(),
+            "plain static bundles should stay static"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_preflight_accepts_generated_node_server_bundle_as_dynamic() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let mut arguments = serde_json::json!({
+            "title": "Generated server bundle"
+        });
+        arguments.as_object_mut().expect("arguments object").insert(
+            "files".to_string(),
+            serde_json::Value::Object(generated_node_server_bundle_files()),
+        );
+
+        app_deploy_preflight(data_dir.path(), &arguments, &registry)
+            .await
+            .expect("dynamic generated bundles should not be rejected as broken static assets");
+    }
+
+    #[test]
+    fn restored_bundle_scan_ignores_runtime_generated_files() {
+        let app_dir = tempfile::tempdir().expect("app dir");
+        std::fs::write(
+            app_dir.path().join("package.json"),
+            r#"{"scripts":{"start":"node server.js"}}"#,
+        )
+        .expect("package json");
+        std::fs::write(app_dir.path().join("server.js"), "require('express')()\n")
+            .expect("server js");
+        std::fs::create_dir_all(app_dir.path().join("node_modules").join("express"))
+            .expect("node_modules dir");
+        std::fs::write(
+            app_dir
+                .path()
+                .join("node_modules")
+                .join("express")
+                .join("index.js"),
+            "module.exports = {}\n",
+        )
+        .expect("node module");
+        std::fs::write(
+            app_dir.path().join(".agentark_runtime_stderr.log"),
+            "runtime log\n",
+        )
+        .expect("runtime log");
+
+        let files =
+            collect_existing_app_text_files_sync(app_dir.path()).expect("collect restored files");
+
+        assert!(files.contains_key("package.json"));
+        assert!(files.contains_key("server.js"));
+        assert!(!files.contains_key("node_modules/express/index.js"));
+        assert!(!files.contains_key(".agentark_runtime_stderr.log"));
+    }
+
+    #[test]
+    fn populated_node_modules_skip_redundant_node_install_command() {
+        let app_dir = tempfile::tempdir().expect("app dir");
+        std::fs::write(
+            app_dir.path().join("package.json"),
+            r#"{"scripts":{"start":"node server.js"},"dependencies":{"express":"latest"}}"#,
+        )
+        .expect("package json");
+        std::fs::create_dir_all(app_dir.path().join("node_modules").join("express"))
+            .expect("node module dir");
+        std::fs::write(
+            app_dir
+                .path()
+                .join("node_modules")
+                .join("express")
+                .join("index.js"),
+            "module.exports = {}\n",
+        )
+        .expect("node module file");
+
+        assert!(should_skip_redundant_install_command(
+            app_dir.path(),
+            "npm install --omit=dev"
+        ));
+        assert!(should_skip_redundant_install_command(
+            app_dir.path(),
+            "pnpm install"
+        ));
+        assert!(!should_skip_redundant_install_command(
+            app_dir.path(),
+            "npm run build"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reserved_restoring_dynamic_app_does_not_expose_unready_port() {
+        let registry = AppRegistry::new();
+        let app_dir = tempfile::tempdir().expect("app dir");
+        let port = registry
+            .reserve_restoring_dynamic(
+                "demo".to_string(),
+                "Demo".to_string(),
+                app_dir.path().to_path_buf(),
+                String::new(),
+                false,
+                false,
+            )
+            .await
+            .expect("port should be reserved");
+
+        assert_eq!(registry.get_port("demo").await, None);
+        assert!(
+            !runtime_port_accepts_connections(port).await,
+            "reserved restore port should not be accepting connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_meta_timestamp_update_preserves_lifecycle_metadata() {
+        let app_dir = tempfile::tempdir().expect("app dir");
+        tokio::fs::write(
+            app_dir.path().join(".app_meta.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "title": "Generated Bundle",
+                "entry_command": "npm run start",
+                "start_command": "npm run start",
+                "install_command": "npm install --omit=dev",
+                "commands": {
+                    "start": "npm run start",
+                    "install": "npm install --omit=dev"
+                },
+                "runtime_required": true
+            }))
+            .expect("meta should serialize"),
+        )
+        .await
+        .expect("meta should be written");
+
+        persist_app_last_accessed_meta(app_dir.path(), chrono::Utc::now())
+            .await
+            .expect("last_accessed update should succeed");
+
+        let meta_raw = tokio::fs::read(app_dir.path().join(".app_meta.json"))
+            .await
+            .expect("meta should be readable");
+        let meta: serde_json::Value =
+            serde_json::from_slice(&meta_raw).expect("meta should parse as json");
+        assert_eq!(
+            app_meta_lifecycle_command(&meta, "entry_command").as_deref(),
+            Some("npm run start")
+        );
+        assert_eq!(
+            app_meta_lifecycle_command(&meta, "install_command").as_deref(),
+            Some("npm install --omit=dev")
+        );
+        assert!(meta.get("last_accessed").and_then(|v| v.as_str()).is_some());
     }
 
     #[test]
@@ -8615,6 +9909,7 @@ mod tests {
             DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
             "agentark-app-demo".to_string(),
             Some(Path::new("/tmp/agentark-demo/.agentark.env")),
+            None,
             "npm run start".to_string(),
         );
 
@@ -8642,6 +9937,74 @@ mod tests {
                 args
             );
         }
+    }
+
+    #[test]
+    fn dynamic_container_run_args_share_executor_network_without_host_publish() {
+        let app_dir = Path::new("/tmp/agentark-demo");
+        let args = build_dynamic_container_run_args(
+            "demo",
+            app_dir,
+            9123,
+            DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
+            "agentark-app-demo".to_string(),
+            None,
+            Some("executor-container-id"),
+            "npm run start".to_string(),
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--network" && pair[1] == "container:executor-container-id"));
+        assert!(
+            !args.iter().any(|arg| arg == "-p"),
+            "shared-network app containers should not publish host-loopback ports"
+        );
+    }
+
+    #[test]
+    fn dynamic_container_commands_bypass_agentark_image_entrypoint() {
+        let app_dir = Path::new("/tmp/agentark-demo");
+        let args = build_dynamic_container_run_args(
+            "demo",
+            app_dir,
+            9123,
+            DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
+            "agentark-app-demo".to_string(),
+            None,
+            None,
+            "npm run start".to_string(),
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh"));
+        let image_index = args
+            .iter()
+            .position(|arg| arg == DEFAULT_FALLBACK_APP_RUNTIME_IMAGE)
+            .expect("runtime image should be present");
+        assert_eq!(args.get(image_index + 1).map(String::as_str), Some("-lc"));
+
+        let install_args = build_dynamic_container_install_args(
+            "demo",
+            app_dir,
+            9123,
+            DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
+            "agentark-app-demo-install".to_string(),
+            None,
+            "npm install".to_string(),
+        );
+        assert!(install_args
+            .windows(2)
+            .any(|pair| pair[0] == "--entrypoint" && pair[1] == "/bin/sh"));
+        let image_index = install_args
+            .iter()
+            .position(|arg| arg == DEFAULT_FALLBACK_APP_RUNTIME_IMAGE)
+            .expect("runtime image should be present");
+        assert_eq!(
+            install_args.get(image_index + 1).map(String::as_str),
+            Some("-lc")
+        );
     }
 
     #[test]
@@ -9009,6 +10372,84 @@ edition = "2021"
         assert_eq!(
             row.get("runtime_mode").and_then(|v| v.as_str()),
             Some("disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_from_disk_infers_dynamic_lifecycle_for_generated_bundle_metadata() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let app_dir = data_dir.path().join("apps").join("demo");
+        tokio::fs::create_dir_all(&app_dir)
+            .await
+            .expect("app dir should exist");
+        let files = generated_node_server_bundle_files();
+        for (relative, value) in &files {
+            let path = app_dir.join(relative);
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .expect("parent dir should exist");
+            }
+            tokio::fs::write(
+                &path,
+                value.as_str().expect("generated test files are text"),
+            )
+            .await
+            .expect("managed app file should be written");
+        }
+        let managed_files = files.keys().cloned().collect::<Vec<_>>();
+        tokio::fs::write(
+            app_dir.join(".app_meta.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "title": "Generated Bundle",
+                "runtime_required": false,
+                "commands": {
+                    "install": "npm install --omit=dev",
+                    "start": null
+                },
+                "managed_files": managed_files,
+                "enabled": false,
+                "access_guard_enabled": false
+            }))
+            .expect("meta should serialize"),
+        )
+        .await
+        .expect("meta should be written");
+
+        let registry = AppRegistry::new();
+        registry
+            .restore_from_disk(config_dir.path(), data_dir.path(), &HashMap::new())
+            .await;
+
+        let apps = registry.list().await;
+        let row = apps
+            .iter()
+            .find(|row| row.get("id").and_then(|v| v.as_str()) == Some("demo"))
+            .expect("restored app should be listed");
+        assert_eq!(row.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(row.get("running").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            row.get("runtime_mode").and_then(|v| v.as_str()),
+            Some("disabled")
+        );
+
+        let meta_raw = tokio::fs::read(app_dir.join(".app_meta.json"))
+            .await
+            .expect("healed meta should be readable");
+        let meta: serde_json::Value =
+            serde_json::from_slice(&meta_raw).expect("healed meta should be json");
+        assert_eq!(
+            app_meta_lifecycle_command(&meta, "entry_command").as_deref(),
+            Some("npm run start")
+        );
+        assert_eq!(
+            app_meta_lifecycle_command(&meta, "install_command").as_deref(),
+            Some("npm install --omit=dev")
+        );
+        assert_eq!(
+            meta.get("runtime_required").and_then(|v| v.as_bool()),
+            Some(true)
         );
     }
 

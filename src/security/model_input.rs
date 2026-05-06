@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{SecretInputType, redact_pii, redact_secret_input};
+use super::{redact_pii, redact_secret_input, SecretInputType};
 
 const EXECUTION_TARGET_BLOCK_START: &str = "<agentark_current_turn_execution_targets>";
 const EXECUTION_TARGET_BLOCK_END: &str = "</agentark_current_turn_execution_targets>";
@@ -702,11 +702,9 @@ mod tests {
 
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
         assert!(result.sanitized_text.contains("You are AgentArk."));
-        assert!(
-            !result
-                .sanitized_text
-                .contains("[SENSITIVE_CONTEXT_WITHHELD")
-        );
+        assert!(!result
+            .sanitized_text
+            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
     }
 
     #[test]
@@ -719,11 +717,9 @@ mod tests {
         );
 
         assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
-        assert!(
-            result
-                .sanitized_text
-                .contains("rtsp://192.168.29.61:554/live.sdp")
-        );
+        assert!(result
+            .sanitized_text
+            .contains("rtsp://192.168.29.61:554/live.sdp"));
         assert!(result.sanitized_text.contains("bare host [IP]"));
     }
 
@@ -762,11 +758,9 @@ mod tests {
         );
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
         assert!(result.sanitized_text.contains("Example User"));
-        assert!(
-            !result
-                .sanitized_text
-                .contains("[SENSITIVE_CONTEXT_WITHHELD")
-        );
+        assert!(!result
+            .sanitized_text
+            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
     }
 
     #[test]
@@ -794,11 +788,9 @@ mod tests {
         );
 
         assert_eq!(result.decision, ModelInputPrivacyDecision::Allow);
-        assert!(
-            !result
-                .sanitized_text
-                .contains("[SENSITIVE_CONTEXT_WITHHELD")
-        );
+        assert!(!result
+            .sanitized_text
+            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
     }
 
     #[test]
@@ -815,11 +807,9 @@ mod tests {
         assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
         assert!(result.sanitized_text.contains("Example User"));
         assert!(result.sanitized_text.contains("[REDACTED_SECRET]"));
-        assert!(
-            !result
-                .sanitized_text
-                .contains("[SENSITIVE_CONTEXT_WITHHELD")
-        );
+        assert!(!result
+            .sanitized_text
+            .contains("[SENSITIVE_CONTEXT_WITHHELD"));
     }
 
     #[test]

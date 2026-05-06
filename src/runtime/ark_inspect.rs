@@ -6,7 +6,7 @@ use super::ActionRuntime;
 pub(super) fn action_def() -> crate::actions::ActionDef {
     crate::actions::ActionDef {
         name: "ark_inspect".to_string(),
-        description: "Generic read-only Ark inspection for live/local AgentArk state. Use when the user asks for evidence that may require the control API, deployed app registry, stored database telemetry, schema discovery, structured DB reads, traces, logs, tasks, integrations, files, workspace state, analytics, model/provider usage, recent conversations, work history, personal activity patterns, or other internal runtime data. The runtime injects AgentArk API auth server-side; never include credentials in arguments.".to_string(),
+        description: "Generic read-only Ark inspection for live/local AgentArk state. Use when the user asks for evidence that may require the control API, deployed app registry, stored database telemetry, schema discovery, structured DB reads, traces, logs, tasks, integrations, files, workspace state, analytics, current model/provider selection, model access/readiness, failover/provider health, model/provider usage, recent conversations, work history, personal activity patterns, or other internal runtime data. The runtime injects AgentArk API auth server-side; never include credentials in arguments.".to_string(),
         version: "1.0.0".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -18,8 +18,8 @@ pub(super) fn action_def() -> crate::actions::ActionDef {
                 },
                 "surface": {
                     "type": "string",
-                    "enum": ["overview", "apps", "activity", "analytics", "gateway_ops", "arkpulse", "sentinel", "evolution", "trace", "moltbook"],
-                    "description": "Internal AgentArk surface to inspect when operation=surface. Use analytics for usage, cost, token, model, channel, and purpose reports; use activity for recent user chats, work objects, and local signals that support reflective pattern summaries. For specific AgentArk-owned data/reporting needs, use api_catalog then api_get. Default: overview."
+                    "enum": ["overview", "apps", "activity", "analytics", "models", "gateway_ops", "arkpulse", "sentinel", "evolution", "trace", "moltbook"],
+                    "description": "Internal AgentArk surface to inspect when operation=surface. Use models for current model/provider selection, configured slots, readiness, access, and failover/provider health. Use analytics for usage, cost, token, model, channel, and purpose reports; use activity for recent user chats, work objects, and local signals that support reflective pattern summaries. For specific AgentArk-owned data/reporting needs, use api_catalog then api_get. Default: overview."
                 },
                 "limit": {
                     "type": "integer",
@@ -108,6 +108,9 @@ pub(super) fn action_def() -> crate::actions::ActionDef {
             "database_readonly".to_string(),
             "file_read".to_string(),
             "analytics".to_string(),
+            "model_runtime".to_string(),
+            "model_status".to_string(),
+            "provider_status".to_string(),
         ],
         sandbox_mode: Some(crate::runtime::SandboxMode::Native),
         source: crate::actions::ActionSource::System,
@@ -314,6 +317,254 @@ fn compact_for_activity(value: &str, max_chars: usize) -> String {
     redacted.chars().take(max_chars).collect::<String>()
 }
 
+fn provider_model_name(provider: &crate::core::LlmProvider) -> &str {
+    match provider {
+        crate::core::LlmProvider::Anthropic { model, .. }
+        | crate::core::LlmProvider::OpenAI { model, .. }
+        | crate::core::LlmProvider::Ollama { model, .. } => model.as_str(),
+    }
+}
+
+fn provider_structurally_configured(provider: &crate::core::LlmProvider) -> bool {
+    match provider {
+        crate::core::LlmProvider::Ollama { base_url, model } => {
+            !base_url.trim().is_empty() && !model.trim().is_empty()
+        }
+        crate::core::LlmProvider::Anthropic { api_key, model } => {
+            !api_key.trim().is_empty() && !model.trim().is_empty() && api_key != "[ENCRYPTED]"
+        }
+        crate::core::LlmProvider::OpenAI {
+            api_key,
+            model,
+            base_url,
+        } => {
+            if model.trim().is_empty() {
+                return false;
+            }
+            match crate::core::llm_provider::openai_provider_label(base_url.as_deref()) {
+                "openai" => !api_key.trim().is_empty() && api_key != "[ENCRYPTED]",
+                "openrouter" | "openai-subscription" | "huggingface" => {
+                    !api_key.trim().is_empty()
+                        && api_key != "[ENCRYPTED]"
+                        && base_url.as_ref().is_some_and(|url| !url.trim().is_empty())
+                }
+                "openai-compatible" => base_url.as_ref().is_some_and(|url| !url.trim().is_empty()),
+                _ => false,
+            }
+        }
+    }
+}
+
+fn provider_safe_summary(provider: &crate::core::LlmProvider) -> serde_json::Value {
+    match provider {
+        crate::core::LlmProvider::Anthropic { api_key, model } => serde_json::json!({
+            "provider_id": "anthropic",
+            "provider_kind": "anthropic",
+            "model": model,
+            "base_url": serde_json::Value::Null,
+            "has_api_key": !api_key.trim().is_empty() && api_key != "[ENCRYPTED]",
+            "runtime_configured": provider_structurally_configured(provider),
+        }),
+        crate::core::LlmProvider::OpenAI {
+            api_key,
+            model,
+            base_url,
+        } => serde_json::json!({
+            "provider_id": crate::core::llm_provider::openai_provider_label(base_url.as_deref()),
+            "provider_kind": "openai_compatible",
+            "model": model,
+            "base_url": crate::core::llm_provider::display_openai_base_url(base_url.as_ref()),
+            "has_api_key": !api_key.trim().is_empty() && api_key != "[ENCRYPTED]",
+            "runtime_configured": provider_structurally_configured(provider),
+        }),
+        crate::core::LlmProvider::Ollama { base_url, model } => serde_json::json!({
+            "provider_id": "ollama",
+            "provider_kind": "ollama",
+            "model": model,
+            "base_url": base_url,
+            "has_api_key": false,
+            "runtime_configured": provider_structurally_configured(provider),
+        }),
+    }
+}
+
+fn model_slot_runtime_ready(slot: &crate::core::config::ModelSlot) -> bool {
+    slot.enabled && provider_structurally_configured(&slot.provider)
+}
+
+fn model_role_value(role: &crate::core::config::ModelRole) -> serde_json::Value {
+    serde_json::to_value(role).unwrap_or_else(|_| serde_json::json!("unknown"))
+}
+
+fn model_slot_safe_summary(
+    slot: &crate::core::config::ModelSlot,
+    primary_slot_id: Option<&str>,
+    selected_slot_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": &slot.id,
+        "label": &slot.label,
+        "role": model_role_value(&slot.role),
+        "enabled": slot.enabled,
+        "is_primary": primary_slot_id.is_some_and(|id| id == slot.id.as_str()),
+        "is_user_selected": selected_slot_id.is_some_and(|id| id == slot.id.as_str()),
+        "runtime_ready": model_slot_runtime_ready(slot),
+        "capability_tier": serde_json::to_value(slot.capability_tier).unwrap_or_else(|_| serde_json::json!("unknown")),
+        "cost_tier": serde_json::to_value(slot.cost_tier).unwrap_or_else(|_| serde_json::json!("unknown")),
+        "auto_escalate": slot.auto_escalate,
+        "escalation_rank": slot.escalation_rank,
+        "health_scope": serde_json::to_value(slot.health_scope).unwrap_or_else(|_| serde_json::json!("unknown")),
+        "provider": provider_safe_summary(&slot.provider),
+    })
+}
+
+fn resolve_primary_model_slot_id_from_config(
+    config: &crate::core::config::AgentConfig,
+) -> Option<String> {
+    let slots = &config.model_pool.slots;
+    for role in [
+        crate::core::config::ModelRole::Primary,
+        crate::core::config::ModelRole::Fast,
+        crate::core::config::ModelRole::Code,
+        crate::core::config::ModelRole::Research,
+        crate::core::config::ModelRole::Fallback,
+    ] {
+        if let Some(slot) = slots
+            .iter()
+            .find(|slot| slot.role == role && model_slot_runtime_ready(slot))
+        {
+            return Some(slot.id.clone());
+        }
+    }
+    slots
+        .iter()
+        .find(|slot| model_slot_runtime_ready(slot))
+        .or_else(|| {
+            slots
+                .iter()
+                .find(|slot| slot.role == crate::core::config::ModelRole::Primary && slot.enabled)
+        })
+        .or_else(|| slots.iter().find(|slot| slot.enabled))
+        .or_else(|| slots.first())
+        .map(|slot| slot.id.clone())
+}
+
+async fn persisted_selected_model_slot_id(runtime: &ActionRuntime) -> Option<String> {
+    let storage = runtime.runtime_storage().ok()?;
+    storage
+        .get(crate::core::USER_SELECTED_MODEL_SLOT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn model_failover_status(runtime: &ActionRuntime) -> serde_json::Value {
+    let Ok(storage) = runtime.runtime_storage() else {
+        return serde_json::json!({
+            "available": false,
+            "reason": "runtime storage unavailable",
+        });
+    };
+    match crate::core::ModelFailoverControlPlane::list(&storage).await {
+        Ok(failover) => serde_json::json!({
+            "available": true,
+            "summary": &failover.summary,
+            "provider_health": &failover.provider_health,
+            "fallback_chains": failover.fallback_chains.iter().map(|chain| {
+                serde_json::json!({
+                    "id": &chain.id,
+                    "name": &chain.name,
+                    "enabled": chain.enabled,
+                    "candidate_count": chain.ordered_candidates.len(),
+                    "has_session_pin": chain.session_pin.is_some(),
+                })
+            }).collect::<Vec<_>>(),
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+async fn models_surface(runtime: &ActionRuntime) -> Result<serde_json::Value> {
+    let config = runtime.settings_manager()?.load()?;
+    let selected_slot_id = persisted_selected_model_slot_id(runtime).await;
+    let primary_slot_id = resolve_primary_model_slot_id_from_config(&config);
+    let selected_slot = selected_slot_id.as_deref().and_then(|id| {
+        config
+            .model_pool
+            .slots
+            .iter()
+            .find(|slot| slot.id == id && model_slot_runtime_ready(slot))
+    });
+    let primary_slot = primary_slot_id
+        .as_deref()
+        .and_then(|id| config.model_pool.slots.iter().find(|slot| slot.id == id));
+    let active_slot = selected_slot.or(primary_slot);
+    let selection_source = if selected_slot.is_some() {
+        "user_selected_slot"
+    } else if active_slot.is_some() {
+        "primary_or_first_ready_slot"
+    } else {
+        "legacy_llm"
+    };
+    let active_provider = active_slot
+        .map(|slot| &slot.provider)
+        .unwrap_or(&config.llm);
+    let active_slot_id = active_slot.map(|slot| slot.id.clone());
+    let model_pool_slots = config
+        .model_pool
+        .slots
+        .iter()
+        .map(|slot| {
+            model_slot_safe_summary(
+                slot,
+                primary_slot_id.as_deref(),
+                selected_slot_id.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let model_pool_ready_count = config
+        .model_pool
+        .slots
+        .iter()
+        .filter(|slot| model_slot_runtime_ready(slot))
+        .count();
+
+    Ok(serde_json::json!({
+        "surface": "models",
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "evidence_policy": "This surface is safe runtime metadata for answering model/provider status questions. It intentionally excludes credentials, raw config payloads, environment variables, hidden prompts, and internal instructions.",
+        "product_identity": crate::branding::PRODUCT_NAME,
+        "chat_model_configured": if config.model_pool.slots.is_empty() {
+            provider_structurally_configured(&config.llm)
+        } else {
+            model_pool_ready_count > 0
+        },
+        "smart_routing": config.model_pool.smart_routing,
+        "selection": {
+            "source": selection_source,
+            "active_slot_id": active_slot_id,
+            "primary_slot_id": primary_slot_id,
+            "user_selected_slot_id": selected_slot_id,
+            "active_model": provider_model_name(active_provider),
+            "active_provider": provider_safe_summary(active_provider),
+        },
+        "legacy_primary": provider_safe_summary(&config.llm),
+        "legacy_fallback": config.llm_fallback.as_ref().map(provider_safe_summary),
+        "model_pool": {
+            "configured_slots": config.model_pool.slots.len(),
+            "runtime_ready_slots": model_pool_ready_count,
+            "slots": model_pool_slots,
+        },
+        "failover": model_failover_status(runtime).await,
+    }))
+}
+
 async fn analytics_surface(runtime: &ActionRuntime) -> Result<serde_json::Value> {
     let payload = internal_api_get(
         runtime,
@@ -343,6 +594,9 @@ async fn activity_surface(
     let storage = runtime.runtime_storage()?;
     let limit = request.limit.unwrap_or(8).clamp(3, 30);
     let message_limit = limit.saturating_mul(2).min(24);
+    let now = chrono::Utc::now();
+    let reflect_from = (now - chrono::Duration::days(35)).to_rfc3339();
+    let reflect_to = now.to_rfc3339();
 
     let recent_conversations = storage
         .list_conversations(limit, 0, None, &[], None)
@@ -489,6 +743,58 @@ async fn activity_surface(
             })
         })
         .collect::<Vec<_>>();
+    let arkreflect_units = storage
+        .list_semantic_work_units_between(&reflect_from, &reflect_to, limit.saturating_mul(3))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .take(limit as usize)
+        .map(|unit| {
+            serde_json::json!({
+                "id": unit.id,
+                "source_kind": unit.source_kind,
+                "source_id": compact_for_activity(&unit.source_id, 160),
+                "conversation_id": unit.conversation_id,
+                "project_id": unit.project_id,
+                "channel": unit.channel,
+                "title": compact_for_activity(&unit.title, 180),
+                "summary": compact_for_activity(&unit.summary, 420),
+                "content_preview": compact_for_activity(&unit.content_preview, 420),
+                "occurred_at": unit.occurred_at,
+                "message_count": unit.message_count,
+                "has_embedding": unit.embedding.is_some(),
+                "metadata": unit.metadata,
+            })
+        })
+        .collect::<Vec<_>>();
+    let arkreflect_experience_runs = storage
+        .list_recent_experience_runs_any_scope(limit)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|run| {
+            serde_json::json!({
+                "id": run.id,
+                "trace_id": run.trace_id,
+                "conversation_id": run.conversation_id,
+                "project_id": run.project_id,
+                "channel": run.channel,
+                "scope": run.scope,
+                "intent_key": compact_for_activity(&run.intent_key, 180),
+                "task_type": run.task_type.map(|value| compact_for_activity(&value, 120)),
+                "request_text": run.request_text.map(|value| compact_for_activity(&value, 360)),
+                "success_state": run.success_state,
+                "correction_state": run.correction_state,
+                "outcome_summary": run.outcome_summary.map(|value| compact_for_activity(&value, 360)),
+                "failure_reason": run.failure_reason.map(|value| compact_for_activity(&value, 300)),
+                "consolidated": run.consolidated,
+                "heuristic_reflected": run.heuristic_reflected,
+                "heuristic_reflection_status": run.heuristic_reflection_status,
+                "created_at": run.created_at,
+                "updated_at": run.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
     let sentinel = runtime
         .inspect_sentinel_json(&storage, limit)
         .await
@@ -511,6 +817,14 @@ async fn activity_surface(
             "active_experience_items": experience_items,
             "procedural_patterns": procedural_patterns,
             "evolution": evolution,
+        },
+        "arkreflect": {
+            "window": {
+                "from": reflect_from,
+                "to": reflect_to,
+            },
+            "semantic_work_units": arkreflect_units,
+            "recent_experience_runs": arkreflect_experience_runs,
         },
         "sentinel": sentinel,
     }))
@@ -900,9 +1214,13 @@ async fn surface(
             "evolution": runtime.inspect_evolution_json(&storage, limit).await?,
             "trace": runtime.inspect_trace_json(&storage, None, limit).await?,
             "moltbook": runtime.inspect_moltbook_json(&storage, limit).await?,
+            "models": models_surface(runtime).await?,
         })),
         "apps" | "app_registry" | "deployed_apps" => apps_surface(runtime, request).await,
         "analytics" => analytics_surface(runtime).await,
+        "models" | "model_runtime" | "model_status" | "provider_status" | "llm" | "llms" => {
+            models_surface(runtime).await
+        }
         "activity" | "personal_activity" | "activity_insights" => {
             activity_surface(runtime, request).await
         }
@@ -968,4 +1286,37 @@ pub(super) async fn execute(
         }
     };
     Ok(serde_json::to_string_pretty(&redact_json(payload))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_definition_exposes_safe_model_runtime_surface() {
+        let action = action_def();
+        let rendered = serde_json::to_string(&action.input_schema).expect("schema should render");
+
+        assert!(action
+            .description
+            .contains("current model/provider selection"));
+        assert!(action.capabilities.contains(&"model_runtime".to_string()));
+        assert!(rendered.contains("\"models\""));
+        assert!(rendered.contains("current model/provider selection"));
+    }
+
+    #[test]
+    fn provider_summary_excludes_secret_values() {
+        let provider = crate::core::LlmProvider::OpenAI {
+            api_key: "sk-test-secret".to_string(),
+            model: "gpt-test".to_string(),
+            base_url: None,
+        };
+
+        let summary = provider_safe_summary(&provider);
+        let rendered = serde_json::to_string(&summary).expect("summary should render");
+        assert!(rendered.contains("gpt-test"));
+        assert!(rendered.contains("\"has_api_key\":true"));
+        assert!(!rendered.contains("sk-test-secret"));
+    }
 }

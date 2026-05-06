@@ -155,6 +155,7 @@ function Show-AgentArkHelp {
     Write-Host "  restart    Restart AgentArk"
     Write-Host "  logs       View live logs"
     Write-Host "  status     Show running containers"
+    Write-Host "  backup     Backup Docker volumes"
     Write-Host "  update     Install the latest tagged release and restart"
     Write-Host "  setup      Run setup wizard"
     Write-Host "  uninstall  Stop and remove containers"
@@ -200,6 +201,10 @@ switch ($CommandName) {
     }
     "status" {
         Invoke-AgentArkStartScript -Args @("status")
+        break
+    }
+    "backup" {
+        Invoke-AgentArkStartScript -Args @("backup")
         break
     }
     "update" {

@@ -5,7 +5,6 @@ import { WorkspaceViewOutlet } from "./WorkspaceViewOutlet";
 import { type WorkspaceView } from "./workspaceSurface";
 
 export {
-  preloadCommonSettingsPanels,
   preloadSettingsTab,
   preloadWorkspaceSurface,
 } from "./workspaceSurface";

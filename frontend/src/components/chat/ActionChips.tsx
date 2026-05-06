@@ -14,6 +14,7 @@ import CancelRoundedIcon from "@mui/icons-material/CancelRounded";
 import CircularProgress from "@mui/material/CircularProgress";
 
 import type { ChatStepCard, ComputerViewKind } from "./types";
+import { AGENTARK_RENDERERS, rendererSlug, surfaceDisplayTitle } from "./surface";
 import {
   chipStatusFromCard,
   extractFilePath,
@@ -24,15 +25,17 @@ import {
 } from "./dispatch";
 
 const VIEW_ICON: Record<
-  ComputerViewKind,
+  string,
   ComponentType<{ fontSize?: "inherit" | "small" | "medium" | "large" }>
 > = {
-  terminal: TerminalRoundedIcon,
-  file: DescriptionRoundedIcon,
-  browse: LanguageRoundedIcon,
-  search: SearchRoundedIcon,
-  app_deploy: TerminalRoundedIcon,
-  status: AutoAwesomeRoundedIcon,
+  [AGENTARK_RENDERERS.TERMINAL]: TerminalRoundedIcon,
+  [AGENTARK_RENDERERS.FILE]: DescriptionRoundedIcon,
+  [AGENTARK_RENDERERS.BROWSER]: LanguageRoundedIcon,
+  [AGENTARK_RENDERERS.SEARCH]: SearchRoundedIcon,
+  [AGENTARK_RENDERERS.DEPLOY]: TerminalRoundedIcon,
+  [AGENTARK_RENDERERS.IMAGE]: DescriptionRoundedIcon,
+  [AGENTARK_RENDERERS.GENERIC]: AutoAwesomeRoundedIcon,
+  [AGENTARK_RENDERERS.WORKING]: AutoAwesomeRoundedIcon,
 };
 
 function urlHost(url: string): string {
@@ -46,11 +49,11 @@ function urlHost(url: string): string {
 }
 
 function chipTarget(card: ChatStepCard, view: ComputerViewKind): string {
-  if (view === "terminal") return extractCommand(card);
-  if (view === "app_deploy") return urlHost(extractUrl(card)) || extractCommand(card);
-  if (view === "file") return extractFilePath(card);
-  if (view === "browse") return urlHost(extractUrl(card));
-  if (view === "search") return (card.detail || "").split(/\r?\n/)[0]?.trim() || "";
+  if (view === AGENTARK_RENDERERS.TERMINAL) return extractCommand(card);
+  if (view === AGENTARK_RENDERERS.DEPLOY) return urlHost(extractUrl(card)) || extractCommand(card);
+  if (view === AGENTARK_RENDERERS.FILE) return extractFilePath(card);
+  if (view === AGENTARK_RENDERERS.BROWSER) return urlHost(extractUrl(card));
+  if (view === AGENTARK_RENDERERS.SEARCH) return surfaceDisplayTitle(card);
   return "";
 }
 
@@ -105,10 +108,11 @@ export function ActionChips({
           Boolean(live),
         );
         const view = pickComputerView(card);
-        const Icon = VIEW_ICON[view];
+        const Icon = VIEW_ICON[view] || VIEW_ICON[AGENTARK_RENDERERS.GENERIC];
         const isActive = card.id === activeStepId;
         const target = truncate(chipTarget(card, view), 40);
-        const tooltip = card.summary || card.detail || card.label;
+        const label = surfaceDisplayTitle(card);
+        const tooltip = card.summary || card.detail || label;
         return (
           <button
             key={`${keyPrefix}-${card.id}`}
@@ -117,20 +121,20 @@ export function ActionChips({
             className={[
               "action-chip",
               `status-${status}`,
-              `view-${view}`,
+              `view-${rendererSlug(view)}`,
               isActive ? "is-active" : "",
             ]
               .filter(Boolean)
               .join(" ")}
             onClick={() => onActivate?.(card.id)}
             title={tooltip}
-            aria-label={`${card.label}${target ? ` ${target}` : ""}`}
+            aria-label={`${label}${target ? ` ${target}` : ""}`}
           >
             <span className="action-chip-icon" aria-hidden="true">
               <Icon fontSize="inherit" />
             </span>
             <span className="action-chip-text">
-              <span className="action-chip-primary">{cleanChipLabel(card.label)}</span>
+              <span className="action-chip-primary">{cleanChipLabel(label)}</span>
               {target ? (
                 <span className="action-chip-secondary">
                   <span className="action-chip-sep" aria-hidden="true">|</span>

@@ -1,6 +1,12 @@
 import { test, expect } from "@playwright/test";
 
 test.describe("Chat Activity UI @smoke", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.setItem("agentark.tour.completed", "1");
+    });
+  });
+
   test("sending first message in a draft chat does not blank the UI", async ({ page }) => {
     let createdConversationId = "";
     let userMessage = "";
@@ -286,6 +292,217 @@ test.describe("Chat Activity UI @smoke", () => {
     await expect(page.locator("body")).not.toContainText("<!DOCTYPE html>");
     await expect(page.locator("body")).not.toContainText("Tool 'Http_get' Blocked By Safety Policy");
     await expect(page.locator("body")).not.toContainText("matched_app");
+  });
+
+  test("renders accidentally indented prose as prose, not a code preview", async ({ page }) => {
+    const conversationId = "conv-indented-prose";
+    const createdAt = "2026-05-03T16:56:00.000Z";
+    const updatedAt = "2026-05-03T16:57:00.000Z";
+    const assistantMessage = [
+      "Here are things you can ask AgentArk to do:",
+      "",
+      '    "Search the web or internal docs for X."',
+      '    "Run some Python/JS code and show me the result."',
+      "    What is confirmed as available right now",
+      "",
+      "A real fenced code block should still render as code:",
+      "",
+      "```ts",
+      "const answer = 42;",
+      "```"
+    ].join("\n");
+
+    await page.route("**/conversations?**", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations: [
+            {
+              id: conversationId,
+              title: "Indented prose chat",
+              channel: "web",
+              created_at: createdAt,
+              updated_at: updatedAt,
+              message_count: 2,
+              archived: false
+            }
+          ],
+          total: 1,
+          limit: 20,
+          offset: 0
+        })
+      });
+    });
+
+    await page.route(`**/conversations/${conversationId}`, async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: conversationId,
+          title: "Indented prose chat",
+          channel: "web",
+          created_at: createdAt,
+          updated_at: updatedAt,
+          message_count: 2
+        })
+      });
+    });
+
+    await page.route(`**/conversations/${conversationId}/messages?**`, async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages: [
+            {
+              id: "msg-user-indented",
+              role: "user",
+              content: "show me a capability walkthrough",
+              timestamp: createdAt,
+              model_used: null,
+              trace_id: null
+            },
+            {
+              id: "msg-assistant-indented",
+              role: "assistant",
+              content: assistantMessage,
+              timestamp: updatedAt,
+              model_used: "test-model",
+              trace_id: null
+            }
+          ]
+        })
+      });
+    });
+
+    await page.goto("/");
+    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+
+    const chatNav = page.locator("text=Chat").first();
+    if (await chatNav.isVisible()) {
+      await chatNav.click();
+    }
+
+    await page.getByRole("button", { name: /^Conversations$/ }).first().click();
+    const conversationRow = page
+      .locator(".conversation-card")
+      .filter({ hasText: "Indented prose chat" })
+      .first();
+    await expect(conversationRow).toBeVisible({ timeout: 10_000 });
+    await conversationRow.click();
+
+    await expect(page.locator(".chat-markdown").first()).toContainText(
+      "Search the web or internal docs for X",
+      { timeout: 10_000 }
+    );
+    await page.waitForTimeout(700);
+    await expect(page.locator(".chat-md-ide")).toHaveCount(1);
+    await expect(page.locator(".chat-md-ide").first()).toContainText("main.ts");
+    await expect(page.locator(".chat-md-ide").first()).not.toContainText(
+      "Search the web or internal docs for X"
+    );
+  });
+
+  test("keeps markdown tables in final assistant messages", async ({ page }) => {
+    const conversationId = "conv-final-table";
+    const createdAt = "2026-05-03T17:00:00.000Z";
+    const updatedAt = "2026-05-03T17:01:00.000Z";
+    const assistantMessage = [
+      "Based on the capability registry results:",
+      "",
+      "| Area | What Ark Evolve learns |",
+      "| --- | --- |",
+      "| Routing | Which model/provider works best for a task type. |",
+      "| Tools | Which action sequence succeeds most often. |",
+      "",
+      "- Recurring workflows",
+      "- User correction patterns"
+    ].join("\n");
+
+    await page.route("**/conversations?**", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations: [
+            {
+              id: conversationId,
+              title: "Final table chat",
+              channel: "web",
+              created_at: createdAt,
+              updated_at: updatedAt,
+              message_count: 2,
+              archived: false
+            }
+          ],
+          total: 1,
+          limit: 20,
+          offset: 0
+        })
+      });
+    });
+
+    await page.route(`**/conversations/${conversationId}`, async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: conversationId,
+          title: "Final table chat",
+          channel: "web",
+          created_at: createdAt,
+          updated_at: updatedAt,
+          message_count: 2
+        })
+      });
+    });
+
+    await page.route(`**/conversations/${conversationId}/messages?**`, async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages: [
+            {
+              id: "msg-user-table",
+              role: "user",
+              content: "explain ark evolve in detail",
+              timestamp: createdAt,
+              model_used: null,
+              trace_id: null
+            },
+            {
+              id: "msg-assistant-table",
+              role: "assistant",
+              content: assistantMessage,
+              timestamp: updatedAt,
+              model_used: "test-model",
+              trace_id: null
+            }
+          ]
+        })
+      });
+    });
+
+    await page.goto("/");
+    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+
+    const chatNav = page.locator("text=Chat").first();
+    if (await chatNav.isVisible()) {
+      await chatNav.click();
+    }
+
+    await page.getByRole("button", { name: /^Conversations$/ }).first().click();
+    const conversationRow = page
+      .locator(".conversation-card")
+      .filter({ hasText: "Final table chat" })
+      .first();
+    await expect(conversationRow).toBeVisible({ timeout: 10_000 });
+    await conversationRow.click();
+
+    await expect(page.locator(".chat-markdown table")).toHaveCount(1, {
+      timeout: 10_000
+    });
+    await expect(page.locator(".chat-markdown table").first()).toContainText(
+      "Routing"
+    );
+    await expect(page.locator(".chat-markdown-search-brief")).toHaveCount(0);
   });
 
   test("collapses raw activity payloads until the user expands them", async ({ page }) => {
@@ -695,6 +912,7 @@ test.describe("Chat Activity UI @smoke", () => {
         status: 200,
         contentType: "text/event-stream",
         body: [
+          'event: tool_progress\ndata: {"name":"agent_turn_loop","content":"Planning the app fix and preparing the app delivery action.","kind":"agent_loop_progress","phase":"model_call","focus":"app_delivery","title":"Calling model","stream_key":"agent-loop:model_call"}\n\n',
           'event: tool_progress\ndata: {"name":"app_deploy","content":"Drafting src/App.tsx","kind":"phase_status","phase":"generating_files","label":"Generating files","detail":"Drafting src/App.tsx","elapsed_secs":7,"stream_key":"phase-status:app_deploy:generating_files"}\n\n',
           'event: tool_progress\ndata: {"name":"app_deploy","content":"Drafting src/App.tsx","kind":"draft_file","file":"src/App.tsx","phase":"generating_files","stream_key":"draft-file:app_deploy:src/App.tsx","content_snapshot":"export default function App() {\\n  return <main>Hello world</main>;\\n}\\n","line":3,"total_lines":3,"done":false}\n\n',
           'event: tool_progress\ndata: {"name":"app_deploy","content":"Drafting src/App.tsx","kind":"draft_file","file":"src/App.tsx","phase":"generating_files","stream_key":"draft-file:app_deploy:src/App.tsx","content_snapshot":"export default function App() {\\n  return <main>Hello world</main>;\\n}\\n","line":3,"total_lines":3,"done":true}\n\n',
@@ -722,16 +940,30 @@ test.describe("Chat Activity UI @smoke", () => {
     await input.fill("build me a simple hello world app");
     await input.press("Enter");
 
-    await expect(page.locator(".term-titlebar-text")).toContainText("AgentArk Console", { timeout: 10_000 });
-    await expect(page.locator(".deployed-file-row.is-selected").first()).toContainText("src/App.tsx", {
+    await expect(page.locator(".computer-pane-heading")).toContainText("AgentArk's Console", { timeout: 10_000 });
+    const paneTabs = page.locator(".computer-pane-tabs").first();
+    const filesTab = paneTabs.getByRole("tab", { name: "Files" });
+    await expect(filesTab).toBeVisible({ timeout: 10_000 });
+    await expect(filesTab).toHaveAttribute("aria-selected", "true", { timeout: 10_000 });
+    await paneTabs.getByRole("tab", { name: "Console" }).click();
+    await expect(page.locator(".computer-pane-body-computer .computer-pane-files-section")).toHaveCount(0);
+    await expect(page.locator(".computer-pane-body-computer .cview-file")).toHaveCount(0);
+    await filesTab.click();
+    await expect(page.locator(".computer-pane-body-files .computer-pane-files-section")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(".computer-pane-file-pill").first()).toContainText("src/App.tsx", {
       timeout: 10_000
     });
-    await expect(page.locator(".chat-workspace-code-inline")).toContainText("Hello world", {
+    await expect(page.locator(".cview-file").first()).toContainText("src/App.tsx", {
+      timeout: 10_000
+    });
+    await expect(page.locator(".cview-file-body").first()).toContainText("Hello world", {
       timeout: 10_000
     });
     await expect(
       page.locator("text=Built the first draft and kept streaming the file into the workspace.")
     ).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("body")).not.toContainText("Agent Turn Loop");
+    await expect(page.locator("body")).not.toContainText("Planning the app fix");
   });
 
   test("deep research shows a confirm card and resumes with the edited plan", async ({ page }) => {

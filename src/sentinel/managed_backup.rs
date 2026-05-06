@@ -9,6 +9,14 @@ const MANAGED_BACKUP_SUFFIX: &str = ".dump";
 const MANAGED_DATA_ARCHIVE_SUFFIX: &str = ".data.tar.gz";
 const MANAGED_CONFIG_ARCHIVE_SUFFIX: &str = ".config.tar.gz";
 const DEFAULT_MANAGED_BACKUP_INTERVAL_SECS: u64 = 14 * 24 * 60 * 60;
+const CONFIG_ARCHIVE_EXCLUDES: &[&str] = &[
+    "./internal-service-tokens.env",
+    "internal-service-tokens.env",
+    "./internal-service-tokens.env.lock",
+    "internal-service-tokens.env.lock",
+    "./internal-service-tokens.env.tmp.*",
+    "internal-service-tokens.env.tmp.*",
+];
 
 static MANAGED_BACKUP_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -166,20 +174,15 @@ pub(super) async fn ensure_managed_postgres_backup(
     let config_archive_created = match create_config_archive(&tmp_config_archive_path).await {
         Ok(created) => created,
         Err(error) => {
-            cleanup_partial_backup_files(&[
-                &tmp_path,
-                &tmp_data_archive_path,
-                &tmp_config_archive_path,
-                &final_path,
-                &final_data_archive_path,
-                &final_config_archive_path,
-            ])
-            .await;
-            let prefix = latest_backup_context(latest.as_ref());
-            return Err(managed_backup_error(
-                &backup_dir,
-                format!("{prefix}Config archive failed: {error}"),
-            ));
+            cleanup_partial_backup_files(&[&tmp_config_archive_path, &final_config_archive_path])
+                .await;
+            tracing::warn!(
+                target: "agentark::sentinel",
+                backup_dir = %backup_dir.display(),
+                error = %error,
+                "Managed backup skipped optional config archive after failure"
+            );
+            false
         }
     };
 
@@ -438,9 +441,11 @@ async fn create_config_archive(output_path: &Path) -> Result<bool, String> {
     command
         .arg("-czf")
         .arg(output_path)
-        .arg("-C")
-        .arg(&config_dir)
-        .arg(".");
+        .arg("--ignore-failed-read");
+    for pattern in CONFIG_ARCHIVE_EXCLUDES {
+        command.arg(format!("--exclude={pattern}"));
+    }
+    command.arg("-C").arg(&config_dir).arg(".");
     run_backup_command(command, "config archive").await?;
     Ok(true)
 }

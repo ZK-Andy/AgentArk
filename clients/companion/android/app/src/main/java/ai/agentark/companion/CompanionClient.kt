@@ -14,7 +14,8 @@ class CompanionClient(
     private val wsUrl: String,
     private val tokenStore: SecureTokenStore,
     private val capabilities: Set<String>,
-    private val onStatus: (String) -> Unit
+    private val onStatus: (String) -> Unit,
+    private val onLocalNotification: (String, String) -> Boolean
 ) {
     private val client = OkHttpClient()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -142,14 +143,39 @@ class CompanionClient(
         }
 
         when (capability) {
-            "approval_prompt", "notifications" -> commandResult(
-                commandId,
-                true,
-                "Received ${command.optString("action")}",
-                null
-            )
+            "approval_prompt", "notifications" -> {
+                val title = notificationTitle(command, capability)
+                val body = notificationBody(command)
+                if (onLocalNotification(title, body)) {
+                    commandResult(commandId, true, "Notification shown: $title", null)
+                } else {
+                    commandResult(
+                        commandId,
+                        false,
+                        null,
+                        "Android notification permission is not granted"
+                    )
+                }
+            }
             else -> commandResult(commandId, false, null, "No Android adapter is installed for $capability")
         }
+    }
+
+    private fun notificationTitle(command: JSONObject, capability: String): String {
+        val args = command.optJSONObject("arguments")
+        val explicit = args?.optString("title", "")?.trim().orEmpty()
+        if (explicit.isNotEmpty()) return explicit
+        return if (capability == "approval_prompt") "AgentArk Approval" else "AgentArk"
+    }
+
+    private fun notificationBody(command: JSONObject): String {
+        val args = command.optJSONObject("arguments")
+        for (key in listOf("body", "message", "text")) {
+            val value = args?.optString(key, "")?.trim().orEmpty()
+            if (value.isNotEmpty()) return value
+        }
+        val action = command.optString("action", "").trim()
+        return if (action.isNotEmpty()) action else "AgentArk companion notification"
     }
 
     private fun commandResult(commandId: String, success: Boolean, preview: String?, error: String?) {

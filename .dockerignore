@@ -4,6 +4,10 @@ target/
 .idea/
 .vscode/
 .claude/
+backups/
+data/
+uploads/
+config/
 .npm-cache/
 output/
 remotion_video/

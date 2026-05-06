@@ -1367,6 +1367,7 @@ impl Agent {
                         "channel": outcome.channel,
                         "success": outcome.success,
                         "error": outcome.error.as_deref().map(crate::security::redact_pii),
+                        "delivery": outcome.delivery.as_str(),
                     })
                 };
                 Ok(serde_json::json!({
@@ -1519,6 +1520,40 @@ impl Agent {
                     "task_id": task_id,
                     "reused_existing": reused_existing,
                     "removed_duplicates": removed_duplicates,
+                }))
+            }
+            "watch" => {
+                let request_channel = payload
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("autonomy");
+                let conversation_id = payload
+                    .get("conversation_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty());
+                let project_id = payload
+                    .get("project_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty());
+                let output = self
+                    .handle_watch(payload, request_channel, conversation_id, project_id, None)
+                    .await
+                    .ok_or_else(|| "Watcher creation did not return a result".to_string())?;
+                let data = schedule_task_completion_data(&output);
+                let watcher_id = data
+                    .as_ref()
+                    .and_then(|value| value.get("watcher_id"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string());
+                Ok(serde_json::json!({
+                    "status": "executed",
+                    "kind": "watch",
+                    "watcher_id": watcher_id,
+                    "watcher": data,
+                    "message": strip_tool_completion_marker_line(&output),
                 }))
             }
             "activate_mode" => {
@@ -2931,24 +2966,17 @@ impl Agent {
     ) -> NotificationDispatchOutcome {
         let channel_name = format!("{}:image", channel);
         if !matches!(channel, "telegram" | "whatsapp") {
-            return NotificationDispatchOutcome {
-                channel: channel_name,
-                success: false,
-                error: Some(
-                    "Channel does not support image notification attachments yet".to_string(),
-                ),
-            };
+            return NotificationDispatchOutcome::pre_send_failure(
+                channel_name,
+                "Channel does not support image notification attachments yet",
+            );
         }
         let mut safe_caption = match Self::sanitize_outbound_notification_message(channel, caption)
         {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!("{}", error);
-                return NotificationDispatchOutcome {
-                    channel: channel_name,
-                    success: false,
-                    error: Some(error),
-                };
+                return NotificationDispatchOutcome::pre_send_failure(channel_name, error);
             }
         };
         if safe_caption.chars().count() > 950 {
@@ -2972,16 +3000,10 @@ impl Agent {
         )
         .await
         {
-            Ok(()) => NotificationDispatchOutcome {
-                channel: channel_name,
-                success: true,
-                error: None,
-            },
-            Err(error) => NotificationDispatchOutcome {
-                channel: channel_name,
-                success: false,
-                error: Some(error.to_string()),
-            },
+            Ok(()) => NotificationDispatchOutcome::full_success(channel_name),
+            Err(error) => {
+                NotificationDispatchOutcome::pre_send_failure(channel_name, error.to_string())
+            }
         }
     }
 
@@ -3482,7 +3504,11 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         .into_iter()
         .max_by_key(|(_, score)| *score)?;
 
-        if best.1 == 0 { None } else { Some(best.0) }
+        if best.1 == 0 {
+            None
+        } else {
+            Some(best.0)
+        }
     }
 
     pub(super) async fn normalize_action_arguments(

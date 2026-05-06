@@ -18,10 +18,19 @@ use super::prompt_evolution::{
     embedded_prompt_benchmark_profile_json, parse_prompt_bundle_profile, ExternalPromptCandidate,
     PromptBundleProfile, PROMPT_BUNDLE_PROFILE_KEY,
 };
+use super::prompt_fragment_evolution::{
+    prompt_fragment_candidate_benchmark_profile, ExternalPromptFragmentCandidate,
+    PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH,
+};
 use super::specialist_prompt_evolution::{
     embedded_specialist_prompt_benchmark_profile_json, parse_specialist_prompt_bundle_profile,
     ExternalSpecialistPromptCandidate, SpecialistPromptBundleProfile,
     SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
+};
+use crate::core::prompt_fragments::{
+    default_prompt_fragment_bundle, parse_prompt_fragment_bundle_profile,
+    sanitize_prompt_fragment_bundle, PromptFragmentBundleProfile,
+    PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
 };
 
 const GEPA_ROOT_REL: &str = ".agentark/self_evolve/gepa";
@@ -247,14 +256,16 @@ pub struct GepaImportSummary {
     pub candidates_path: String,
     pub prompt_candidates: usize,
     pub specialist_prompt_candidates: usize,
+    pub prompt_fragment_candidates: usize,
     pub rejected_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-pub struct GepaImportedCandidates {
-    pub summary: GepaImportSummary,
-    pub prompt_candidates: Vec<ExternalPromptCandidate>,
-    pub specialist_prompt_candidates: Vec<ExternalSpecialistPromptCandidate>,
+pub(crate) struct GepaImportedCandidates {
+    pub(crate) summary: GepaImportSummary,
+    pub(crate) prompt_candidates: Vec<ExternalPromptCandidate>,
+    pub(crate) specialist_prompt_candidates: Vec<ExternalSpecialistPromptCandidate>,
+    pub(crate) prompt_fragment_candidates: Vec<ExternalPromptFragmentCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -807,6 +818,11 @@ pub async fn export_optimization_bundle(
         .await?
         .and_then(|raw| parse_specialist_prompt_bundle_profile(&raw))
         .unwrap_or_default();
+    let prompt_fragment_bundle = storage
+        .get(PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY)
+        .await?
+        .and_then(|raw| parse_prompt_fragment_bundle_profile(&raw))
+        .unwrap_or_else(default_prompt_fragment_bundle);
     let recent_runs = storage
         .list_recent_experience_runs_any_scope(recent_limit.clamp(1, MAX_EXPORTED_EXPERIENCE_RUNS))
         .await
@@ -823,19 +839,22 @@ pub async fn export_optimization_bundle(
         "surfaces": {
             "prompt_bundle": prompt_bundle,
             "specialist_prompt_bundle": specialist_bundle,
+            "prompt_fragment_bundle": prompt_fragment_bundle,
         },
         "benchmarks": {
             "prompt_bundle": serde_json::from_str::<Value>(embedded_prompt_benchmark_profile_json()).unwrap_or(Value::Null),
             "specialist_prompt_bundle": serde_json::from_str::<Value>(embedded_specialist_prompt_benchmark_profile_json()).unwrap_or(Value::Null),
+            "prompt_fragment_bundle": prompt_fragment_candidate_benchmark_profile(),
         },
         "recent_lineage": {
             "prompt_bundle": read_recent_jsonl_values(project_root.join(".agentark/self_evolve/prompt_bundle_lineage.jsonl"), 12).await,
             "specialist_prompt_bundle": read_recent_jsonl_values(project_root.join(".agentark/self_evolve/specialist_prompt_bundle_lineage.jsonl"), 12).await,
+            "prompt_fragment_bundle": read_recent_jsonl_values(project_root.join(PROMPT_FRAGMENT_LINEAGE_ARCHIVE_REL_PATH), 12).await,
         },
         "experience_runs": recent_runs,
         "candidate_contract": {
             "format": "jsonl",
-            "surfaces": ["prompt_bundle", "specialist_prompt_bundle"],
+            "surfaces": ["prompt_bundle", "specialist_prompt_bundle", "prompt_fragment_bundle"],
             "required_fields": ["run_id", "surface", "source", "candidate", "objective_scores", "feedback_summary", "trace_refs", "created_at"]
         }
     });
@@ -941,7 +960,7 @@ pub async fn run_python_optimizer(
     })
 }
 
-pub async fn import_candidates(candidates_path: &Path) -> Result<GepaImportedCandidates> {
+pub(crate) async fn import_candidates(candidates_path: &Path) -> Result<GepaImportedCandidates> {
     let metadata = tokio::fs::metadata(candidates_path)
         .await
         .with_context(|| format!("failed to inspect GEPA candidates at {:?}", candidates_path))?;
@@ -958,6 +977,7 @@ pub async fn import_candidates(candidates_path: &Path) -> Result<GepaImportedCan
     let records = parse_candidate_records(&raw)?;
     let mut prompt_candidates = Vec::new();
     let mut specialist_prompt_candidates = Vec::new();
+    let mut prompt_fragment_candidates = Vec::new();
     let mut rejected_candidates = Vec::new();
 
     for record in records {
@@ -1007,6 +1027,21 @@ pub async fn import_candidates(candidates_path: &Path) -> Result<GepaImportedCan
                     )),
                 }
             }
+            "prompt_fragment_bundle" => {
+                match serde_json::from_value::<PromptFragmentBundleProfile>(
+                    record.candidate.clone(),
+                ) {
+                    Ok(mut bundle) => {
+                        sanitize_prompt_fragment_bundle(&mut bundle);
+                        prompt_fragment_candidates
+                            .push(ExternalPromptFragmentCandidate { source, bundle });
+                    }
+                    Err(error) => rejected_candidates.push(format!(
+                        "{}:prompt_fragment_bundle rejected because profile JSON was invalid: {}",
+                        record.run_id, error
+                    )),
+                }
+            }
             other => rejected_candidates.push(format!(
                 "{}:{} rejected because surface is not supported",
                 record.run_id, other
@@ -1019,10 +1054,12 @@ pub async fn import_candidates(candidates_path: &Path) -> Result<GepaImportedCan
             candidates_path: candidates_path.display().to_string(),
             prompt_candidates: prompt_candidates.len(),
             specialist_prompt_candidates: specialist_prompt_candidates.len(),
+            prompt_fragment_candidates: prompt_fragment_candidates.len(),
             rejected_candidates,
         },
         prompt_candidates,
         specialist_prompt_candidates,
+        prompt_fragment_candidates,
     })
 }
 

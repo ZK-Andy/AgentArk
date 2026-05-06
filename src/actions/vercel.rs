@@ -286,9 +286,10 @@ pub async fn publish_app_to_external_target(
     match options.target {
         ExternalDeployTarget::Local => Ok(None),
         ExternalDeployTarget::VercelDirect => {
-            let result =
-                publish_app_to_vercel_direct(config_dir, data_dir, app_id, app_dir, app_meta, title, options)
-                    .await?;
+            let result = publish_app_to_vercel_direct(
+                config_dir, data_dir, app_id, app_dir, app_meta, title, options,
+            )
+            .await?;
             persist_external_deployment_meta(app_dir, "vercel", &result).await?;
             Ok(Some(result))
         }
@@ -449,7 +450,10 @@ async fn publish_app_to_vercel_direct(
         body.insert("project".to_string(), Value::String(project.to_string()));
     }
     if options.production {
-        body.insert("target".to_string(), Value::String("production".to_string()));
+        body.insert(
+            "target".to_string(),
+            Value::String("production".to_string()),
+        );
     }
 
     body.insert(
@@ -626,7 +630,10 @@ async fn vercel_git_nudge(
                     });
                 }
             };
-            let team_id = options.vercel_team_id.as_deref().or(creds.team_id.as_deref());
+            let team_id = options
+                .vercel_team_id
+                .as_deref()
+                .or(creds.team_id.as_deref());
             match find_vercel_project(&client, &creds.token, team_id, project).await {
                 Ok(project_payload) => {
                     if vercel_project_has_git_link(&project_payload) {
@@ -707,13 +714,14 @@ async fn find_vercel_project(
     team_id: Option<&str>,
     id_or_name: &str,
 ) -> std::result::Result<Value, (u16, String, String)> {
-    let mut url = url::Url::parse(&format!("{}/v9/projects/", VERCEL_API_BASE)).map_err(|error| {
-        (
-            0,
-            format!("Failed to build Vercel project lookup URL: {}", error),
-            String::new(),
-        )
-    })?;
+    let mut url =
+        url::Url::parse(&format!("{}/v9/projects/", VERCEL_API_BASE)).map_err(|error| {
+            (
+                0,
+                format!("Failed to build Vercel project lookup URL: {}", error),
+                String::new(),
+            )
+        })?;
     url.path_segments_mut()
         .map_err(|_| {
             (
@@ -786,7 +794,10 @@ async fn upload_vercel_files(
             .map_err(|error| {
                 (
                     0,
-                    format!("Vercel file upload request failed for '{}': {}", file.file, error),
+                    format!(
+                        "Vercel file upload request failed for '{}': {}",
+                        file.file, error
+                    ),
                     String::new(),
                 )
             })?;
@@ -828,8 +839,8 @@ async fn wait_for_vercel_deployment(
     if id_or_url.is_empty() {
         return None;
     }
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(VERCEL_DEPLOY_READY_TIMEOUT_SECS);
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(VERCEL_DEPLOY_READY_TIMEOUT_SECS);
     let mut latest = None;
     loop {
         match get_vercel_deployment(client, token, team_id, id_or_url).await {
@@ -859,15 +870,14 @@ async fn get_vercel_deployment(
     team_id: Option<&str>,
     id_or_url: &str,
 ) -> std::result::Result<Value, (u16, String, String)> {
-    let mut url = url::Url::parse(&format!("{}/v13/deployments/", VERCEL_API_BASE)).map_err(
-        |error| {
+    let mut url =
+        url::Url::parse(&format!("{}/v13/deployments/", VERCEL_API_BASE)).map_err(|error| {
             (
                 0,
                 format!("Failed to build Vercel deployment lookup URL: {}", error),
                 String::new(),
             )
-        },
-    )?;
+        })?;
     url.path_segments_mut()
         .map_err(|_| {
             (
@@ -970,13 +980,14 @@ async fn create_vercel_project(
         }
     }
 
-    let mut url = url::Url::parse(&format!("{}/v11/projects", VERCEL_API_BASE)).map_err(|error| {
-        (
-            0,
-            format!("Failed to build Vercel project request URL: {}", error),
-            String::new(),
-        )
-    })?;
+    let mut url =
+        url::Url::parse(&format!("{}/v11/projects", VERCEL_API_BASE)).map_err(|error| {
+            (
+                0,
+                format!("Failed to build Vercel project request URL: {}", error),
+                String::new(),
+            )
+        })?;
     if let Some(team_id) = team_id.filter(|value| !value.trim().is_empty()) {
         url.query_pairs_mut().append_pair("teamId", team_id);
     }
@@ -1179,13 +1190,20 @@ fn excluded_deploy_path(path: &str) -> bool {
             .any(|segment| matches!(segment, ".git" | ".agentark" | "node_modules" | "target"))
 }
 
-fn project_settings_from_meta(app_meta: &Value, options: &ExternalDeployOptions) -> Map<String, Value> {
+fn project_settings_from_meta(
+    app_meta: &Value,
+    options: &ExternalDeployOptions,
+) -> Map<String, Value> {
     let mut settings = Map::new();
-    let build_command = options
-        .build_command
-        .as_deref()
-        .or_else(|| app_meta.get("build_command").and_then(|value| value.as_str()));
-    if let Some(value) = build_command.map(str::trim).filter(|value| !value.is_empty()) {
+    let build_command = options.build_command.as_deref().or_else(|| {
+        app_meta
+            .get("build_command")
+            .and_then(|value| value.as_str())
+    });
+    if let Some(value) = build_command
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         settings.insert("buildCommand".to_string(), Value::String(value.to_string()));
     }
     let output_dir = options
@@ -1193,7 +1211,10 @@ fn project_settings_from_meta(app_meta: &Value, options: &ExternalDeployOptions)
         .as_deref()
         .or_else(|| app_meta.get("output_dir").and_then(|value| value.as_str()));
     if let Some(value) = output_dir.map(str::trim).filter(|value| !value.is_empty()) {
-        settings.insert("outputDirectory".to_string(), Value::String(value.to_string()));
+        settings.insert(
+            "outputDirectory".to_string(),
+            Value::String(value.to_string()),
+        );
     }
     if let Some(value) = app_meta
         .get("install_command")
@@ -1201,7 +1222,10 @@ fn project_settings_from_meta(app_meta: &Value, options: &ExternalDeployOptions)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        settings.insert("installCommand".to_string(), Value::String(value.to_string()));
+        settings.insert(
+            "installCommand".to_string(),
+            Value::String(value.to_string()),
+        );
     }
     settings
 }
@@ -1236,7 +1260,10 @@ async fn persist_external_deployment_meta(
     Ok(())
 }
 
-fn load_vercel_credentials(config_dir: &Path, data_dir: &Path) -> Result<Option<VercelCredentials>> {
+fn load_vercel_credentials(
+    config_dir: &Path,
+    data_dir: &Path,
+) -> Result<Option<VercelCredentials>> {
     if let Ok(token) = std::env::var("VERCEL_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
@@ -1470,7 +1497,10 @@ mod tests {
 
     #[test]
     fn deploy_target_defaults_to_local_for_unknown_values() {
-        assert_eq!(ExternalDeployTarget::from_value(None), ExternalDeployTarget::Local);
+        assert_eq!(
+            ExternalDeployTarget::from_value(None),
+            ExternalDeployTarget::Local
+        );
         assert_eq!(
             ExternalDeployTarget::from_value(Some(&json!("vercel_direct"))),
             ExternalDeployTarget::VercelDirect

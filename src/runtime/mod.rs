@@ -277,6 +277,19 @@ const BACKGROUND_BLOCKED_ACTIONS: &[&str] = &[
     "watch",
 ];
 
+#[derive(Debug, Clone)]
+struct OpenAiChatVisionCandidate {
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+}
+
+impl OpenAiChatVisionCandidate {
+    fn provider_label(&self) -> &'static str {
+        crate::core::llm_provider::openai_provider_label(self.base_url.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ContainerReaperStatus {
     pub last_run_at: Option<String>,
@@ -3895,23 +3908,29 @@ print(json.dumps({
         .await;
 
         self.register_builtin_action(ActionDef {
-            name: "product_help_search".to_string(),
-            description: "Search bundled AgentArk product help and runtime documentation on demand. Use when the user asks about product capabilities, setup, navigation, configuration, or how an AgentArk feature works. This is a read-only documentation lookup; live/current AgentArk state should be inspected with state-inspection actions.".to_string(),
+            name: "agentark_capability_lookup".to_string(),
+            description: "Search the live AgentArk capability registry with curated AgentArk manual context. Use when the user asks what AgentArk can do, how a feature works, where it is configured, or whether a built-in/plugin/MCP capability exists. The live registry is authoritative; manual text is supplemental explanation. This is read-only; current run logs and object state still require state-inspection actions.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Question or topic to search in AgentArk product help" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Maximum help entries to return (default: 4)" },
+                    "query": { "type": "string", "description": "Question or topic to search in the AgentArk capability registry and manual" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Maximum registry entries and supplemental manual entries to return per source (default: 4)" },
                     "doc_ids": {
                         "type": "array",
-                        "description": "Optional product-help document IDs that scope retrieval when routing already selected grounding documents.",
+                        "description": "Optional AgentArk knowledge document IDs that scope supplemental manual retrieval.",
                         "items": { "type": "string" }
                     }
                 },
                 "required": ["query"]
             }),
-            capabilities: vec!["product_help".to_string(), "documentation".to_string(), "database_readonly".to_string()],
+            capabilities: vec![
+                "agentark_capabilities".to_string(),
+                "agentark_manual".to_string(),
+                "capability_inventory".to_string(),
+                "documentation".to_string(),
+                "database_readonly".to_string(),
+            ],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -3946,7 +3965,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "vision_ocr".to_string(),
-            description: "Analyze an uploaded image/PDF or image/PDF URL with a configured provider vision model. Use for OCR, screenshot understanding, visual document extraction, and image questions.".to_string(),
+            description: "Analyze an uploaded image/PDF or image/PDF URL. Use for OCR, screenshot understanding, visual document extraction, and image questions in chat or tool flows.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3977,7 +3996,7 @@ print(json.dumps({
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-            authorization: integration_authorization("media_gen"),
+            authorization: Default::default(),
         })
         .await;
 
@@ -4778,7 +4797,7 @@ print(json.dumps({
                 "properties": {
                     "query": { "type": "string", "description": "Search query. Preserve the user's topic and any explicit date or range. For current/recent scope, include the runtime date or year when it improves freshness; for historical scope, preserve the historical period." },
                     "num_results": { "type": "integer", "description": "Number of results (default 5)" },
-                    "backend": { "type": "string", "description": "Search backend: lightpanda, duckduckgo, playwright, brave, brave_api, serper" },
+                    "backend": { "type": "string", "description": "Search backend override: serper, brave, brave_api, exa, tavily, perplexity, firecrawl, searxng, playwright, lightpanda, duckduckgo, bing_rss" },
                     "time_scope": { "type": "string", "enum": ["current", "recent", "historical", "timeless"], "description": "Semantic temporal intent of the lookup. Use current/recent when the answer depends on now, latest state, news, or recent changes; historical when the user gives or implies a past period; timeless for stable background/reference lookup." }
                 },
                 "required": ["query"]
@@ -4800,7 +4819,7 @@ print(json.dumps({
                 "properties": {
                     "query": { "type": "string", "description": "Research topic or question. For current or recent questions, anchor the query to the runtime date/current year. For explicit historical periods, preserve the user's date or range instead of making it current." },
                     "max_sources": { "type": "integer", "description": "Maximum sources to examine (default 5, or 12 when depth='deep')" },
-                    "backend": { "type": "string", "description": "Optional search backend override: lightpanda, duckduckgo, playwright, brave, brave_api, serper" },
+                    "backend": { "type": "string", "description": "Optional search backend override: serper, brave, brave_api, exa, tavily, perplexity, firecrawl, searxng, playwright, lightpanda, duckduckgo, bing_rss" },
                     "depth": { "type": "string", "description": "Research depth: quick, standard, deep" },
                     "include_sources": { "type": "boolean", "description": "Include source URLs" },
                     "min_primary_sources": { "type": "integer", "description": "Minimum number of primary-source-like results to include when available. Deep research defaults to 2." },
@@ -6349,7 +6368,7 @@ print(json.dumps({
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
             description: format!(
-                "Deploy a web app or server and return a live URL. Supports generated files, files staged in the workspace, line-level patches to an existing app, explicit file deletes, OR a repository source. Use when the intended outcome is a managed browser-usable or hosted artifact, such as building a dashboard, creating a tool, making a website, building an app, or deploying/running a repo locally for the user. External publishing is explicit: deploy_target defaults to local; set deploy_target=\"vercel_direct\" only when the selected app deployment layer is Vercel direct API publishing, or deploy_target=\"vercel_git\" only when the selected layer is Git-backed Vercel. If the requested timing/cadence describes how the generated artifact refreshes, polls, auto-updates, backfills, or presents live data, implement that behavior inside the artifact rather than creating an AgentArk schedule or watcher. {inline_report_boundary} For generated multi-file apps, prefer staging each file with `file_write` under one workspace directory, then call app_deploy with `source_dir` and `source_paths`; this gives the user per-file progress and avoids one giant deploy payload. For edits to a known existing app, prefer `mode=\"patch\"` with `app_id` and `file_patches` unified diffs for small line changes, plus `delete_paths` for removed files; use full `files` only for files that must be replaced completely. For small file-based apps, you may instead provide a `files` object containing every local file needed by the page: if HTML/CSS references a local stylesheet, script, image, font, manifest, or media asset, include that file too. The delivered app must implement the requested workflow and controls; do not substitute a placeholder, mock-only screen, or decorative shell when the user asked for working behavior. For substantial generated pages, prefer a multi-file static bundle with a complete `index.html` that links app-relative `style.css` and `app.js` files included in `files` or `source_paths`; this keeps HTML structure complete and makes validation/repair reliable. Local asset paths must be app-relative, not root-relative. For generated static apps that read public APIs, prefer app-relative {} helpers over third-party CORS proxy services; arXiv search is available at `__agentark/arxiv/search?categories=cs.LG,cs.AI,stat.ML&keywords=reinforcement%20learning,time%20series&max_results=20` and returns normalized JSON from server-side arXiv fetches. Authenticated API apps are supported, but do not embed credentials in browser JavaScript or static files. Build a dynamic backend/proxy when an API needs secret headers/tokens, declare the needed keys in `required_inputs`/`required_secrets`, read them from process env at runtime, and use `config` only for non-sensitive values such as base URLs. AgentArk's own model/provider credentials are not inherited by generated apps; app credentials must be supplied intentionally through the secure credential store. When modifying a known deployed app, provide its stable `app_id`; otherwise a new deployment is created unless duplicate detection finds a matching app to reuse or replace. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, provide `entry_command` or `start_command` when the app needs a long-lived server/runtime; a start command makes the app dynamic unless `runtime_required=false` is explicitly supplied. Generated dynamic bundles may be Python, Node/TypeScript, Rust, or another direct-command stack when the files include complete project configuration plus appropriate lifecycle commands. Dynamic app runtimes persist their app directory and lifecycle commands, can install dependencies with network access before startup (`pip`, `npm`, `cargo`, etc.), can run an optional `stop_command` as a graceful stop hook, and restart from saved metadata. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided; use `runtime_image` for specialized toolchains not present in the default runner. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard follows the current app-hosting default when omitted for local/private apps. Public exposure requires `access_password`, and providing `access_password` enables App Guard.",
+                "Deploy a web app or server and return a live URL. Supports generated files, files staged in the workspace, line-level patches to an existing app, explicit file deletes, OR a repository source. Use when the intended outcome is a managed browser-usable or hosted artifact, such as building a dashboard, creating a tool, making a website, building an app, or deploying/running a repo locally for the user. External publishing is explicit: deploy_target defaults to local; set deploy_target=\"vercel_direct\" only when the selected app deployment layer is Vercel direct API publishing, or deploy_target=\"vercel_git\" only when the selected layer is Git-backed Vercel. If the requested timing/cadence describes how the generated artifact refreshes, polls, auto-updates, backfills, or presents live data, implement that behavior inside the artifact rather than creating an AgentArk schedule or watcher. Build the smallest working app that satisfies the requested workflow, with polished responsive UI, clear controls, and useful loading/empty/error states. Keep generated bundles lean: avoid unrelated routes, auth, databases, admin areas, test suites, generated boilerplate, package manifests, server files, or lifecycle commands unless the user's intent semantically requires them. Prefer a standalone static/browser bundle when the requested behavior can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Use a dynamic backend/runtime only for server-only needs: secret credentials, authenticated server-side API access, durable jobs that must continue with no browser open, durable server-side state/databases, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs that the browser/app proxy cannot safely call. {inline_report_boundary} For generated multi-file apps, prefer staging each file with `file_write` under one workspace directory, then call app_deploy with `source_dir` and `source_paths`; this gives the user per-file progress and avoids one giant deploy payload. For edits to a known existing app, prefer `mode=\"patch\"` with `app_id` and `file_patches` unified diffs for small line changes, plus `delete_paths` for removed files; use full `files` only for files that must be replaced completely. For small file-based apps, you may instead provide a `files` object containing every local file needed by the page: if HTML/CSS references a local stylesheet, script, image, font, manifest, or media asset, include that file too. The delivered app must implement the requested workflow and controls; do not substitute a placeholder, mock-only screen, or decorative shell when the user asked for working behavior. Static browser apps should omit package manifests, server files, `entry_command`, and `start_command` unless a real runtime is needed. Local asset paths must be app-relative, not root-relative. For generated static apps that read public APIs, prefer app-relative {} helpers over third-party CORS proxy services. The app-scoped `__agentark/http/fetch?url=...` helper performs same-origin public GET/HEAD requests for public hosts referenced by the deployed app source; it is not for private networks or secrets. Authenticated API apps are supported, but do not embed credentials in browser JavaScript or static files. Build a dynamic backend/proxy when an API needs secret headers/tokens, declare the needed keys in `required_inputs`/`required_secrets`, read them from process env at runtime, and use `config` only for non-sensitive values such as base URLs. AgentArk's own model/provider credentials are not inherited by generated apps; app credentials must be supplied intentionally through the secure credential store. When modifying a known deployed app, provide its stable `app_id`; otherwise a new deployment is created unless duplicate detection finds a matching app to reuse or replace. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, provide `entry_command` or `start_command` only when the app needs a long-lived server/runtime; a start command makes the app dynamic unless `runtime_required=false` is explicitly supplied. Generated dynamic bundles may be Python, Node/TypeScript, Rust, or another direct-command stack when the files include complete project configuration plus appropriate lifecycle commands. Dynamic app runtimes persist their app directory and lifecycle commands, can install dependencies with network access before startup (`pip`, `npm`, `cargo`, etc.), can run an optional `stop_command` as a graceful stop hook, and restart from saved metadata. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided; use `runtime_image` for specialized toolchains not present in the default runner. Deployment is local by default. Content visibility or audience requirements inside the app are not the same as external network exposure; set expose_public only when the deployment target itself is external/public internet exposure. Local app deployments stay local and access guard defaults to off unless the user explicitly enables local App Guard or supplies a local access password. Public exposure does not change the local URL or local guard setting; the public app surface is protected by App Guard and AgentArk generates a public access password if one is not supplied. After deployment, direct the user to the Apps page for start, stop, restart, logs, App Guard, public exposure, and delete controls. Declare required inputs via required_inputs and mark each item sensitive=true/false.",
                 crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME,
@@ -6536,15 +6555,15 @@ print(json.dumps({
                     },
                     "expose_public": {
                         "type": "boolean",
-                        "description": "Whether to expose the app on the configured remote-access provider when available. Default: false."
+                        "description": "Whether to expose this deployment through the configured remote-access provider. Default: false; ordinary app deployment remains local even if the app content is intended to be shared or read-only."
                     },
                     "access_guard": {
                         "type": "boolean",
-                        "description": "Enable access-password guard for the shared app URL. Providing `access_password` enables this automatically. Public exposure requires it."
+                        "description": "Enable access-password guard for the local app URL. Defaults to false for local app deployments. Public exposure has its own mandatory public-surface guard and does not change this local setting."
                     },
                     "access_password": {
                         "type": "string",
-                        "description": "Operator-chosen or UI-generated access password. Required when `expose_public=true` and enables App Guard."
+                        "description": "Optional operator-chosen access password. Providing it enables local App Guard unless public exposure is the only guarded surface. If public exposure is requested and this is omitted, AgentArk generates a public-surface password."
                     },
                     "replace_existing": {
                         "type": "boolean",
@@ -8242,7 +8261,7 @@ print(json.dumps({
                     format!(
                         "Action '{}' is unavailable because required integration '{}' is not ready.",
                         action_name, integration_id
-                    )
+                    ),
                 ));
             }
         }
@@ -9320,7 +9339,9 @@ print(json.dumps({
             "manage_actions" => self.execute_manage_actions(arguments).await,
             "ark_inspect" => self.execute_ark_inspect(arguments).await,
             "memory_lookup" => self.execute_memory_lookup(arguments).await,
-            "product_help_search" => self.execute_product_help_search(arguments).await,
+            "agentark_capability_lookup" => {
+                self.execute_agentark_capability_lookup(arguments).await
+            }
             "list_integrations" => self.execute_list_integrations(arguments).await,
             "postgres_schema_inspect" => self.execute_postgres_schema_inspect(arguments).await,
             "postgres_query_readonly" => self.execute_postgres_query_readonly(arguments).await,
@@ -9439,6 +9460,7 @@ print(json.dumps({
                 Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
             }
             "session_search" => self.execute_session_search(arguments).await,
+            "document_lookup" => self.execute_document_lookup(arguments).await,
             "vision_ocr" => self.execute_vision_ocr(arguments).await,
             "code_execute" => {
                 // Native fallback for code execution (when Docker mode falls through)
@@ -10814,6 +10836,34 @@ print(result["text"])
         }
     }
 
+    fn openai_chat_vision_response_output_text(value: &serde_json::Value) -> Option<String> {
+        if let Some(text) = value
+            .pointer("/choices/0/message/content")
+            .and_then(|content| {
+                content.as_str().map(ToString::to_string).or_else(|| {
+                    let mut parts = Vec::new();
+                    for item in content.as_array()? {
+                        if let Some(text) = item
+                            .get("text")
+                            .and_then(|text| text.as_str())
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                        {
+                            parts.push(text.to_string());
+                        }
+                    }
+                    let joined = parts.join("\n").trim().to_string();
+                    (!joined.is_empty()).then_some(joined)
+                })
+            })
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text);
+        }
+        Self::openai_response_output_text(value)
+    }
+
     fn gemini_response_output_text(value: &serde_json::Value) -> Option<String> {
         let mut parts = Vec::new();
         let candidates = value.get("candidates").and_then(|value| value.as_array())?;
@@ -10902,6 +10952,93 @@ print(result["text"])
             .ok_or_else(|| anyhow::anyhow!("OpenAI vision response did not include text output"))
     }
 
+    async fn execute_openai_chat_vision(
+        &self,
+        api_key: &str,
+        base_url: Option<&str>,
+        model: &str,
+        detail: &str,
+        instruction: &str,
+        filename: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        if mime_type == "application/pdf" {
+            anyhow::bail!(
+                "Primary chat vision fallback supports image uploads. Configure OpenAI Images or Google Gemini media vision for PDF analysis."
+            );
+        }
+        let encoded_data =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        let image_url = format!("data:{mime_type};base64,{encoded_data}");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to build OpenAI-compatible vision client: {}", error)
+            })?;
+        let request_config = crate::core::llm_provider::resolve_openai_request_config(
+            &client, api_key, base_url, model,
+        )
+        .await?;
+        if request_config.uses_codex_cli_oauth {
+            anyhow::bail!(
+                "OpenAI Subscription Codex backend is not available for uploaded image analysis. Configure a media vision provider or an OpenAI-compatible vision chat model."
+            );
+        }
+        let body = serde_json::json!({
+            "model": model,
+            "stream": false,
+            "max_tokens": 1800,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are AgentArk's chat visual-analysis tool. Analyze only observable content in the supplied upload. Return concise, user-facing text suitable for later answer synthesis or memory extraction. Do not infer sensitive traits, credentials, hidden data, or facts not visible in the image."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": format!("{instruction}\n\nFilename: {filename}")
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url,
+                                "detail": detail
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        let endpoint = format!("{}/chat/completions", request_config.base_url);
+        let mut request = client
+            .post(endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if !request_config.api_key.is_empty() {
+            request = request.bearer_auth(&request_config.api_key);
+        }
+        if request_config.is_openrouter {
+            request = request
+                .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                .header("X-Title", crate::branding::PRODUCT_NAME);
+        }
+        let response = request.json(&body).send().await?;
+        let status = response.status();
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if !status.is_success() {
+            anyhow::bail!("OpenAI-compatible vision error {}: {}", status, value);
+        }
+        Self::openai_chat_vision_response_output_text(&value).ok_or_else(|| {
+            anyhow::anyhow!("OpenAI-compatible vision response did not include text output")
+        })
+    }
+
     async fn execute_gemini_vision(
         &self,
         api_key: &str,
@@ -10952,26 +11089,122 @@ print(result["text"])
             .ok_or_else(|| anyhow::anyhow!("Gemini vision response did not include text output"))
     }
 
+    fn openai_chat_vision_candidate_is_usable(
+        api_key: &str,
+        model: &str,
+        base_url: Option<&str>,
+    ) -> bool {
+        let model = model.trim();
+        if model.is_empty() {
+            return false;
+        }
+        if base_url.is_some_and(crate::core::llm_provider::is_codex_cli_base_url) {
+            return false;
+        }
+
+        let provider_label = crate::core::llm_provider::openai_provider_label(base_url);
+        let missing_api_key = {
+            let trimmed = api_key.trim();
+            trimmed.is_empty() || trimmed == "[ENCRYPTED]"
+        };
+        if missing_api_key {
+            !matches!(
+                provider_label,
+                crate::core::llm_provider::OPENAI_PROVIDER_ID
+                    | crate::core::llm_provider::OPENROUTER_PROVIDER_ID
+            )
+        } else {
+            true
+        }
+    }
+
+    fn push_openai_chat_vision_candidate(
+        candidates: &mut Vec<OpenAiChatVisionCandidate>,
+        provider: &crate::core::LlmProvider,
+    ) {
+        let crate::core::LlmProvider::OpenAI {
+            api_key,
+            model,
+            base_url,
+        } = provider
+        else {
+            return;
+        };
+        if Self::openai_chat_vision_candidate_is_usable(api_key, model, base_url.as_deref()) {
+            candidates.push(OpenAiChatVisionCandidate {
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+            });
+        }
+    }
+
+    fn openai_compatible_chat_vision_candidates(
+        config: &AgentConfig,
+    ) -> Vec<OpenAiChatVisionCandidate> {
+        let mut candidates = Vec::new();
+
+        if !config.model_pool.slots.is_empty() {
+            for slot in
+                config.model_pool.slots.iter().filter(|slot| {
+                    slot.enabled && slot.role == crate::core::config::ModelRole::Primary
+                })
+            {
+                Self::push_openai_chat_vision_candidate(&mut candidates, &slot.provider);
+            }
+            for slot in
+                config.model_pool.slots.iter().filter(|slot| {
+                    slot.enabled && slot.role != crate::core::config::ModelRole::Primary
+                })
+            {
+                Self::push_openai_chat_vision_candidate(&mut candidates, &slot.provider);
+            }
+        }
+
+        Self::push_openai_chat_vision_candidate(&mut candidates, &config.llm);
+        Self::dedupe_openai_chat_vision_candidates(candidates)
+    }
+
+    fn dedupe_openai_chat_vision_candidates(
+        candidates: Vec<OpenAiChatVisionCandidate>,
+    ) -> Vec<OpenAiChatVisionCandidate> {
+        let mut seen = HashSet::new();
+        let mut deduped = Vec::new();
+        for candidate in candidates {
+            let key = format!(
+                "{}\n{}\n{}",
+                candidate.provider_label(),
+                candidate.base_url.as_deref().unwrap_or("").trim(),
+                candidate.model.trim().to_ascii_lowercase()
+            );
+            if seen.insert(key) {
+                deduped.push(candidate);
+            }
+        }
+        deduped
+    }
+
+    fn compact_vision_error(error: &anyhow::Error) -> String {
+        let mut parts = Vec::new();
+        for cause in error.chain() {
+            let redacted = crate::security::redact_secret_input(&cause.to_string()).text;
+            let collapsed = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !collapsed.is_empty() && parts.last() != Some(&collapsed) {
+                parts.push(collapsed);
+            }
+        }
+        let mut text = parts.join(": ");
+        const MAX_ERROR_CHARS: usize = 900;
+        if text.chars().count() > MAX_ERROR_CHARS {
+            text = text.chars().take(MAX_ERROR_CHARS).collect::<String>();
+            text.push_str("...");
+        }
+        text
+    }
+
     async fn execute_vision_ocr(&self, arguments: &serde_json::Value) -> Result<String> {
         let settings = self.settings_manager()?.load()?;
-        let provider = Self::select_vision_provider(
-            &settings,
-            arguments.get("provider").and_then(|value| value.as_str()),
-        )?;
-        let api_key = Self::media_provider_secret(&settings, provider).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Provider '{}' is selected for vision_ocr but has no configured API key.",
-                provider.id()
-            )
-        })?;
-        let base_url = Self::media_provider_base_url(&settings, provider);
-        let model = arguments
-            .get("model")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| Self::default_vision_model(provider))
-            .to_string();
+        let requested_provider = arguments.get("provider").and_then(|value| value.as_str());
         let task = arguments
             .get("task")
             .and_then(|value| value.as_str())
@@ -10992,43 +11225,210 @@ print(result["text"])
             arguments.get("question").and_then(|value| value.as_str()),
         )?;
         let (source, filename, mime_type, bytes) = self.load_vision_input(arguments).await?;
+        let selected_media_provider = Self::select_vision_provider(&settings, requested_provider);
+        let model_override = arguments
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
 
-        let text = match provider {
-            crate::integrations::media_gen::MediaProvider::OpenAiDalle => {
-                self.execute_openai_vision(
-                    &api_key,
-                    &base_url,
-                    &model,
-                    detail,
-                    &instruction,
-                    &filename,
-                    &mime_type,
-                    &bytes,
+        if requested_provider.is_some() {
+            let provider = selected_media_provider?;
+            let api_key = Self::media_provider_secret(&settings, provider).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Provider '{}' is selected for vision_ocr but has no configured API key.",
+                    provider.id()
                 )
-                .await?
-            }
-            crate::integrations::media_gen::MediaProvider::GoogleGemini => {
-                self.execute_gemini_vision(
-                    &api_key,
-                    &base_url,
-                    &model,
-                    &instruction,
-                    &mime_type,
-                    &bytes,
-                )
-                .await?
-            }
-            _ => unreachable!("select_vision_provider only returns supported vision providers"),
-        };
+            })?;
+            let base_url = Self::media_provider_base_url(&settings, provider);
+            let model = arguments
+                .get("model")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| Self::default_vision_model(provider))
+                .to_string();
 
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "provider": provider.id(),
-            "model": model,
-            "task": task,
-            "source": source,
-            "mime_type": mime_type,
-            "text": text,
-        }))?)
+            let text = match provider {
+                crate::integrations::media_gen::MediaProvider::OpenAiDalle => {
+                    self.execute_openai_vision(
+                        &api_key,
+                        &base_url,
+                        &model,
+                        detail,
+                        &instruction,
+                        &filename,
+                        &mime_type,
+                        &bytes,
+                    )
+                    .await?
+                }
+                crate::integrations::media_gen::MediaProvider::GoogleGemini => {
+                    self.execute_gemini_vision(
+                        &api_key,
+                        &base_url,
+                        &model,
+                        &instruction,
+                        &mime_type,
+                        &bytes,
+                    )
+                    .await?
+                }
+                _ => unreachable!("select_vision_provider only returns supported vision providers"),
+            };
+
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "provider": provider.id(),
+                "mode": "media_vision",
+                "model": model,
+                "task": task,
+                "source": source,
+                "mime_type": mime_type,
+                "text": text,
+            }))?);
+        }
+
+        let media_provider_error = selected_media_provider
+            .as_ref()
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+
+        let mut failures = Vec::new();
+        if mime_type != "application/pdf" {
+            let mut attempted_chat = HashSet::new();
+            for candidate in Self::openai_compatible_chat_vision_candidates(&settings) {
+                let model = model_override
+                    .unwrap_or(candidate.model.as_str())
+                    .to_string();
+                let attempt_key = format!(
+                    "{}\n{}\n{}",
+                    candidate.provider_label(),
+                    candidate.base_url.as_deref().unwrap_or("").trim(),
+                    model.trim().to_ascii_lowercase()
+                );
+                if !attempted_chat.insert(attempt_key.clone()) {
+                    continue;
+                }
+                match self
+                    .execute_openai_chat_vision(
+                        candidate.api_key.as_str(),
+                        candidate.base_url.as_deref(),
+                        &model,
+                        detail,
+                        &instruction,
+                        &filename,
+                        &mime_type,
+                        &bytes,
+                    )
+                    .await
+                {
+                    Ok(text) => {
+                        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                            "provider": candidate.provider_label(),
+                            "mode": "configured_chat_vision",
+                            "model": model,
+                            "task": task,
+                            "source": source,
+                            "mime_type": mime_type,
+                            "text": text,
+                        }))?);
+                    }
+                    Err(error) => {
+                        failures.push(format!(
+                            "{} model '{}' failed: {}",
+                            candidate.provider_label(),
+                            model,
+                            Self::compact_vision_error(&error)
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Ok(provider) = selected_media_provider {
+            let api_key = Self::media_provider_secret(&settings, provider).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Provider '{}' is selected for vision_ocr but has no configured API key.",
+                    provider.id()
+                )
+            })?;
+            let base_url = Self::media_provider_base_url(&settings, provider);
+            let model = model_override
+                .unwrap_or_else(|| Self::default_vision_model(provider))
+                .to_string();
+
+            let result = match provider {
+                crate::integrations::media_gen::MediaProvider::OpenAiDalle => {
+                    self.execute_openai_vision(
+                        &api_key,
+                        &base_url,
+                        &model,
+                        detail,
+                        &instruction,
+                        &filename,
+                        &mime_type,
+                        &bytes,
+                    )
+                    .await
+                }
+                crate::integrations::media_gen::MediaProvider::GoogleGemini => {
+                    self.execute_gemini_vision(
+                        &api_key,
+                        &base_url,
+                        &model,
+                        &instruction,
+                        &mime_type,
+                        &bytes,
+                    )
+                    .await
+                }
+                _ => unreachable!("select_vision_provider only returns supported vision providers"),
+            };
+
+            match result {
+                Ok(text) => {
+                    return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                        "provider": provider.id(),
+                        "mode": "media_vision",
+                        "model": model,
+                        "task": task,
+                        "source": source,
+                        "mime_type": mime_type,
+                        "text": text,
+                    }))?);
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "{} model '{}' failed: {}",
+                        provider.id(),
+                        model,
+                        Self::compact_vision_error(&error)
+                    ));
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            if mime_type == "application/pdf" {
+                anyhow::bail!(
+                    "vision_ocr could not analyze this PDF because no dedicated media vision provider is configured. Configure OpenAI Images or Google Gemini in Settings > Media."
+                );
+            }
+            anyhow::bail!(
+                "vision_ocr could not analyze this image because no usable configured chat vision model was available and no dedicated media vision provider is configured ({media_provider_error})."
+            );
+        }
+
+        anyhow::bail!(
+            "vision_ocr could not analyze this upload. Attempts: {}{}",
+            failures.join(" | "),
+            if media_provider_error.is_empty() {
+                String::new()
+            } else {
+                format!(" | media provider selection: {media_provider_error}")
+            }
+        )
     }
 
     fn runtime_storage(&self) -> Result<crate::storage::Storage> {
@@ -11357,7 +11757,7 @@ print(result["text"])
         }))
     }
 
-    fn product_help_query_terms(query: &str) -> Vec<String> {
+    fn agentark_knowledge_query_terms(query: &str) -> Vec<String> {
         query
             .split(|ch: char| !ch.is_alphanumeric())
             .map(|part| part.trim().to_ascii_lowercase())
@@ -11365,7 +11765,7 @@ print(result["text"])
             .collect()
     }
 
-    fn product_help_match_score(text: &str, terms: &[String]) -> usize {
+    fn agentark_knowledge_match_score(text: &str, terms: &[String]) -> usize {
         if terms.is_empty() {
             return 1;
         }
@@ -11376,7 +11776,7 @@ print(result["text"])
             .count()
     }
 
-    fn product_help_chunk_field(content: &str, field: &str) -> Option<String> {
+    fn agentark_knowledge_chunk_field(content: &str, field: &str) -> Option<String> {
         let prefix = format!("{field}:");
         content.lines().find_map(|line| {
             line.strip_prefix(&prefix)
@@ -11386,14 +11786,18 @@ print(result["text"])
         })
     }
 
-    fn product_help_hit_json(
+    fn agentark_knowledge_hit_json(
         hit: crate::core::document_search::DocumentSearchHit,
     ) -> serde_json::Value {
-        let title = Self::product_help_chunk_field(&hit.content, "title")
+        let title = Self::agentark_knowledge_chunk_field(&hit.content, "title")
             .unwrap_or_else(|| hit.filename.clone());
-        let url = Self::product_help_chunk_field(&hit.content, "url");
-        let tags = Self::product_help_chunk_field(&hit.content, "tags");
+        let source = Self::agentark_knowledge_chunk_field(&hit.content, "source")
+            .unwrap_or_else(|| "agentark_knowledge".to_string());
+        let url = Self::agentark_knowledge_chunk_field(&hit.content, "url");
+        let tags = Self::agentark_knowledge_chunk_field(&hit.content, "tags");
         serde_json::json!({
+            "source": source,
+            "result_type": "agentark_knowledge_document",
             "title": title,
             "document_id": hit.document_id,
             "chunk_index": hit.chunk_index,
@@ -11407,16 +11811,273 @@ print(result["text"])
         })
     }
 
-    fn product_help_fallback_results(
+    fn document_lookup_hit_json(
+        hit: crate::core::document_search::DocumentSearchHit,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "filename": hit.filename,
+            "document_id": hit.document_id,
+            "chunk_index": hit.chunk_index,
+            "content": Self::compact_text(&hit.content, 1800),
+            "score": hit.score,
+            "lexical_score": hit.lexical_score,
+            "dense_score": hit.dense_score,
+            "match_reason": hit.match_reason,
+        })
+    }
+
+    fn document_lookup_doc_ids_from_arguments(
+        arguments: &serde_json::Value,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut doc_ids = std::collections::HashSet::new();
+        let Some(items) = arguments.get("doc_ids") else {
+            return Ok(doc_ids);
+        };
+        let Some(items) = items.as_array() else {
+            anyhow::bail!("document_lookup doc_ids must be an array when supplied");
+        };
+        for item in items {
+            let Some(raw) = item
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if !raw
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            {
+                anyhow::bail!("document_lookup doc_ids contain unsupported characters");
+            }
+            doc_ids.insert(raw.to_string());
+            if doc_ids.len() >= 16 {
+                break;
+            }
+        }
+        Ok(doc_ids)
+    }
+
+    async fn execute_document_lookup(&self, arguments: &serde_json::Value) -> Result<String> {
+        let query = arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("document_lookup requires a non-empty query"))?;
+        let limit = arguments
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(6)
+            .clamp(1, 12) as usize;
+        let project_id = arguments
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let requested_doc_ids = Self::document_lookup_doc_ids_from_arguments(arguments)?;
+        let storage = self.runtime_storage()?;
+        let mut docs = storage.list_documents_for_search(project_id).await?;
+        if !requested_doc_ids.is_empty() {
+            docs.retain(|doc| requested_doc_ids.contains(&doc.id));
+        }
+        let matches = crate::core::document_search::search_document_models(
+            &storage,
+            self.embedding_client.as_deref(),
+            query,
+            limit,
+            docs,
+        )
+        .await?
+        .into_iter()
+        .map(Self::document_lookup_hit_json)
+        .collect::<Vec<_>>();
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "query": query,
+            "retrieval": {
+                "mode": if self.embedding_client.is_some() {
+                    "document_chunks_with_dense_similarity"
+                } else {
+                    "document_chunks_lexical"
+                },
+                "embedding_available": self.embedding_client.is_some(),
+                "max_results": limit,
+                "scoped_doc_ids": requested_doc_ids.iter().cloned().collect::<Vec<_>>(),
+            },
+            "results": matches,
+        }))?)
+    }
+
+    fn agentark_capability_overview_result(actions: &[ActionDef]) -> serde_json::Value {
+        let mut capability_counts = std::collections::BTreeMap::<String, usize>::new();
+        let mut integration_counts = std::collections::BTreeMap::<String, usize>::new();
+        let mut source_counts = std::collections::BTreeMap::<String, usize>::new();
+        for action in actions {
+            if action.capabilities.is_empty() {
+                *capability_counts
+                    .entry("uncategorized".to_string())
+                    .or_default() += 1;
+            } else {
+                for capability in &action.capabilities {
+                    let capability = capability.trim();
+                    if !capability.is_empty() {
+                        *capability_counts.entry(capability.to_string()).or_default() += 1;
+                    }
+                }
+            }
+            let metadata = action.planner_metadata();
+            *integration_counts
+                .entry(format!("{:?}", metadata.integration_class))
+                .or_default() += 1;
+            *source_counts
+                .entry(format!("{:?}", action.source))
+                .or_default() += 1;
+        }
+        let top_capabilities = capability_counts
+            .iter()
+            .rev()
+            .take(48)
+            .map(|(name, count)| format!("{name} ({count})"))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "source": crate::core::agentark_knowledge::RUNTIME_SOURCE,
+            "result_type": "live_capability_registry_overview",
+            "title": "Live AgentArk capability registry",
+            "content": Self::compact_text(
+                &format!(
+                    "Current enabled action count: {}. Capability groups: {}. Integration classes: {:?}. Action sources: {:?}. This live registry is authoritative for current availability; AgentArk manual documents are supplemental context.",
+                    actions.len(),
+                    if top_capabilities.is_empty() { "none".to_string() } else { top_capabilities.join(", ") },
+                    integration_counts,
+                    source_counts,
+                ),
+                1800,
+            ),
+            "action_count": actions.len(),
+            "capability_counts": capability_counts,
+            "integration_class_counts": integration_counts,
+            "action_source_counts": source_counts,
+            "score": 1.0,
+            "match_reason": "live_registry_overview",
+        })
+    }
+
+    fn agentark_capability_action_result(
+        action: &ActionDef,
+        score: f64,
+        match_reason: &str,
+    ) -> serde_json::Value {
+        let metadata = action.planner_metadata();
+        let caps = if action.capabilities.is_empty() {
+            "none".to_string()
+        } else {
+            action.capabilities.join(", ")
+        };
+        let content = format!(
+            "`{}` | capabilities: {} | source: {:?} | role: {:?} | integration: {:?} | delivery: {:?} | side_effect: {:?} | requires_auth: {} | {}",
+            action.name,
+            caps,
+            action.source,
+            metadata.role,
+            metadata.integration_class,
+            metadata.delivery_mode,
+            metadata.side_effect_level,
+            metadata.requires_auth || action.authorization.requires_auth,
+            action.description
+        );
+        serde_json::json!({
+            "source": crate::core::agentark_knowledge::RUNTIME_SOURCE,
+            "result_type": "live_action",
+            "title": action.name.clone(),
+            "action_name": action.name.clone(),
+            "description": action.description.clone(),
+            "version": action.version.clone(),
+            "capabilities": action.capabilities.clone(),
+            "action_source": action.source.clone(),
+            "planner_metadata": metadata.clone(),
+            "authorization": {
+                "requires_auth": action.authorization.requires_auth,
+                "risk_level": action.authorization.risk_level.clone(),
+                "human_approval": action.authorization.human_approval.clone(),
+            },
+            "content": Self::compact_text(&content, 1800),
+            "score": score,
+            "match_reason": match_reason,
+        })
+    }
+
+    fn agentark_capability_registry_results(
+        actions: &[ActionDef],
+        query: &str,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let terms = Self::agentark_knowledge_query_terms(query);
+        let mut scored = actions
+            .iter()
+            .map(|action| {
+                let metadata = action.planner_metadata();
+                let searchable = format!(
+                    "{}\n{}\n{}\n{:?}\n{:?}\n{:?}\n{:?}",
+                    action.name,
+                    action.description,
+                    action.capabilities.join("\n"),
+                    action.source,
+                    metadata.role,
+                    metadata.integration_class,
+                    metadata.delivery_mode
+                );
+                let raw_score = Self::agentark_knowledge_match_score(&searchable, &terms);
+                let score = if terms.is_empty() {
+                    1.0
+                } else {
+                    raw_score as f64 / terms.len().max(1) as f64
+                };
+                (action, raw_score, score)
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .2
+                .partial_cmp(&left.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.name.cmp(&right.0.name))
+        });
+
+        let mut results = vec![Self::agentark_capability_overview_result(actions)];
+        results.extend(
+            scored
+                .into_iter()
+                .filter(|(_, raw_score, _)| terms.is_empty() || *raw_score > 0)
+                .take(limit.saturating_sub(1))
+                .map(|(action, raw_score, score)| {
+                    let reason = if terms.is_empty() {
+                        "live_registry_default"
+                    } else if raw_score > 0 {
+                        "live_registry_lexical_match"
+                    } else {
+                        "live_registry_context"
+                    };
+                    Self::agentark_capability_action_result(action, score, reason)
+                }),
+        );
+        results
+    }
+
+    fn agentark_knowledge_fallback_results(
         actions: &[ActionDef],
         query: &str,
         limit: usize,
         doc_ids: &std::collections::HashSet<String>,
+        source_filter: Option<&str>,
     ) -> Vec<serde_json::Value> {
-        let terms = Self::product_help_query_terms(query);
-        let mut scored = crate::core::product_help::build_seed_product_help_documents(actions)
+        let terms = Self::agentark_knowledge_query_terms(query);
+        let mut scored = crate::core::agentark_knowledge::build_seed_agentark_knowledge_documents(actions)
             .into_iter()
             .filter(|doc| doc_ids.is_empty() || doc_ids.contains(&doc.id))
+            .filter(|doc| source_filter.map(|source| doc.source == source).unwrap_or(true))
             .flat_map(|doc| {
                 let title = doc.title.clone();
                 let doc_id = doc.id.clone();
@@ -11427,7 +12088,8 @@ print(result["text"])
                     .into_iter()
                     .enumerate()
                     .map(move |(chunk_index, content)| {
-                        let raw_score = Self::product_help_match_score(&content, &terms_for_doc);
+                        let raw_score =
+                            Self::agentark_knowledge_match_score(&content, &terms_for_doc);
                         let score = if terms_for_doc.is_empty() {
                             1.0
                         } else {
@@ -11436,6 +12098,8 @@ print(result["text"])
                         (
                             score,
                             serde_json::json!({
+                                "source": Self::agentark_knowledge_chunk_field(&content, "source").unwrap_or_else(|| "agentark_knowledge".to_string()),
+                                "result_type": "agentark_knowledge_document",
                                 "title": title.clone(),
                                 "document_id": doc_id.clone(),
                                 "chunk_index": chunk_index,
@@ -11466,7 +12130,7 @@ print(result["text"])
             .collect()
     }
 
-    fn product_help_doc_ids_from_arguments(
+    fn agentark_knowledge_doc_ids_from_arguments(
         arguments: &serde_json::Value,
     ) -> Result<std::collections::HashSet<String>> {
         let mut doc_ids = std::collections::HashSet::new();
@@ -11474,7 +12138,7 @@ print(result["text"])
             return Ok(doc_ids);
         };
         let Some(items) = items.as_array() else {
-            anyhow::bail!("product_help_search doc_ids must be an array when supplied");
+            anyhow::bail!("agentark_capability_lookup doc_ids must be an array when supplied");
         };
         for item in items {
             let Some(raw) = item
@@ -11484,13 +12148,13 @@ print(result["text"])
             else {
                 continue;
             };
-            if !raw.starts_with(crate::core::product_help::DOCUMENT_ID_PREFIX)
+            if !crate::core::agentark_knowledge::is_agentark_knowledge_document_id(raw)
                 || !raw
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '-' | '_'))
             {
                 anyhow::bail!(
-                    "product_help_search doc_ids may only contain product-help document IDs"
+                    "agentark_capability_lookup doc_ids may only contain AgentArk knowledge document IDs"
                 );
             }
             doc_ids.insert(raw.to_string());
@@ -11501,65 +12165,120 @@ print(result["text"])
         Ok(doc_ids)
     }
 
-    async fn execute_product_help_search(&self, arguments: &serde_json::Value) -> Result<String> {
+    async fn execute_agentark_capability_lookup(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
         let query = arguments
             .get("query")
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("product_help_search requires a non-empty query"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("agentark_capability_lookup requires a non-empty query")
+            })?;
         let limit = arguments
             .get("limit")
             .and_then(|value| value.as_u64())
             .unwrap_or(4)
             .clamp(1, 8) as usize;
-        let requested_doc_ids = Self::product_help_doc_ids_from_arguments(arguments)?;
-        let storage = self.runtime_storage()?;
-        let mut product_docs = storage
-            .list_documents_by_id_prefix(crate::core::product_help::DOCUMENT_ID_PREFIX, 512)
-            .await?;
-        if !requested_doc_ids.is_empty() {
-            product_docs.retain(|doc| requested_doc_ids.contains(&doc.id));
-        }
+        let requested_doc_ids = Self::agentark_knowledge_doc_ids_from_arguments(arguments)?;
+        let actions = self.list_enabled_actions().await?;
+        let registry_results = Self::agentark_capability_registry_results(&actions, query, limit);
         let embedding_available = self.embedding_client.is_some();
-        let semantic_results = if product_docs.is_empty() {
-            Vec::new()
-        } else {
-            crate::core::document_search::search_document_models(
-                &storage,
-                self.embedding_client.as_deref(),
-                query,
-                limit,
-                product_docs,
-            )
-            .await?
-            .into_iter()
-            .map(Self::product_help_hit_json)
-            .collect::<Vec<_>>()
-        };
-        let (mode, matches) = if semantic_results.is_empty() {
-            let actions = self.list_enabled_actions().await.unwrap_or_default();
-            (
-                "bounded_lexical_chunk_fallback",
-                Self::product_help_fallback_results(&actions, query, limit, &requested_doc_ids),
-            )
-        } else {
-            (
-                if requested_doc_ids.is_empty() {
-                    "pgvector_document_chunks"
+        let (mode, supplemental_results) = match self.runtime_storage() {
+            Ok(storage) => {
+                let mut agentark_docs = match storage
+                    .list_documents_by_id_prefix(
+                        crate::core::agentark_knowledge::DOCUMENT_ID_PREFIX,
+                        512,
+                    )
+                    .await
+                {
+                    Ok(docs) => docs,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "AgentArk manual document lookup failed; returning live registry only"
+                        );
+                        Vec::new()
+                    }
+                };
+                if !requested_doc_ids.is_empty() {
+                    agentark_docs.retain(|doc| requested_doc_ids.contains(&doc.id));
+                }
+                let semantic_results = if agentark_docs.is_empty() {
+                    Vec::new()
                 } else {
-                    "pgvector_scoped_document_chunks"
-                },
-                semantic_results,
-            )
+                    match crate::core::document_search::search_document_models(
+                        &storage,
+                        self.embedding_client.as_deref(),
+                        query,
+                        limit.saturating_mul(4).max(limit),
+                        agentark_docs,
+                    )
+                    .await
+                    {
+                        Ok(hits) => hits
+                            .into_iter()
+                            .map(Self::agentark_knowledge_hit_json)
+                            .filter(|hit| {
+                                hit.get("source").and_then(|value| value.as_str())
+                                    == Some(crate::core::agentark_knowledge::CURATED_SOURCE)
+                            })
+                            .take(limit)
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "AgentArk manual search failed; falling back to generated manual text"
+                            );
+                            Vec::new()
+                        }
+                    }
+                };
+                if semantic_results.is_empty() {
+                    (
+                        "live_registry_with_bounded_lexical_manual_fallback",
+                        Self::agentark_knowledge_fallback_results(
+                            &actions,
+                            query,
+                            limit,
+                            &requested_doc_ids,
+                            Some(crate::core::agentark_knowledge::CURATED_SOURCE),
+                        ),
+                    )
+                } else {
+                    (
+                        if requested_doc_ids.is_empty() {
+                            "live_registry_with_pgvector_manual_chunks"
+                        } else {
+                            "live_registry_with_pgvector_scoped_manual_chunks"
+                        },
+                        semantic_results,
+                    )
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "AgentArk manual storage unavailable; returning live registry only"
+                );
+                ("live_registry_only", Vec::new())
+            }
         };
+        let mut matches = registry_results;
+        matches.extend(supplemental_results);
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "query": query,
             "retrieval": {
                 "mode": mode,
                 "embedding_available": embedding_available,
-                "result_scope": "product_help_document_chunks",
-                "max_results": limit,
+                "result_scope": "agentark_capability_registry_and_manual",
+                "max_results_per_source": limit,
+                "authoritative_source": crate::core::agentark_knowledge::RUNTIME_SOURCE,
+                "supplemental_source": crate::core::agentark_knowledge::CURATED_SOURCE,
+                "capability_registry_action_count": actions.len(),
                 "scoped_doc_ids": requested_doc_ids.iter().cloned().collect::<Vec<_>>(),
             },
             "results": matches,
@@ -11712,12 +12431,7 @@ print(result["text"])
 
         let semantic_facts = if include_semantic {
             let mut scored = storage
-                .list_active_experience_items(
-                    &semantic_kinds,
-                    project_id,
-                    conversation_id,
-                    96,
-                )
+                .list_active_experience_items(&semantic_kinds, project_id, conversation_id, 96)
                 .await?
                 .into_iter()
                 .filter(Self::memory_lookup_include_sensitive_experience_item)
@@ -19865,6 +20579,147 @@ version: "1.2.3"
             .into_iter()
             .find(|action| action.name == name)
             .expect("action should exist")
+    }
+
+    #[tokio::test]
+    async fn vision_ocr_is_read_only_and_not_media_generation_gated() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "vision_ocr").await;
+
+        assert!(action.capabilities.contains(&"vision_ocr".to_string()));
+        assert!(!action
+            .capabilities
+            .contains(&"image_generation".to_string()));
+        assert!(action.authorization.access.integration_ids.is_empty());
+    }
+
+    fn vision_test_slot(
+        id: &str,
+        role: crate::core::config::ModelRole,
+        provider: crate::core::LlmProvider,
+    ) -> crate::core::config::ModelSlot {
+        crate::core::config::ModelSlot {
+            id: id.to_string(),
+            label: id.to_string(),
+            role,
+            provider,
+            enabled: true,
+            capability_tier: crate::core::config::ModelCapabilityTier::Balanced,
+            cost_tier: crate::core::config::ModelCostTier::Medium,
+            auto_escalate: true,
+            escalation_rank: 0,
+            health_scope: crate::core::config::ModelHealthScope::Provider,
+        }
+    }
+
+    #[test]
+    fn configured_chat_vision_candidates_prefer_model_pool_primary() {
+        let mut config = crate::core::config::AgentConfig::default();
+        config.llm = crate::core::LlmProvider::OpenAI {
+            api_key: "legacy-key".to_string(),
+            model: "legacy-model".to_string(),
+            base_url: None,
+        };
+        config.model_pool.slots = vec![
+            vision_test_slot(
+                "fast",
+                crate::core::config::ModelRole::Fast,
+                crate::core::LlmProvider::OpenAI {
+                    api_key: "fast-key".to_string(),
+                    model: "fast-model".to_string(),
+                    base_url: Some(crate::core::llm_provider::OPENROUTER_API_BASE_URL.to_string()),
+                },
+            ),
+            vision_test_slot(
+                "primary",
+                crate::core::config::ModelRole::Primary,
+                crate::core::LlmProvider::OpenAI {
+                    api_key: "primary-key".to_string(),
+                    model: "primary-model".to_string(),
+                    base_url: Some(crate::core::llm_provider::OPENROUTER_API_BASE_URL.to_string()),
+                },
+            ),
+        ];
+
+        let candidates = ActionRuntime::openai_compatible_chat_vision_candidates(&config);
+
+        assert_eq!(candidates[0].model, "primary-model");
+        assert_eq!(candidates[0].provider_label(), "openrouter");
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.model == "legacy-model"));
+    }
+
+    #[test]
+    fn configured_chat_vision_candidates_skip_missing_managed_provider_keys() {
+        let mut config = crate::core::config::AgentConfig::default();
+        config.llm = crate::core::LlmProvider::Anthropic {
+            api_key: "anthropic-key".to_string(),
+            model: "text-model".to_string(),
+        };
+        config.model_pool.slots = vec![
+            vision_test_slot(
+                "missing-openrouter",
+                crate::core::config::ModelRole::Primary,
+                crate::core::LlmProvider::OpenAI {
+                    api_key: String::new(),
+                    model: "openrouter-model".to_string(),
+                    base_url: Some(crate::core::llm_provider::OPENROUTER_API_BASE_URL.to_string()),
+                },
+            ),
+            vision_test_slot(
+                "local-compatible",
+                crate::core::config::ModelRole::Fallback,
+                crate::core::LlmProvider::OpenAI {
+                    api_key: String::new(),
+                    model: "local-vision-model".to_string(),
+                    base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+                },
+            ),
+        ];
+
+        let candidates = ActionRuntime::openai_compatible_chat_vision_candidates(&config);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].model, "local-vision-model");
+        assert_eq!(candidates[0].provider_label(), "openai-compatible");
+    }
+
+    #[test]
+    fn configured_chat_vision_candidates_dedupe_legacy_primary_copy() {
+        let mut config = crate::core::config::AgentConfig::default();
+        let provider = crate::core::LlmProvider::OpenAI {
+            api_key: "shared-key".to_string(),
+            model: "same-model".to_string(),
+            base_url: Some(crate::core::llm_provider::OPENROUTER_API_BASE_URL.to_string()),
+        };
+        config.llm = provider.clone();
+        config.model_pool.slots = vec![vision_test_slot(
+            "primary",
+            crate::core::config::ModelRole::Primary,
+            provider,
+        )];
+
+        let candidates = ActionRuntime::openai_compatible_chat_vision_candidates(&config);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].model, "same-model");
+    }
+
+    #[tokio::test]
+    async fn document_lookup_has_native_executor() {
+        let runtime = runtime_for_authorization_tests().await;
+        let error = runtime
+            .execute_action(
+                "document_lookup",
+                &serde_json::json!({"query": "uploaded document"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(!error.contains("Unknown native action"));
+        assert!(error.contains("storage") || error.contains("not available"));
     }
 
     #[tokio::test]

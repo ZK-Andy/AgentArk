@@ -168,7 +168,7 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
   connections: settingsRoute("Loading connections...", 2),
   channels: settingsRoute("Loading channels...", 2),
   routing: settingsRoute("Loading routing...", 2),
-  webhooks: settingsRoute("Loading webhooks...", 2),
+  webhooks: settingsRoute("Loading webhooks...", 22),
   devices: settingsRoute("Loading devices...", 26),
   // Keep the legacy browser route alive, but redirect it to Integrations
   // while the browser-profile UI is hidden.

@@ -60,11 +60,9 @@ pub struct ExecutionPlan {
 }
 
 const DEFAULT_MAX_PLAN_STEPS: usize = 8;
-#[cfg(test)]
 pub const DEFAULT_MAX_CONFIRMATION_PLAN_STEPS: usize = 7;
 pub const DEFAULT_MAX_ACTIONS_FOR_PLAN: usize = 8;
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfirmationPlanRelevance {
     pub accepted: bool,
@@ -75,14 +73,12 @@ pub struct ConfirmationPlanRelevance {
     pub matched_anchors: Vec<String>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RequestOutlineSection {
     heading: Option<String>,
     items: Vec<String>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RequestOutline {
     objective: String,
@@ -134,7 +130,6 @@ fn allowed_action_names(actions: &[crate::actions::ActionDef]) -> HashSet<String
         .collect()
 }
 
-#[cfg(test)]
 fn normalize_relevance_text(text: &str) -> String {
     text.to_lowercase()
         .chars()
@@ -142,7 +137,6 @@ fn normalize_relevance_text(text: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
 fn request_anchor_tokens(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut tokens = normalize_relevance_text(text)
@@ -169,7 +163,6 @@ fn request_anchor_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
-#[cfg(test)]
 fn trim_request_list_marker(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     for prefix in ["- ", "* ", "+ "] {
@@ -199,10 +192,13 @@ fn trim_request_list_marker(line: &str) -> Option<&str> {
     }
 
     let rest = after_chars.as_str().trim();
-    if rest.is_empty() { None } else { Some(rest) }
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
 }
 
-#[cfg(test)]
 fn parse_request_outline_heading(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trim_request_list_marker(trimmed).is_some() {
@@ -215,7 +211,6 @@ fn parse_request_outline_heading(line: &str) -> Option<String> {
     Some(heading.to_string())
 }
 
-#[cfg(test)]
 fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     let mut truncated = text.chars().take(max_chars).collect::<String>();
     if text.chars().count() > max_chars {
@@ -224,7 +219,6 @@ fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-#[cfg(test)]
 fn push_request_outline_section(
     sections: &mut Vec<RequestOutlineSection>,
     heading: Option<String>,
@@ -239,7 +233,6 @@ fn push_request_outline_section(
     });
 }
 
-#[cfg(test)]
 fn extract_request_outline(request: &str) -> RequestOutline {
     let mut outline = RequestOutline::default();
     let mut current_heading: Option<String> = None;
@@ -284,7 +277,6 @@ fn extract_request_outline(request: &str) -> RequestOutline {
     outline
 }
 
-#[cfg(test)]
 pub fn render_confirmation_request_grounding(request: &str) -> String {
     let outline = extract_request_outline(request);
     let anchors = request_anchor_tokens(request);
@@ -310,7 +302,19 @@ pub fn render_confirmation_request_grounding(request: &str) -> String {
     lines.join("\n")
 }
 
-#[cfg(test)]
+pub fn confirmation_request_objective_and_items(request: &str) -> (String, Vec<String>) {
+    let outline = extract_request_outline(request);
+    let mut items = Vec::new();
+    for section in outline.sections {
+        for item in section.items {
+            if !item.trim().is_empty() {
+                items.push(item);
+            }
+        }
+    }
+    (outline.objective, items)
+}
+
 fn dense_alnum_text(text: &str) -> String {
     normalize_relevance_text(text)
         .chars()
@@ -318,7 +322,6 @@ fn dense_alnum_text(text: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
 fn char_ngrams(text: &str, n: usize) -> HashSet<String> {
     let chars = text.chars().collect::<Vec<_>>();
     if chars.len() < n {
@@ -330,7 +333,6 @@ fn char_ngrams(text: &str, n: usize) -> HashSet<String> {
         .collect()
 }
 
-#[cfg(test)]
 fn confirmation_plan_text(plan: &ExecutionPlan) -> String {
     let mut parts = Vec::new();
     if !plan.summary.trim().is_empty() {
@@ -347,7 +349,6 @@ fn confirmation_plan_text(plan: &ExecutionPlan) -> String {
     parts.join(" ")
 }
 
-#[cfg(test)]
 pub fn assess_confirmation_plan_relevance(
     request: &str,
     plan: &ExecutionPlan,
@@ -423,7 +424,11 @@ fn normalize_action_name(
 
 fn normalize_arguments(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
     let value = value?.clone();
-    if value.is_object() { Some(value) } else { None }
+    if value.is_object() {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 fn normalize_plan_step(
@@ -706,7 +711,6 @@ Rules:\n\
     (system, user)
 }
 
-#[cfg(test)]
 pub fn build_confirmation_plan_prompt(
     request: &str,
     refinement: Option<&str>,
@@ -988,16 +992,14 @@ mod tests {
     fn parse_plan_rejects_malformed_or_empty_payloads() {
         let actions = vec![action("file_write")];
         assert!(parse_plan_from_llm_content("not json", &actions, None, 1, false).is_none());
-        assert!(
-            parse_plan_from_llm_content(
-                r#"{"summary":"No steps","steps":[]}"#,
-                &actions,
-                None,
-                1,
-                false
-            )
-            .is_none()
-        );
+        assert!(parse_plan_from_llm_content(
+            r#"{"summary":"No steps","steps":[]}"#,
+            &actions,
+            None,
+            1,
+            false
+        )
+        .is_none());
     }
 
     #[test]

@@ -94,6 +94,10 @@ pub struct OrbitChatMessage {
     pub content: String,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<OrbitChatMessageStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
@@ -109,6 +113,14 @@ pub struct OrbitChatMessage {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_token_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrbitChatMessageStatus {
+    Running,
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

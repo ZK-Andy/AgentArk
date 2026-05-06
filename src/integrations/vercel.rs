@@ -57,7 +57,11 @@ impl Integration for VercelConnector {
         }
     }
 
-    async fn execute(&self, _action: &str, _params: &serde_json::Value) -> Result<serde_json::Value> {
+    async fn execute(
+        &self,
+        _action: &str,
+        _params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         Err(anyhow::anyhow!(
             "Use app_deploy or the Apps publish endpoint for Vercel deployments"
         ))

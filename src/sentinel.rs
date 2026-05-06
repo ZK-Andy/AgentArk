@@ -159,6 +159,15 @@ mod tests {
     }
 
     #[test]
+    fn watcher_timeout_routes_preferred_aliases_to_fallback() {
+        for channel in ["", "preferred", "push", "auto", "default", " Preferred "] {
+            assert!(watcher_timeout_uses_preferred_fallback(channel));
+        }
+        assert!(!watcher_timeout_uses_preferred_fallback("telegram"));
+        assert!(!watcher_timeout_uses_preferred_fallback("web"));
+    }
+
+    #[test]
     fn pulse_event_app_ids_collect_snapshot_and_doctor_refs() {
         let event = PulseEvent {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -299,7 +308,7 @@ async fn run_with_busy_deferral<F, Fut>(
         if !sentinel_under_load(agent).await {
             let Some(_maintenance_guard) = try_start_sentinel_maintenance() else {
                 if defers >= max_defers {
-                    tracing::info!(
+                    tracing::debug!(
                         "ArkSentinel: {} skipped (another maintenance job still active after {} defers)",
                         label,
                         max_defers
@@ -308,7 +317,7 @@ async fn run_with_busy_deferral<F, Fut>(
                 }
 
                 defers += 1;
-                tracing::info!(
+                tracing::debug!(
                     "ArkSentinel: {} waiting for another maintenance job; deferring {}/{} for {} minutes",
                     label,
                     defers,
@@ -318,11 +327,11 @@ async fn run_with_busy_deferral<F, Fut>(
                 tokio::time::sleep(Duration::from_secs((defer_minutes * 60) as u64)).await;
                 continue;
             };
-            tracing::info!("ArkSentinel: {} started", label);
+            tracing::debug!("ArkSentinel: {} started", label);
             match tokio::time::timeout(Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS), job()).await
             {
                 Ok(()) => {
-                    tracing::info!("ArkSentinel: {} completed", label);
+                    tracing::debug!("ArkSentinel: {} completed", label);
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -336,7 +345,7 @@ async fn run_with_busy_deferral<F, Fut>(
         }
 
         if defers >= max_defers {
-            tracing::info!(
+            tracing::debug!(
                 "ArkSentinel: {} skipped (busy after {} defers)",
                 label,
                 max_defers
@@ -345,7 +354,7 @@ async fn run_with_busy_deferral<F, Fut>(
         }
 
         defers += 1;
-        tracing::info!(
+        tracing::debug!(
             "ArkSentinel: {} busy; deferring {}/{} for {} minutes",
             label,
             defers,
@@ -3723,14 +3732,14 @@ pub fn start(
                     break;
                 }
                 record_loop_heartbeat(&agent, SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY).await;
-                tracing::info!("ArkSentinel: approval_expiry started");
+                tracing::debug!("ArkSentinel: approval_expiry started");
                 match tokio::time::timeout(
                     Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
                     run_approval_expiry(&agent),
                 )
                 .await
                 {
-                    Ok(()) => tracing::info!("ArkSentinel: approval_expiry completed"),
+                    Ok(()) => tracing::debug!("ArkSentinel: approval_expiry completed"),
                     Err(_) => tracing::warn!(
                         "ArkSentinel: approval_expiry timed out after {}s",
                         *SENTINEL_JOB_TIMEOUT_SECS
@@ -3818,7 +3827,7 @@ pub fn start(
                         || {
                             let agent = agent.clone();
                             async move {
-                                tracing::info!("ArkSentinel: auto_analysis tick started");
+                                tracing::debug!("ArkSentinel: auto_analysis tick started");
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(45),
                                     channels::http::run_autonomy_analysis_tick(
@@ -3829,7 +3838,7 @@ pub fn start(
                                 .await
                                 {
                                     Ok(result) => {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             status = result
                                                 .get("status")
                                                 .and_then(|value| value.as_str())
@@ -3913,14 +3922,14 @@ pub fn start(
                         let agent_guard = agent.read().await;
                         agent_guard.runtime.clone()
                     };
-                    tracing::info!("ArkSentinel: container_reaper started");
+                    tracing::debug!("ArkSentinel: container_reaper started");
                     let result = tokio::time::timeout(
                         Duration::from_secs(*SENTINEL_JOB_TIMEOUT_SECS),
                         async move { runtime.reconcile_orphan_containers().await },
                     )
                     .await;
                     match result {
-                        Ok(Ok(_)) => tracing::info!("ArkSentinel: container_reaper completed"),
+                        Ok(Ok(_)) => tracing::debug!("ArkSentinel: container_reaper completed"),
                         Ok(Err(error)) => {
                             tracing::warn!(
                                 "ArkSentinel: sandbox container reconciliation failed: {}",
@@ -4095,6 +4104,13 @@ async fn persist_watcher_notification_attempt(
         .await;
 }
 
+fn watcher_timeout_uses_preferred_fallback(channel: &str) -> bool {
+    matches!(
+        channel.trim().to_ascii_lowercase().as_str(),
+        "" | "preferred" | "push" | "auto" | "default"
+    )
+}
+
 async fn run_watchers(agent: &SharedAgent) {
     if is_agent_autonomy_paused(agent).await {
         tracing::debug!("ArkSentinel: watchers skipped (agent paused)");
@@ -4133,11 +4149,12 @@ async fn run_watchers(agent: &SharedAgent) {
             web_outcome.error,
         )
         .await;
-        if !w.notify_channel.is_empty() {
-            if !w.notify_channel.eq_ignore_ascii_case("web") {
-                let outcome = agent_snapshot
-                    .try_send_notification_reported(&w.notify_channel, &msg)
-                    .await;
+        let notify_channel = w.notify_channel.trim();
+        if watcher_timeout_uses_preferred_fallback(notify_channel) {
+            for outcome in agent_snapshot.notify_preferred_channel_reported(&msg).await {
+                if outcome.channel.eq_ignore_ascii_case("web") {
+                    continue;
+                }
                 persist_watcher_notification_attempt(
                     &watcher_manager,
                     w.id,
@@ -4148,8 +4165,13 @@ async fn run_watchers(agent: &SharedAgent) {
                 )
                 .await;
             }
-        } else {
-            for outcome in agent_snapshot.notify_preferred_channel_reported(&msg).await {
+        } else if !notify_channel.eq_ignore_ascii_case("web")
+            && !notify_channel.eq_ignore_ascii_case("in_app")
+        {
+            for outcome in agent_snapshot
+                .notify_preferred_channel_reported_with_hint(&msg, Some(notify_channel), true)
+                .await
+            {
                 if outcome.channel.eq_ignore_ascii_case("web") {
                     continue;
                 }

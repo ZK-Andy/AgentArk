@@ -56,7 +56,10 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import { api } from "./api/client";
-import { PersonalizeAgentArkDialog } from "./components/PersonalizeAgentArkDialog";
+import {
+  formatUiRelativeDateTimeMeta,
+  setUiTimeZoneOverride,
+} from "./lib/dateFormat";
 import { AmberCascadesBackground } from "./components/AmberCascadesBackground";
 import {
   NativeWorkspace,
@@ -66,10 +69,7 @@ import {
 } from "./components/NativeWorkspace";
 import SettingsPage from "./components/pages/SettingsPage";
 import {
-  CORE_SETTINGS_STALE_TIME_MS,
-  fetchSettings,
   prefetchSettingsTabData,
-  SETTINGS_QUERY_KEYS,
 } from "./components/pages/settingsData";
 import { OverviewPane } from "./components/OverviewPane";
 import { LibraryPane } from "./components/LibraryPane";
@@ -178,7 +178,12 @@ type ViewKey =
   | "search"
   | "settings";
 
-type NavItem = { key: ViewKey; label: string; icon: ReactNode };
+type NavItem = {
+  key: ViewKey;
+  label: string;
+  icon: ReactNode;
+  tooltip: string;
+};
 type NavGroup = { id: string; label: string; items: NavItem[] };
 type NotificationStreamPayload = {
   kind?: string;
@@ -196,9 +201,10 @@ function defaultSettingsTabForView(
     case "connections":
     case "channels":
     case "routing":
-    case "devices":
     case "browser":
       return 20;
+    case "devices":
+      return 26;
     case "failover":
       return 1;
     case "search":
@@ -348,16 +354,19 @@ const NAV_GROUPS: NavGroup[] = [
         key: "overview",
         label: "Mission Control",
         icon: <SpaceDashboardRoundedIcon fontSize="small" />,
+        tooltip: "Home overview, alerts, and recent activity.",
       },
       {
         key: "chat",
         label: "Chat",
         icon: <ChatRoundedIcon fontSize="small" />,
+        tooltip: "Talk with AgentArk and run work.",
       },
       {
         key: "arkorbit",
         label: "Orbit",
         icon: <HubRoundedIcon fontSize="small" />,
+        tooltip: "Your canvases, projects, and working spaces.",
       },
     ],
   },
@@ -369,21 +378,25 @@ const NAV_GROUPS: NavGroup[] = [
         key: "skills",
         label: "Skills",
         icon: <ExtensionRoundedIcon fontSize="small" />,
+        tooltip: "Manage agent abilities and tools.",
       },
       {
         key: "apps",
         label: "Apps",
         icon: <AppsRoundedIcon fontSize="small" />,
+        tooltip: "Open and manage generated apps.",
       },
       {
         key: "swarm",
         label: "Agents",
         icon: <HubRoundedIcon fontSize="small" />,
+        tooltip: "View and coordinate available agents.",
       },
       {
         key: "goals",
         label: "Goals",
         icon: <FlagRoundedIcon fontSize="small" />,
+        tooltip: "Track objectives and progress.",
       },
     ],
   },
@@ -395,26 +408,31 @@ const NAV_GROUPS: NavGroup[] = [
         key: "sentinel",
         label: "ArkSentinel",
         icon: <NotificationsActiveRoundedIcon fontSize="small" />,
+        tooltip: "Review automation checks and suggestions.",
       },
       {
         key: "evolution",
         label: "ArkEvolve",
         icon: <AutoGraphRoundedIcon fontSize="small" />,
+        tooltip: "Inspect experiments that improve AgentArk.",
       },
       {
         key: "arkmemory",
         label: "ArkMemory",
         icon: <MemoryRoundedIcon fontSize="small" />,
+        tooltip: "Review stored knowledge and preferences.",
       },
       {
         key: "arkreflect",
         label: "ArkReflect",
         icon: <BubbleChartRoundedIcon fontSize="small" />,
+        tooltip: "Explore patterns and self-review insights.",
       },
       {
         key: "arkpulse",
         label: "ArkPulse",
         icon: <MonitorHeartRoundedIcon fontSize="small" />,
+        tooltip: "Monitor system health and cleanup findings.",
       },
     ],
   },
@@ -426,21 +444,25 @@ const NAV_GROUPS: NavGroup[] = [
         key: "tasks",
         label: "Tasks",
         icon: <TaskRoundedIcon fontSize="small" />,
+        tooltip: "See scheduled, running, and completed tasks.",
       },
       {
         key: "sessions",
         label: "Browser Sessions",
         icon: <HistoryRoundedIcon fontSize="small" />,
+        tooltip: "Manage live browser handoff sessions.",
       },
       {
         key: "status",
         label: "Background Work",
         icon: <VisibilityRoundedIcon fontSize="small" />,
+        tooltip: "Follow ongoing background work.",
       },
       {
         key: "trace",
         label: "Trace",
         icon: <TimelineRoundedIcon fontSize="small" />,
+        tooltip: "Inspect execution steps and diagnostics.",
       },
     ],
   },
@@ -452,11 +474,13 @@ const NAV_GROUPS: NavGroup[] = [
         key: "documents",
         label: "Documents",
         icon: <DescriptionRoundedIcon fontSize="small" />,
+        tooltip: "Browse files and document context.",
       },
       {
         key: "analytics",
         label: "Analytics",
         icon: <AnalyticsRoundedIcon fontSize="small" />,
+        tooltip: "View usage and performance metrics.",
       },
     ],
   },
@@ -635,21 +659,6 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-function toBool(value: unknown): boolean {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "string") {
-    const normalized = value.trim().toLowerCase();
-    return (
-      normalized === "true" ||
-      normalized === "1" ||
-      normalized === "yes" ||
-      normalized === "on"
-    );
-  }
-  if (typeof value === "number") return value !== 0;
-  return false;
-}
-
 function pickTasks(value: unknown): Task[] {
   if (Array.isArray(value)) return value as Task[];
   const record = asRecord(value);
@@ -658,42 +667,7 @@ function pickTasks(value: unknown): Task[] {
 
 function notifTimeAgo(raw?: string | null): { label: string; tip: string } {
   if (!raw) return { label: "", tip: "" };
-  const dt = new Date(raw);
-  if (Number.isNaN(dt.getTime())) return { label: raw, tip: raw };
-  const tip = new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    timeZoneName: "short",
-  }).format(dt);
-  const diffMs = Date.now() - dt.getTime();
-  const isPast = diffMs >= 0;
-  const absSec = Math.round(Math.abs(diffMs) / 1000);
-  if (absSec < 30) return { label: "just now", tip };
-  const absMin = Math.round(absSec / 60);
-  if (absMin < 60) {
-    const s = absMin === 1 ? "1 min" : `${absMin} mins`;
-    return { label: isPast ? `${s} ago` : `in ${s}`, tip };
-  }
-  const absHours = Math.round(absMin / 60);
-  if (absHours < 24) {
-    const s = absHours === 1 ? "1 hour" : `${absHours} hours`;
-    return { label: isPast ? `${s} ago` : `in ${s}`, tip };
-  }
-  const absDays = Math.round(absHours / 24);
-  if (absDays < 7) {
-    const s = absDays === 1 ? "1 day" : `${absDays} days`;
-    return { label: isPast ? `${s} ago` : `in ${s}`, tip };
-  }
-  const absWeeks = Math.round(absDays / 7);
-  if (absWeeks < 5) {
-    const s = absWeeks === 1 ? "1 week" : `${absWeeks} weeks`;
-    return { label: isPast ? `${s} ago` : `in ${s}`, tip };
-  }
-  return { label: tip, tip };
+  return formatUiRelativeDateTimeMeta(raw, { fallback: raw });
 }
 
 function isAutomationFailureNotification(notification: {
@@ -822,12 +796,22 @@ function notificationDisplaySummary(notification: {
   return notification.body || notification.source || "Open to view details.";
 }
 
+function isRoutineSecurityGuardNotification(notification: {
+  title?: string;
+  source?: string;
+}): boolean {
+  const source = (notification.source || "").trim().toLowerCase();
+  const title = (notification.title || "").trim().toLowerCase();
+  return source === "security" && title === "security alert";
+}
+
 function shouldSurfaceNotification(notification: {
   title?: string;
   body?: string;
   source?: string;
   level?: string;
 }): boolean {
+  if (isRoutineSecurityGuardNotification(notification)) return false;
   const source = (notification.source || "").toLowerCase();
   const title = (notification.title || "").toLowerCase();
   if (source.includes("watcher") || title.includes("watcher triggered"))
@@ -866,6 +850,12 @@ function notificationEventAffectsChat(
 
 export default function App() {
   const queryClient = useQueryClient();
+  const profileQ = useQuery({
+    queryKey: ["profile"],
+    queryFn: () => api.rawGet("/profile"),
+    staleTime: 30_000,
+    refetchInterval: false,
+  });
   const autoRefresh = useUiStore((s) => s.autoRefresh);
   const selectedNotificationId = useUiStore((s) => s.selectedNotificationId);
   const openNotification = useUiStore((s) => s.openNotification);
@@ -885,57 +875,22 @@ export default function App() {
   const tourActive = useUiStore((s) => s.tourActive);
   const tourCompleted = useUiStore((s) => s.tourCompleted);
   const startTour = useUiStore((s) => s.startTour);
-  const [personalizationDismissedSession, setPersonalizationDismissedSession] =
-    useState(false);
-  const profileQ = useQuery({
-    queryKey: ["profile"],
-    queryFn: () => api.rawGet("/profile"),
-    refetchInterval: false,
-  });
-  const appSettingsQ = useQuery({
-    queryKey: SETTINGS_QUERY_KEYS.settings,
-    queryFn: fetchSettings,
-    staleTime: CORE_SETTINGS_STALE_TIME_MS,
-    refetchInterval: false,
-  });
-  const profileRecord = asRecord(profileQ.data);
-  const appSettingsRecord = asRecord(appSettingsQ.data);
-  const personalizationGateResolved =
-    (!profileQ.isLoading && !appSettingsQ.isLoading) ||
-    profileQ.isError ||
-    appSettingsQ.isError;
-  const llmConfigured = toBool(appSettingsRecord.settings_complete);
-  const onboardingComplete = toBool(profileRecord.onboarding_complete);
-  const personalizationDismissedPersisted = toBool(
-    profileRecord.personalization_dismissed,
-  );
-  const needsPersonalization =
-    llmConfigured && !onboardingComplete && !personalizationDismissedPersisted;
 
   // Auto-start guided tour on first launch
   useEffect(() => {
-    if (
-      !tourCompleted &&
-      !tourActive &&
-      personalizationGateResolved &&
-      !needsPersonalization
-    ) {
+    if (!tourCompleted && !tourActive) {
       const timer = setTimeout(() => startTour(), 800);
       return () => clearTimeout(timer);
     }
-  }, [
-    needsPersonalization,
-    personalizationGateResolved,
-    startTour,
-    tourActive,
-    tourCompleted,
-  ]);
+  }, [startTour, tourActive, tourCompleted]);
 
   useEffect(() => {
-    if (!needsPersonalization) {
-      setPersonalizationDismissedSession(false);
-    }
-  }, [needsPersonalization]);
+    if (!profileQ.isSuccess) return;
+    const timezone = asRecord(profileQ.data).timezone;
+    setUiTimeZoneOverride(
+      typeof timezone === "string" ? timezone.trim() || null : null,
+    );
+  }, [profileQ.data, profileQ.isSuccess]);
 
   const [notifAnchorEl, setNotifAnchorEl] = useState<HTMLElement | null>(null);
   const [navHidden, setNavHidden] = useState<boolean>(() => {
@@ -1013,18 +968,21 @@ export default function App() {
       preloadAppView("swarm");
       preloadAppView("sessions");
       preloadAppView("trace");
+      // Warm Settings + the Models tab early so the user's first click on
+      // either the Settings gear or a Models-tab shortcut lands instantly.
+      // preloadAppView("settings") also fires prefetchSettingsTabData; model
+      // rows come from the cached /settings payload.
+      preloadAppView("settings", { settingsTab: 1 });
       void loadApprovalPromptOverlayModule();
     }, 900);
-    const cancelSettingsWarmup = scheduleWarmup(() => {
-      preloadAppView("settings");
-      prefetchSettingsTabData(queryClient, 0);
+    const cancelGuidedTourWarmup = scheduleWarmup(() => {
       void loadGuidedTourModule();
     }, 1800);
     return () => {
       cancelCoreWarmup();
-      cancelSettingsWarmup();
+      cancelGuidedTourWarmup();
     };
-  }, [preloadAppView, queryClient]);
+  }, [preloadAppView]);
 
   useEffect(() => {
     const syncFromLocation = (replaceInvalid: boolean) => {
@@ -1156,12 +1114,6 @@ export default function App() {
         Math.min(Math.round(unreadCountFromEndpoint), visibleUnreadCount),
       )
     : visibleUnreadCount;
-  const personalizeDialogOpen =
-    personalizationGateResolved &&
-    !profileQ.isError &&
-    !appSettingsQ.isError &&
-    needsPersonalization &&
-    !personalizationDismissedSession;
   const filteredNotifications = useMemo(() => {
     if (notifFilter === "all") return visibleNotifications;
     if (notifFilter === "unread")
@@ -1552,9 +1504,9 @@ export default function App() {
             {group.items.map((item) => (
               <Tooltip
                 key={item.key}
-                title={item.label}
+                title={`${item.label}: ${item.tooltip}`}
                 placement="right"
-                disableHoverListener={!collapsed}
+                arrow
               >
                 <ListItemButton
                   selected={isNavItemActive(item.key, activeView)}
@@ -1788,11 +1740,6 @@ export default function App() {
           onOpenTasks={() => navigateToView("tasks")}
         />
       </Suspense>
-      <PersonalizeAgentArkDialog
-        open={personalizeDialogOpen}
-        profile={profileRecord}
-        onClose={() => setPersonalizationDismissedSession(true)}
-      />
       <Dialog
         open={settingsModalOpen}
         onClose={closeSettingsModal}

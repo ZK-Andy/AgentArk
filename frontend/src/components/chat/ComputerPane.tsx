@@ -1,8 +1,16 @@
 // Right-side "Computer" pane: one focused live artifact surface with compact
-// activity and trace tabs. This is intentionally closer to a runtime console
+// activity history. This is intentionally closer to a runtime console
 // than a second copy of the chat timeline.
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  memo,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import Box from "@mui/material/Box";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
@@ -12,18 +20,23 @@ import CloseIcon from "@mui/icons-material/Close";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
 import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import FiberManualRecordRoundedIcon from "@mui/icons-material/FiberManualRecordRounded";
-import ComputerRoundedIcon from "@mui/icons-material/ComputerRounded";
+import KeyboardArrowDownRoundedIcon from "@mui/icons-material/KeyboardArrowDownRounded";
+import KeyboardArrowUpRoundedIcon from "@mui/icons-material/KeyboardArrowUpRounded";
+import TerminalRoundedIcon from "@mui/icons-material/TerminalRounded";
 
-import type { ChatStepCard, ComputerPaneFile, ComputerPaneTab } from "./types";
+import type { ChatStepCard, ComputerPaneFile, ComputerPaneTab, SurfaceStatus } from "./types";
 import { extractFilePath, pickComputerView, prepareChipCards } from "./dispatch";
 import {
-  AppDeployView,
-  BrowseView,
+  AGENTARK_RENDERERS,
+  rendererIdForCard,
+  surfaceDisplayTitle,
+  surfaceFromCard,
+  surfaceStatus,
+} from "./surface";
+import {
   FileView,
-  SearchView,
+  SurfaceRenderer,
   StatusView,
-  TerminalView,
-  TraceTimeline,
   WorkingView,
 } from "./computerViews";
 
@@ -81,6 +94,23 @@ function pickActiveCard(
   return pool[pool.length - 1] ?? null;
 }
 
+function looksLikeStructuredPanePayload(text: string): boolean {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return false;
+  return (
+    ((trimmed.startsWith("{") || trimmed.startsWith("[")) &&
+      /["}\]]\s*[:,]|^\{\s*"|^\[\s*(\{|"|\])/.test(trimmed)) ||
+    /^<artifact\b/i.test(trimmed)
+  );
+}
+
+function safePaneText(value: string, fallback = ""): string {
+  const trimmed = (value || "").replace(/\s+/g, " ").trim();
+  if (!trimmed) return fallback;
+  if (looksLikeStructuredPanePayload(trimmed)) return fallback;
+  return trimmed.length > 180 ? `${trimmed.slice(0, 177).trimEnd()}...` : trimmed;
+}
+
 function ActivityList({
   cards,
   activeStepId,
@@ -104,6 +134,7 @@ function ActivityList({
       {cards.map((card) => {
         const isActive = card.id === activeStepId;
         const time = card.time || "";
+        const detail = safePaneText(card.summary || card.detail || "");
         return (
           <li
             key={`activity-${card.id}`}
@@ -118,9 +149,9 @@ function ActivityList({
                 {card.kind || "Update"}
               </span>
               <span className="computer-pane-activity-label">{card.label}</span>
-              {card.summary || card.detail ? (
+              {detail ? (
                 <span className="computer-pane-activity-detail">
-                  {card.summary || card.detail}
+                  {detail}
                 </span>
               ) : null}
               {time ? (
@@ -290,6 +321,28 @@ function filePathsMatch(left: string, right: string): boolean {
   return lhs === rhs || lhs.endsWith(`/${rhs}`) || rhs.endsWith(`/${lhs}`);
 }
 
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileNameFromPath(path: string): string {
+  const normalized = (path || "").replace(/\\/g, "/").trim();
+  return normalized.split("/").filter(Boolean).pop() || normalized || "file";
+}
+
+function workspaceFileMeta(file: ComputerPaneFile, live: boolean): string {
+  if (live) return "writing";
+  const lineCount = file.content ? file.content.split(/\r?\n/).length : 0;
+  const byteCount = new Blob([file.content || ""]).size;
+  if (lineCount > 0) {
+    return `${lineCount} line${lineCount === 1 ? "" : "s"} / ${formatBytes(byteCount)}`;
+  }
+  return "queued";
+}
+
 function syntheticFileCard(source: ChatStepCard, path: string): ChatStepCard {
   return {
     ...source,
@@ -302,6 +355,34 @@ function syntheticFileCard(source: ChatStepCard, path: string): ChatStepCard {
     rawDetailFull: "",
     summary: "",
     payloadView: null,
+    surface: {
+      protocolVersion: 1,
+      renderer: {
+        id: AGENTARK_RENDERERS.FILE,
+        version: 1,
+        fallback: "generic-artifact",
+      },
+      call: {
+        runId: surfaceFromCard(source)?.call.runId,
+        callId: `${surfaceFromCard(source)?.call.callId || source.id}:file:${path}`,
+        sequence: surfaceFromCard(source)?.call.sequence,
+      },
+      tool: {
+        id: "workspace_file",
+        displayName: "File",
+      },
+      status: "done",
+      title: path,
+      artifacts: [
+        {
+          id: `file:${path}`,
+          role: "file",
+          contentType: "text/plain",
+          path,
+          label: path,
+        },
+      ],
+    },
   };
 }
 
@@ -310,7 +391,20 @@ function progressLabel(done: number, total: number): string {
   return `Task Progress ${done}/${total}`;
 }
 
-export function ComputerPane({
+function statusTone(status: SurfaceStatus | null): "working" | "waiting" | "error" | "idle" {
+  if (status === "error") return "error";
+  if (status === "waiting" || status === "pending") return "waiting";
+  if (status === "running") return "working";
+  return "idle";
+}
+
+const COMPUTER_PANE_TAB_LABEL: Record<ComputerPaneTab, string> = {
+  computer: "Console",
+  files: "Files",
+  activity: "Activity",
+};
+
+function ComputerPaneInner({
   liveCards,
   allCards,
   activeStepId,
@@ -335,7 +429,18 @@ export function ComputerPane({
   const [tab, setTab] = useState<ComputerPaneTab>("computer");
   const [deployFilePath, setDeployFilePath] = useState<string | null>(null);
   const [userPickedDeployFile, setUserPickedDeployFile] = useState(false);
+  const [filesListCollapsed, setFilesListCollapsed] = useState(false);
+  const filesListId = useId();
+  const lastLiveWritePathRef = useRef<string | null>(null);
+  const hasWorkspaceFiles = workspaceFiles.length > 0;
+  const snippetFileAvailable = Boolean(showSnippet && (snippetPath || snippetContent));
+  const hasFileTab =
+    hasWorkspaceFiles || Boolean(liveWritePath || deployFilePath) || snippetFileAvailable;
   const autoFocusFilePath = liveWritePath || workspaceFiles[0]?.path || null;
+  const followedLiveWritePath =
+    liveWriteActive && liveWritePath && !userPickedDeployFile
+      ? liveWritePath
+      : "";
 
   // While a file is actively being written, auto-focus it in the pane so the
   // user watches the code stream in (Bolt/Lovable-style) without having to
@@ -356,34 +461,81 @@ export function ComputerPane({
   useEffect(() => {
     if (!liveWriteActive) setUserPickedDeployFile(false);
   }, [liveWriteActive]);
+  useEffect(() => {
+    if (!liveWriteActive || !liveWritePath) return;
+    const normalized = normalizePath(liveWritePath);
+    if (lastLiveWritePathRef.current === normalized) return;
+    lastLiveWritePathRef.current = normalized;
+    setUserPickedDeployFile(false);
+    setDeployFilePath(liveWritePath);
+    setTab("files");
+  }, [liveWriteActive, liveWritePath]);
+  useEffect(() => {
+    if (tab === "files" && !hasFileTab) setTab("computer");
+  }, [hasFileTab, tab]);
+  useEffect(() => {
+    if (liveWriteActive && hasFileTab) setTab("files");
+  }, [hasFileTab, liveWriteActive]);
 
   const cardsForRun = useMemo(
     () => (liveCards.length > 0 ? liveCards : allCards),
     [liveCards, allCards],
   );
-  const traceCards = useMemo(
+  const activityCards = useMemo(
     () => cardsForRun.filter((card) => !card.isHeartbeat),
     [cardsForRun],
   );
-  const primaryTraceCards = useMemo(
-    () => traceCards.filter((card) => !isReasoningOnlyCard(card)),
-    [traceCards],
+  const primaryActivityCards = useMemo(
+    () => activityCards.filter((card) => !isReasoningOnlyCard(card)),
+    [activityCards],
   );
   const navPool = useMemo(
     () =>
       prepareChipCards(cardsForRun).filter(
-        (card) => pickComputerView(card) !== "status",
+        (card) => {
+          const rendererId = rendererIdForCard(card);
+          return (
+            rendererId !== AGENTARK_RENDERERS.WORKING &&
+            rendererId !== AGENTARK_RENDERERS.FILE
+          );
+        },
       ),
     [cardsForRun],
+  );
+  const headerFilePath =
+    followedLiveWritePath ||
+    deployFilePath ||
+    liveWritePath ||
+    workspaceFiles[0]?.path ||
+    snippetPath ||
+    "";
+  const workspaceFileRows = useMemo(
+    () =>
+      workspaceFiles.map((file) => {
+        const live =
+          !!liveWritePath &&
+          filePathsMatch(file.path, liveWritePath) &&
+          liveWriteActive;
+        const selected =
+          !!headerFilePath && filePathsMatch(file.path, headerFilePath);
+        return {
+          file,
+          live,
+          selected,
+          name: fileNameFromPath(file.path),
+          meta: workspaceFileMeta(file, live),
+        };
+      }),
+    [headerFilePath, liveWriteActive, liveWritePath, workspaceFiles],
   );
 
   const activeCard = useMemo(
     () => pickActiveCard(navPool, activeStepId),
     [navPool, activeStepId],
   );
-  const latestTraceCard = useMemo(
-    () => pickActiveCard(primaryTraceCards, activeStepId),
-    [primaryTraceCards, activeStepId],
+  const latestActivityCard = useMemo(
+    () => pickActiveCard(primaryActivityCards, activeStepId),
+    [primaryActivityCards, activeStepId],
   );
 
   const activeIndex = useMemo(
@@ -392,12 +544,30 @@ export function ComputerPane({
   );
   const canPrev = activeIndex > 0;
   const canNext = activeIndex >= 0 && activeIndex < navPool.length - 1;
-  const view = activeCard ? pickComputerView(activeCard) : "status";
-  const headerText = activeCard?.label || nowDoingLabel || "Working";
+  const view = activeCard ? pickComputerView(activeCard) : AGENTARK_RENDERERS.GENERIC;
+  const activeSurfaceStatus = activeCard ? surfaceStatus(activeCard, Boolean(isStreaming)) : null;
+  const fileHeaderText =
+    liveWriteActive && headerFilePath
+      ? `Writing ${headerFilePath}`
+      : headerFilePath
+        ? `Files: ${headerFilePath}`
+        : "Files";
+  const consoleHeaderText = activeCard
+    ? surfaceDisplayTitle(activeCard)
+    : nowDoingLabel || "Working";
+  const headerText = safePaneText(
+    tab === "files" && hasFileTab ? fileHeaderText : consoleHeaderText,
+    "Working",
+  );
   const completedCount = navPool.filter((card) =>
     /done|complete|success/i.test(card.kind || ""),
   ).length;
-  const progressText =
+  const fileCount = hasWorkspaceFiles ? workspaceFiles.length : hasFileTab ? 1 : 0;
+  const fileProgressText =
+    fileCount > 0
+      ? `${fileCount} file${fileCount === 1 ? "" : "s"}`
+      : "Files";
+  const consoleProgressText =
     taskProgress && taskProgress.total > 0
       ? progressLabel(
           Math.max(0, Math.min(taskProgress.done, taskProgress.total)),
@@ -407,6 +577,8 @@ export function ComputerPane({
           Math.max(completedCount, activeIndex + 1, 0),
           navPool.length,
         );
+  const progressText =
+    tab === "files" && hasFileTab ? fileProgressText : consoleProgressText;
   const deployFileIsLiveWrite =
     !!deployFilePath &&
     !!liveWritePath &&
@@ -428,8 +600,33 @@ export function ComputerPane({
     liveWriteContent,
     workspaceFiles,
   ]);
+  const focusedFilePath =
+    followedLiveWritePath || deployFilePath || (liveWriteActive ? liveWritePath || "" : "");
+  const focusedFileIsLiveWrite =
+    !!focusedFilePath &&
+    !!liveWritePath &&
+    filePathsMatch(focusedFilePath, liveWritePath);
+  const focusedFileContent = useMemo(() => {
+    if (!focusedFilePath) return "";
+    if (deployFilePath && filePathsMatch(focusedFilePath, deployFilePath)) {
+      return deployFileContent;
+    }
+    if (focusedFileIsLiveWrite && liveWriteContent) return liveWriteContent;
+    return (
+      findWorkspaceFileContent(workspaceFiles, focusedFilePath) ||
+      findFileContentForPath(cardsForRun, focusedFilePath)
+    );
+  }, [
+    cardsForRun,
+    deployFileContent,
+    deployFilePath,
+    focusedFileIsLiveWrite,
+    focusedFilePath,
+    liveWriteContent,
+    workspaceFiles,
+  ]);
   const activeFilePath =
-    activeCard && view === "file"
+    activeCard && view === AGENTARK_RENDERERS.FILE
       ? extractFilePath(activeCard) || activeCard.label || ""
       : "";
   const activeFileIsLiveWrite =
@@ -450,6 +647,10 @@ export function ComputerPane({
     liveWriteContent,
     workspaceFiles,
   ]);
+  const activeSurfaceLive =
+    view === AGENTARK_RENDERERS.FILE
+      ? activeFileIsLiveWrite && liveWriteActive
+      : Boolean(isStreaming) && activeIndex === navPool.length - 1;
   const fallbackFilePath =
     !activeCard && (deployFilePath || liveWritePath || workspaceFiles[0]?.path)
       ? deployFilePath || liveWritePath || workspaceFiles[0]?.path || ""
@@ -474,7 +675,7 @@ export function ComputerPane({
     liveWriteContent,
     workspaceFiles,
   ]);
-  const fallbackFileSourceCard = latestTraceCard || activeCard;
+  const fallbackFileSourceCard = latestActivityCard || activeCard;
   const fallbackFileCard =
     fallbackFilePath && fallbackFileSourceCard
       ? syntheticFileCard(fallbackFileSourceCard, fallbackFilePath)
@@ -499,14 +700,35 @@ export function ComputerPane({
             fallbackFilePath,
           )
         : null;
-  const deployFileCard =
-    activeCard && deployFilePath
-      ? syntheticFileCard(activeCard, deployFilePath)
-      : null;
+  const focusedFileSourceCard = activeCard || latestActivityCard;
+  const focusedFileCard =
+    focusedFilePath && focusedFileSourceCard
+      ? syntheticFileCard(focusedFileSourceCard, focusedFilePath)
+      : focusedFilePath
+        ? syntheticFileCard(
+            {
+              id: "workspace-live-file",
+              index: 0,
+              stepType: "file_read",
+              rawTitle: "",
+              tone: "default",
+              kind: "File",
+              label: focusedFilePath,
+              detail: "",
+              detailFull: "",
+              summary: "",
+              rawDetailFull: "",
+              payloadView: null,
+              isHeartbeat: false,
+              time: "",
+            },
+            focusedFilePath,
+          )
+        : null;
   const snippetCard =
     showSnippet && (snippetPath || snippetContent)
       ? syntheticFileCard(
-          activeCard || latestTraceCard || {
+          activeCard || latestActivityCard || {
             id: "workspace-snippet",
             index: 0,
             stepType: "file_read",
@@ -525,6 +747,19 @@ export function ComputerPane({
           snippetPath || "Code",
         )
       : null;
+  const visibleTabs: ComputerPaneTab[] = hasFileTab
+    ? ["computer", "files", "activity"]
+    : ["computer", "activity"];
+  const headerModeLabel =
+    tab === "files" && hasFileTab
+      ? "Live files"
+      : activeCard
+        ? surfaceFromCard(activeCard)?.tool?.displayName ||
+          surfaceFromCard(activeCard)?.renderer.id ||
+          "Artifact"
+        : isStreaming
+          ? "Live output"
+          : "";
 
   return (
     <Box
@@ -544,9 +779,9 @@ export function ComputerPane({
       >
         <Box className="computer-pane-title">
           <Box className="computer-pane-brand-row">
-            <ComputerRoundedIcon fontSize="small" className="computer-pane-brand-icon" />
+            <TerminalRoundedIcon fontSize="small" className="computer-pane-brand-icon" />
             <Typography variant="subtitle2" className="computer-pane-heading">
-              AgentArk Computer
+              AgentArk's Console
             </Typography>
           </Box>
           <Stack
@@ -557,7 +792,7 @@ export function ComputerPane({
           >
             <FiberManualRecordRoundedIcon
               fontSize="inherit"
-              className={isStreaming ? "computer-pane-live-dot" : "computer-pane-idle-dot"}
+              className={`computer-pane-status-dot tone-${statusTone(liveWriteActive ? "running" : activeSurfaceStatus)}`}
             />
             <Typography variant="caption" className="computer-pane-progress">
               {progressText}
@@ -566,11 +801,19 @@ export function ComputerPane({
             <Typography variant="caption" className="computer-pane-current-step">
               {headerText}
             </Typography>
+            {headerModeLabel ? (
+              <>
+                <span className="computer-pane-step-sep">|</span>
+                <Typography variant="caption" className="computer-pane-current-step">
+                  {headerModeLabel}
+                </Typography>
+              </>
+            ) : null}
           </Stack>
         </Box>
         <Box sx={{ flex: 1 }} />
-        <Box className="computer-pane-tabs" role="tablist" aria-label="Console view">
-          {(["computer", "activity", "trace"] as ComputerPaneTab[]).map((value) => {
+        <Box className="computer-pane-tabs" role="tablist" aria-label="Console pane view">
+          {visibleTabs.map((value) => {
             const active = tab === value;
             return (
               <button
@@ -581,11 +824,7 @@ export function ComputerPane({
                 className={`computer-pane-tab${active ? " is-active" : ""}`}
                 onClick={() => setTab(value)}
               >
-                {value === "computer"
-                  ? "Computer"
-                  : value === "activity"
-                    ? "Activity"
-                    : "Trace"}
+                {COMPUTER_PANE_TAB_LABEL[value]}
               </button>
             );
           })}
@@ -680,26 +919,11 @@ export function ComputerPane({
             className="computer-pane-stage"
             sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
           >
-            {snippetCard ? (
-              <FileView
-                card={snippetCard}
-                snippetPath={snippetPath}
-                snippetContent={snippetContent}
-              />
-            ) : !activeCard && fallbackFileCard ? (
-              <FileView
-                card={fallbackFileCard}
-                snippetPath={fallbackFilePath}
-                snippetContent={fallbackFileContent}
-                live={
-                  fallbackFileIsLiveWrite && liveWriteActive
-                }
-              />
-            ) : !activeCard ? (
-              isStreaming || latestTraceCard || reasoningPreview ? (
+            {!activeCard ? (
+              isStreaming || latestActivityCard || reasoningPreview ? (
                 <WorkingView
                   phaseLabel={nowDoingLabel || "Working..."}
-                  detail={latestTraceCard?.detail || latestTraceCard?.summary || ""}
+                  detail={latestActivityCard?.detail || latestActivityCard?.summary || ""}
                   startedAt={startedAt}
                   tokenPreview={tokenPreview}
                   reasoningPreview={reasoningPreview}
@@ -711,45 +935,133 @@ export function ComputerPane({
                   detail="When AgentArk runs a tool, its live output will land here."
                 />
               )
-            ) : view === "terminal" ? (
-              <TerminalView
+            ) : (
+              <SurfaceRenderer
                 card={activeCard}
-                live={Boolean(isStreaming) && activeIndex === navPool.length - 1}
-              />
-            ) : view === "app_deploy" ? (
-              <Stack spacing={1}>
-                <AppDeployView
-                  card={activeCard}
-                  workspaceFiles={workspaceFiles}
-                  onOpenFile={(path) => {
-                    setUserPickedDeployFile(path !== liveWritePath);
-                    setDeployFilePath(path);
-                  }}
-                />
-                {deployFileCard && deployFilePath ? (
-                  <FileView
-                    card={deployFileCard}
-                    snippetPath={deployFilePath}
-                    snippetContent={deployFileContent}
-                    live={deployFileIsLiveWrite && liveWriteActive}
-                  />
-                ) : null}
-              </Stack>
-            ) : view === "file" ? (
-              <FileView
-                card={activeCard}
+                live={activeSurfaceLive}
                 snippetPath={activeFilePath || snippetPath}
                 snippetContent={activeFileContent}
-                live={activeFileIsLiveWrite && liveWriteActive}
+                workspaceFiles={workspaceFiles}
+                deployFilePath={null}
+                deployFileContent=""
+                deployFileCard={null}
+                deployFileLive={false}
+                onOpenDeployFile={(path) => {
+                  setUserPickedDeployFile(
+                    !filePathsMatch(path, liveWritePath || ""),
+                  );
+                  setDeployFilePath(path);
+                  setTab("files");
+                  onActivate(null);
+                }}
               />
-            ) : view === "browse" ? (
-              <BrowseView card={activeCard} />
-            ) : view === "search" ? (
-              <SearchView card={activeCard} />
+            )}
+          </Box>
+        </Box>
+      ) : tab === "files" && hasFileTab ? (
+        <Box
+          className="computer-pane-body computer-pane-body-files"
+          sx={{
+            flex: 1,
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
+          {hasWorkspaceFiles ? (
+            <Box
+              className={`computer-pane-files-section${filesListCollapsed ? " is-collapsed" : ""}`}
+            >
+              <Box className="computer-pane-files-head">
+                <Box className="computer-pane-files-head-main">
+                  <Typography variant="caption" className="computer-pane-files-title">
+                    Files
+                  </Typography>
+                  <Typography variant="caption" className="computer-pane-files-count">
+                    {workspaceFiles.length}
+                  </Typography>
+                </Box>
+                <Tooltip title={filesListCollapsed ? "Show files" : "Collapse files"}>
+                  <IconButton
+                    size="small"
+                    className="computer-pane-files-collapse"
+                    aria-label={
+                      filesListCollapsed ? "Show files" : "Collapse files"
+                    }
+                    aria-expanded={!filesListCollapsed}
+                    aria-controls={filesListId}
+                    onClick={() => setFilesListCollapsed((prev) => !prev)}
+                  >
+                    {filesListCollapsed ? (
+                      <KeyboardArrowDownRoundedIcon fontSize="small" />
+                    ) : (
+                      <KeyboardArrowUpRoundedIcon fontSize="small" />
+                    )}
+                  </IconButton>
+                </Tooltip>
+              </Box>
+              {!filesListCollapsed ? (
+                <div id={filesListId} className="computer-pane-files-list">
+                  {workspaceFileRows.map(({ file, live, selected, name, meta }) => {
+                    return (
+                      <button
+                        key={file.path}
+                        type="button"
+                        className={`computer-pane-file-pill${selected ? " is-selected" : ""}${live ? " is-live" : ""}`}
+                        onClick={() => {
+                          setUserPickedDeployFile(
+                            !filePathsMatch(file.path, liveWritePath || ""),
+                          );
+                          setDeployFilePath(file.path);
+                          onActivate(null);
+                        }}
+                        title={file.path}
+                      >
+                        <span
+                          className="computer-pane-file-dot"
+                          aria-hidden="true"
+                        />
+                        <span className="computer-pane-file-name">{name}</span>
+                        <span className="computer-pane-file-path">
+                          {file.path}
+                        </span>
+                        <span className="computer-pane-file-meta">{meta}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </Box>
+          ) : null}
+          <Box
+            className="computer-pane-stage"
+            sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
+          >
+            {snippetCard ? (
+              <FileView
+                card={snippetCard}
+                snippetPath={snippetPath}
+                snippetContent={snippetContent}
+              />
+            ) : focusedFileCard ? (
+              <FileView
+                card={focusedFileCard}
+                snippetPath={focusedFilePath}
+                snippetContent={focusedFileContent}
+                live={focusedFileIsLiveWrite && liveWriteActive}
+              />
+            ) : fallbackFileCard ? (
+              <FileView
+                card={fallbackFileCard}
+                snippetPath={fallbackFilePath}
+                snippetContent={fallbackFileContent}
+                live={fallbackFileIsLiveWrite && liveWriteActive}
+              />
             ) : (
               <StatusView
-                title={activeCard.label}
-                detail={activeCard.detail || activeCard.summary || ""}
+                title="No file selected"
+                detail="Generated files and live writes will appear here."
               />
             )}
           </Box>
@@ -761,7 +1073,7 @@ export function ComputerPane({
         >
           {activityNode || (
             <ActivityList
-              cards={traceCards}
+              cards={activityCards}
               activeStepId={activeStepId}
               onActivate={(id) => {
                 onActivate(id);
@@ -770,23 +1082,40 @@ export function ComputerPane({
             />
           )}
         </Box>
-      ) : (
-        <Box
-          className="computer-pane-body computer-pane-body-trace"
-          sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
-        >
-          <TraceTimeline
-            cards={traceCards}
-            activeStepId={activeCard?.id || activeStepId}
-            onActivate={(id) => {
-              onActivate(id);
-              setTab("computer");
-            }}
-          />
-        </Box>
-      )}
+      ) : null}
     </Box>
   );
 }
+
+function areComputerPanePropsEqual(
+  prev: ComputerPaneProps,
+  next: ComputerPaneProps,
+) {
+  return (
+    prev.liveCards === next.liveCards &&
+    prev.allCards === next.allCards &&
+    prev.activeStepId === next.activeStepId &&
+    prev.onActivate === next.onActivate &&
+    prev.onClose === next.onClose &&
+    prev.activityNode === next.activityNode &&
+    prev.nowDoingLabel === next.nowDoingLabel &&
+    prev.snippetPath === next.snippetPath &&
+    prev.snippetContent === next.snippetContent &&
+    prev.isStreaming === next.isStreaming &&
+    prev.startedAt === next.startedAt &&
+    prev.tokenPreview === next.tokenPreview &&
+    prev.reasoningPreview === next.reasoningPreview &&
+    prev.reasoningPhase === next.reasoningPhase &&
+    prev.taskProgress === next.taskProgress &&
+    prev.showSnippet === next.showSnippet &&
+    prev.workspaceFiles === next.workspaceFiles &&
+    prev.liveWritePath === next.liveWritePath &&
+    prev.liveWriteContent === next.liveWriteContent &&
+    prev.liveWriteActive === next.liveWriteActive
+  );
+}
+
+export const ComputerPane = memo(ComputerPaneInner, areComputerPanePropsEqual);
+ComputerPane.displayName = "ComputerPane";
 
 export default ComputerPane;

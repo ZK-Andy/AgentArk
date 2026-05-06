@@ -29,6 +29,7 @@ export type OrbitChatFileChip = {
   id: string;
   path: string;
   operation?: "wrote" | "edited";
+  bytes?: number;
 };
 
 export type OrbitFileEntry = {
@@ -47,11 +48,15 @@ export type OrbitChatUsage = {
   time_to_first_token_ms?: number;
 };
 
+export type OrbitChatMessageStatus = "running" | "completed" | "failed" | "stopped";
+
 export type OrbitChatHistoryMessage = OrbitChatUsage & {
   id: string;
   role: "user" | "assistant" | string;
   content: string;
   created_at?: string;
+  status?: OrbitChatMessageStatus;
+  activity?: string;
 };
 
 export type OrbitChatTranscript = {

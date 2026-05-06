@@ -4,8 +4,8 @@
 //! tokens, typed commands, and audit events in the existing KV store. Device
 //! tokens are never equivalent to UI/API sessions.
 
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -2109,6 +2109,7 @@ pub fn protocol_document() -> CompanionProtocolDocument {
             "High-risk actions require fresh UI approval before dispatch.".to_string(),
             "Capability reports cannot expand grants automatically.".to_string(),
             "Commands are typed JSON actions, not raw free-text instructions.".to_string(),
+            "Notification and approval_prompt commands may include optional string arguments: title and body.".to_string(),
         ],
     }
 }

@@ -7,8 +7,8 @@ use crate::{
     identity::IdentityManager,
     proofs::ProofEngine,
     runtime::{
-        ActionRuntime, InstalledCliSkillManifest, WorkflowMissingInputsPayload,
-        parse_workflow_action_marker, parse_workflow_missing_inputs_marker,
+        parse_workflow_action_marker, parse_workflow_missing_inputs_marker, ActionRuntime,
+        InstalledCliSkillManifest, WorkflowMissingInputsPayload,
     },
     safety::SafetyEngine,
     security::SecurityGuard,
@@ -16,27 +16,23 @@ use crate::{
 };
 use anyhow::Result;
 use regex::Regex;
-use sea_orm::{TransactionTrait, entity::prelude::PgVector};
+use sea_orm::{entity::prelude::PgVector, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{broadcast, RwLock};
 
 use super::{
-    AgentConfig, EmbeddingClient, ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus,
-    PlanSubstep, PromptMemory, RequestState,
     action_catalog::{
-        ActionCatalogSyncStats, action_catalog_embedding_has_default_dim,
-        action_catalog_entry_needs_embedding, build_action_catalog_descriptor,
+        action_catalog_embedding_has_default_dim, action_catalog_entry_needs_embedding,
+        build_action_catalog_descriptor, ActionCatalogSyncStats,
     },
     arkorbit,
     automation::{
-        self, AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
-        AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
-        AutomationValidationMode, append_run as append_automation_run, compute_retry_at,
+        self, append_run as append_automation_run, compute_retry_at,
         critique_result as critique_automation_result,
         current_attempt as automation_current_attempt,
         delete_supervisor_state as delete_automation_supervisor_state,
@@ -52,15 +48,18 @@ use super::{
         truncate_text as automation_truncate_text,
         upsert_supervisor_state as upsert_automation_supervisor_state,
         validation_from_request_argument as automation_validation_from_request_argument,
+        AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
+        AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
+        AutomationValidationMode,
     },
     autonomy::{self, ConversationScope},
     background_session, browser_session,
     config::{ModelCapabilityTier, ModelCostTier, ModelRole, ModelSlot},
     document_search::{self, DocumentSearchHit},
     execution::{
-        ExecutionCandidateDescriptor, ExecutionRequest, ExecutionRunStatus, ExecutionSupervisor,
-        RecoveryAction, UserFacingOutcome, UserFacingOutcomeStatus,
-        execute_supervised_transport_chat,
+        execute_supervised_transport_chat, ExecutionCandidateDescriptor, ExecutionRequest,
+        ExecutionRunStatus, ExecutionSupervisor, RecoveryAction, UserFacingOutcome,
+        UserFacingOutcomeStatus,
     },
     intent::{action_intent_score, preferred_direct_action_name},
     llm::{self, LlmClient, LlmProvider},
@@ -70,7 +69,8 @@ use super::{
     orchestra::{Orchestra, OrchestraConfig},
     swarm::{AgentId, SwarmManager},
     task::{self, TaskQueue},
-    task_router, watcher,
+    task_router, watcher, AgentConfig, EmbeddingClient, ExecutionPlan, PlanPromptMode, PlanStep,
+    PlanStepStatus, PlanSubstep, PromptMemory, RequestState,
 };
 
 mod action_selection;
@@ -105,16 +105,16 @@ use background_sessions::*;
 pub use conversation_context::ConversationMessage;
 pub(crate) use intent_planning::{AdvisoryIntent, AdvisoryIntentPlan};
 use memory::*;
-pub use notifications::{NotificationDispatchOutcome, NotificationEvent, NotificationStore};
 use notifications::{
     inbound_security_source_label, is_external_notification_channel,
     notification_channel_display_name, notification_push_signature,
     telegram_notification_target_is_configured, whatsapp_notification_target_is_configured,
 };
+pub use notifications::{NotificationDispatchOutcome, NotificationEvent, NotificationStore};
 use request_context::*;
 use skill_import::*;
-pub use streaming::StreamEvent;
 pub(crate) use streaming::queue_stream_event;
+pub use streaming::StreamEvent;
 use tool_responses::*;
 pub(crate) use watcher_followup::{WatcherFollowupPreparation, WatcherFollowupWorker};
 
@@ -123,17 +123,20 @@ const MOLTBOOK_ACTIVITY_LOG_LIMIT: usize = 500;
 const TOOL_INTEGRATION_ALIASES_KEY: &str = "tool_integration_aliases_v1";
 const HOOKS_STORAGE_KEY: &str = "hooks_v1";
 const CONTEXT_FETCH_LIMIT: u64 = 240;
-const CONTEXT_RECENT_TAIL: usize = 24;
-const CONTEXT_MAX_CHARS: usize = 18_000;
-const CONTEXT_MAX_MESSAGE_CHARS: usize = 1_000;
-const CONTEXT_MIN_MSGS_FOR_DIGEST: usize = 12;
-const CONTEXT_DIGEST_MAX_CHARS: usize = 3_600;
-const CONTEXT_DIGEST_MAX_POINTS_PER_ROLE: usize = 10;
-const CONTEXT_DIGEST_POINT_MAX_CHARS: usize = 220;
+const DEFAULT_CHAT_HISTORY_CONTEXT_WINDOW_TOKENS: usize = 32_000;
+const DEFAULT_CHAT_HISTORY_BUDGET_RATIO_PERCENT: usize = 18;
+const MIN_CHAT_HISTORY_TOKEN_BUDGET: usize = 1_024;
+const MAX_CHAT_HISTORY_SUMMARY_TOKENS: usize = 8_000;
+const DEFAULT_CHAT_FIXED_PROMPT_TOKENS: usize = 6_000;
+const DEFAULT_DIRECT_CHAT_FIXED_PROMPT_TOKENS: usize = 2_000;
+const MIN_CHAT_MESSAGE_TOKEN_BUDGET: usize = 128;
+const MAX_CHAT_MESSAGE_TOKEN_BUDGET: usize = 1_200;
+const DEFAULT_CHAT_DIGEST_POINT_TOKENS: usize = 96;
 const CONTEXT_DIGEST_PAGE_SIZE: u64 = 64;
-const CONTEXT_DIGEST_VERSION: u8 = 2;
-const CONTEXT_SALIENT_OLDER_LIMIT: usize = 10;
-const CONTEXT_SHORT_FOLLOWUP_OLDER_LIMIT: usize = 6;
+const CONTEXT_DIGEST_VERSION: u8 = 3;
+const PROMPT_RECENT_HISTORY_RATIO_PERCENT: usize = 45;
+const READ_ONLY_PROMPT_RECENT_HISTORY_RATIO_PERCENT: usize = 25;
+const INTENT_PLAN_HISTORY_RATIO_PERCENT: usize = 20;
 const CONVERSATION_RECENT_ARTIFACT_KEY_PREFIX: &str = "conversation_recent_artifact_v1:";
 const CONVERSATION_RECENT_ARTIFACT_LIMIT: usize = 8;
 const BACKGROUND_SESSION_IDLE_CONSOLIDATION_AFTER_MINS: i64 = 10;
@@ -1007,6 +1010,14 @@ fn summarize_model_failure_for_user(error: &str) -> String {
         .map(|value| format!("{}: ", value))
         .unwrap_or_default();
 
+    if lower.contains("model_not_found")
+        || lower.contains("does not exist or you do not have access")
+    {
+        return format!(
+            "{}could not use the requested model because the provider says it does not exist or this key has no access.",
+            prefix
+        );
+    }
     if lower.contains("invalid schema for function")
         || lower.contains("invalid_function_parameters")
     {
@@ -1071,6 +1082,24 @@ fn summarize_model_attempt_failure_for_user(attempt: &crate::core::ModelAttemptR
     } else {
         format!("{}: ", label)
     };
+    if let Some(error) = attempt.error.as_deref() {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("model_not_found")
+            || lower.contains("does not exist or you do not have access")
+        {
+            let model = attempt.model_name.trim();
+            if model.is_empty() {
+                return format!(
+                    "{}could not use the requested model because the provider says it does not exist or this key has no access.",
+                    prefix
+                );
+            }
+            return format!(
+                "{}could not use model `{}` because the provider says it does not exist or this key has no access.",
+                prefix, model
+            );
+        }
+    }
     match attempt.failure_kind.as_ref() {
         Some(crate::core::FailureKind::Timeout) => {
             if let Some(elapsed_ms) = attempt.elapsed_ms {
@@ -1735,7 +1764,7 @@ pub struct Agent {
     /// Security guard for prompt injection/leakage protection
     pub security: SecurityGuard,
 
-    /// Conversation history per channel (keeps last N messages)
+    /// Conversation history per channel, trimmed by the active model's token budget.
     pub conversation_history:
         Arc<RwLock<std::collections::HashMap<String, Vec<ConversationMessage>>>>,
 
@@ -1875,6 +1904,7 @@ pub struct ChatAttachmentHint {
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestExecutionHints {
+    pub turn_timing_id: Option<String>,
     pub caller_principal: Option<ActionCallerPrincipal>,
     pub execution_surface: ActionExecutionSurface,
     pub direct_user_intent: bool,
@@ -1890,6 +1920,9 @@ pub struct RequestExecutionHints {
     /// optional `agent_instructions`. Forwarded as augmentation only — never
     /// a model selection override and never a global system-prompt mutation.
     pub arkorbit_context: Option<serde_json::Value>,
+    /// Per-turn structured launch packet for a user-approved stored
+    /// suggestion. This is typed metadata, not a phrase-matching hint.
+    pub accepted_suggestion_context: Option<serde_json::Value>,
 }
 
 enum InboundSecurityPrecheck {

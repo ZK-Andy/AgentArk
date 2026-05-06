@@ -4,9 +4,9 @@ import { useMemo } from "react";
 import {
   CORE_SETTINGS_STALE_TIME_MS,
   fetchAvailableMessagingChannels,
-  fetchModels,
   fetchSettings,
   fetchSettingsMedia,
+  normalizeModelSlotRows,
   SETTINGS_QUERY_KEYS,
 } from "./settingsData";
 import { asRecord, errMessage, pickRecords, str, toBool } from "./pageHelpers";
@@ -140,15 +140,11 @@ export function SettingsOverviewTab({
     staleTime: CORE_SETTINGS_STALE_TIME_MS,
     refetchInterval: autoRefresh ? 8000 : false,
   });
-  const modelsQ = useQuery({
-    queryKey: SETTINGS_QUERY_KEYS.models,
-    queryFn: fetchModels,
-    staleTime: CORE_SETTINGS_STALE_TIME_MS,
-    refetchInterval: autoRefresh ? 8000 : false,
-  });
-
   const settings = asRecord(settingsQ.data);
-  const models = pickRecords(asRecord(modelsQ.data).models);
+  const models = useMemo(
+    () => normalizeModelSlotRows(settings.model_pool),
+    [settings.model_pool],
+  );
   const media = asRecord(mediaQ.data);
   const availableDeliveryChannels = useMemo(() => {
     const channels = pickRecords(asRecord(availableChannelsQ.data).channels);
@@ -202,14 +198,13 @@ export function SettingsOverviewTab({
   ].some((value) => str(value, "").trim() || toBool(value));
 
   const setupMissing =
-    settingsQ.isSuccess && modelsQ.isSuccess && configuredModels.length === 0;
+    settingsQ.isSuccess && configuredModels.length === 0;
   const loading =
     settingsQ.isLoading ||
-    modelsQ.isLoading ||
     mediaQ.isLoading ||
     availableChannelsQ.isLoading;
   const error =
-    settingsQ.error || modelsQ.error || mediaQ.error || availableChannelsQ.error;
+    settingsQ.error || mediaQ.error || availableChannelsQ.error;
 
   const deliveryStatus = [
     {

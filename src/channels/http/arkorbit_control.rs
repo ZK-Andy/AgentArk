@@ -2,8 +2,9 @@
 
 use super::*;
 
+use crate::core::arkorbit::store::orbit_file_is_user_artifact_path;
 use crate::core::arkorbit::{
-    OrbitAgentEvent, OrbitChatUsage, OrbitUpdate, content_type_for_name, stream_orbit_chat_turn,
+    content_type_for_name, stream_orbit_chat_turn, OrbitAgentEvent, OrbitChatUsage, OrbitUpdate,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -113,6 +114,11 @@ fn truncate_trace_value(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn user_visible_orbit_error(error: &dyn std::fmt::Display) -> String {
+    tracing::warn!(target: "arkorbit.chat", error = %error, "orbit chat stream failed");
+    "I couldn't complete the Orbit request because an internal canvas operation failed. No further canvas changes were applied. The detailed error is in the AgentArk logs.".to_string()
+}
+
 fn orbit_trace_duration_ms(
     started_at: chrono::DateTime<chrono::Utc>,
     timestamp: chrono::DateTime<chrono::Utc>,
@@ -162,18 +168,23 @@ impl OrbitTraceAccumulator {
             OrbitAgentEvent::Token(content) => {
                 self.response.push_str(content);
             }
-            OrbitAgentEvent::FileWritten { path, operation } => {
+            OrbitAgentEvent::FileWritten {
+                path,
+                operation,
+                bytes,
+            } => {
                 self.file_write_count += 1;
                 self.steps.push(orbit_trace_step(
                     "[file]",
                     "Orbit File Updated",
-                    format!("{} {}", operation.as_str(), path),
+                    format!("{} {} ({} bytes)", operation.as_str(), path, bytes),
                     "success",
                     Some(
                         serde_json::json!({
                             "source": ORBIT_TRACE_SOURCE_LABEL,
                             "path": path,
                             "operation": operation.as_str(),
+                            "bytes": bytes,
                         })
                         .to_string(),
                     ),
@@ -397,8 +408,16 @@ pub(super) async fn create_orbit_endpoint(
         .await
     {
         Ok(orbit) => (StatusCode::OK, Json(serde_json::json!({ "orbit": orbit }))).into_response(),
+        Err(err) if is_duplicate_orbit_name_error(&err) => {
+            json_error(StatusCode::CONFLICT, err.to_string())
+        }
         Err(err) => internal_error(err),
     }
+}
+
+fn is_duplicate_orbit_name_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("orbit name") && message.contains("already exists")
 }
 
 pub(super) async fn get_orbit_endpoint(
@@ -461,6 +480,9 @@ pub(super) async fn update_orbit_endpoint(
     let agent = state.agent.read().await;
     match agent.arkorbit.update_orbit(&id, patch).await {
         Ok(orbit) => (StatusCode::OK, Json(serde_json::json!({ "orbit": orbit }))).into_response(),
+        Err(err) if is_duplicate_orbit_name_error(&err) => {
+            json_error(StatusCode::CONFLICT, err.to_string())
+        }
         Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
@@ -524,6 +546,12 @@ pub(super) async fn orbit_file_endpoint(
     State(state): State<AppState>,
     Path((id, path)): Path<(String, String)>,
 ) -> Response {
+    if !orbit_file_is_user_artifact_path(&path) {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "Orbit file is not a user-created artifact",
+        );
+    }
     let agent = state.agent.read().await;
     match agent.arkorbit.read_orbit_file_text(&id, &path) {
         Ok(content) => {
@@ -537,7 +565,10 @@ fn orbit_widget_layout_number(
     body: &serde_json::Value,
     key: &str,
 ) -> std::result::Result<Option<f64>, String> {
-    if !body.as_object().is_some_and(|object| object.contains_key(key)) {
+    if !body
+        .as_object()
+        .is_some_and(|object| object.contains_key(key))
+    {
         return Ok(None);
     }
     let Some(value) = body.get(key).and_then(|value| value.as_f64()) else {
@@ -1045,6 +1076,20 @@ pub(super) async fn orbit_chat_endpoint(
     let Some(message) = message else {
         return json_error(StatusCode::BAD_REQUEST, "'message' is required");
     };
+    let runtime_notices = body
+        .get("runtime_notices")
+        .and_then(|value| value.as_array())
+        .map(|notices| {
+            notices
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .take(6)
+                .map(|value| value.chars().take(500).collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     let trace_id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now();
@@ -1070,6 +1115,7 @@ pub(super) async fn orbit_chat_endpoint(
                     "channel": ORBIT_TRACE_CHANNEL,
                     "orbit_id": id.clone(),
                     "message_chars": message.chars().count(),
+                    "runtime_notice_count": runtime_notices.len(),
                 })
                 .to_string(),
             ),
@@ -1101,16 +1147,24 @@ pub(super) async fn orbit_chat_endpoint(
         tokio::sync::mpsc::channel::<std::result::Result<Event, std::convert::Infallible>>(128);
     let worker_orbit_id = id.clone();
     let worker_message = message.clone();
+    let worker_runtime_notices = runtime_notices.clone();
     crate::spawn_logged!(
         "src/channels/http/arkorbit_control.rs:orbit_chat_worker",
         async move {
             let error_tx = agent_tx.clone();
-            if let Err(err) =
-                stream_orbit_chat_turn(service, llm, worker_orbit_id, worker_message, agent_tx)
-                    .await
+            if let Err(err) = stream_orbit_chat_turn(
+                service,
+                llm,
+                worker_orbit_id,
+                worker_message,
+                worker_runtime_notices,
+                agent_tx,
+            )
+            .await
             {
-                tracing::warn!(target: "arkorbit.chat", error = %err, "orbit chat stream failed");
-                let _ = error_tx.send(OrbitAgentEvent::Error(err.to_string())).await;
+                let _ = error_tx
+                    .send(OrbitAgentEvent::Error(user_visible_orbit_error(&err)))
+                    .await;
                 let _ = error_tx.send(OrbitAgentEvent::Done).await;
             }
         }
@@ -1135,7 +1189,7 @@ pub(super) async fn orbit_chat_endpoint(
                             });
                             if let Ok(data) = serde_json::to_string(&payload) {
                                 if sse_tx
-                                    .send(Ok(Event::default().event("status").data(data)))
+                                    .send(Ok(Event::default().event("heartbeat").data(data)))
                                     .await
                                     .is_err()
                                 {
@@ -1158,11 +1212,16 @@ pub(super) async fn orbit_chat_endpoint(
                     OrbitAgentEvent::Token(content) => {
                         ("token", serde_json::json!({ "content": content }))
                     }
-                    OrbitAgentEvent::FileWritten { path, operation } => (
+                    OrbitAgentEvent::FileWritten {
+                        path,
+                        operation,
+                        bytes,
+                    } => (
                         "file_written",
                         serde_json::json!({
                             "path": path,
-                            "operation": operation.as_str()
+                            "operation": operation.as_str(),
+                            "bytes": bytes
                         }),
                     ),
                     OrbitAgentEvent::ReadRequested { path } => {

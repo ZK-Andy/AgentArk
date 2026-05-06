@@ -682,10 +682,10 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "Memory",
     );
     add(
-        "/memory/knowledge/sync-product-docs",
+        "/memory/knowledge/sync-agentark-knowledge",
         "POST",
         &format!(
-            "Sync bundled {} product-help knowledge",
+            "Sync {} capability/manual knowledge",
             crate::branding::PRODUCT_NAME
         ),
         "Memory",

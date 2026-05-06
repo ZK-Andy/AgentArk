@@ -1,18 +1,24 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
+    extract::{rejection::JsonRejection, State},
+    http::{Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
 };
+use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 const DEFAULT_BIND: &str = "0.0.0.0:8993";
 const DEFAULT_CACHE_DIR: &str = "/app/prebuilt-embeddings-cache";
@@ -24,6 +30,7 @@ struct AppState {
     cache_dir: PathBuf,
     default_model: String,
     runtime: Arc<Mutex<RuntimeState>>,
+    request_counter: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -68,8 +75,48 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Clone, Copy)]
+struct EmbedRequestLogMetrics {
+    text_count: usize,
+    empty_text_count: usize,
+    total_text_chars: usize,
+    max_text_chars: usize,
+    total_text_bytes: usize,
+}
+
+fn embed_request_log_metrics(texts: &[String]) -> EmbedRequestLogMetrics {
+    let mut empty_text_count = 0usize;
+    let mut total_text_chars = 0usize;
+    let mut max_text_chars = 0usize;
+    let mut total_text_bytes = 0usize;
+
+    for text in texts {
+        if text.is_empty() {
+            empty_text_count += 1;
+        }
+        let char_count = text.chars().count();
+        total_text_chars = total_text_chars.saturating_add(char_count);
+        max_text_chars = max_text_chars.max(char_count);
+        total_text_bytes = total_text_bytes.saturating_add(text.len());
+    }
+
+    EmbedRequestLogMetrics {
+        text_count: texts.len(),
+        empty_text_count,
+        total_text_chars,
+        max_text_chars,
+        total_text_bytes,
+    }
+}
+
 fn json_error(status: StatusCode, error: impl Into<String>) -> Response {
-    (status, Json(ErrorResponse { error: error.into() })).into_response()
+    (
+        status,
+        Json(ErrorResponse {
+            error: error.into(),
+        }),
+    )
+        .into_response()
 }
 
 fn configured_bind() -> String {
@@ -204,25 +251,28 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn embed(State(state): State<AppState>, Json(request): Json<EmbedRequest>) -> Response {
-    if request.texts.len() > MAX_TEXTS_PER_REQUEST {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "too many texts in embedding request: max {}, got {}",
-                MAX_TEXTS_PER_REQUEST,
-                request.texts.len()
-            ),
-        );
-    }
+async fn embed(
+    State(state): State<AppState>,
+    payload: Result<Json<EmbedRequest>, JsonRejection>,
+) -> Response {
+    let request_id = state.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let started = Instant::now();
 
-    if request.texts.is_empty() {
-        return Json(EmbedResponse {
-            embeddings: Vec::new(),
-        })
-        .into_response();
-    }
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            let status = rejection.status();
+            tracing::warn!(
+                request_id,
+                status = status.as_u16(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "embedding request rejected before JSON body was accepted"
+            );
+            return rejection.into_response();
+        }
+    };
 
+    let metrics = embed_request_log_metrics(&request.texts);
     let model_name = request
         .model
         .as_deref()
@@ -230,15 +280,63 @@ async fn embed(State(state): State<AppState>, Json(request): Json<EmbedRequest>)
         .filter(|value| !value.is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+
+    tracing::info!(
+        request_id,
+        model = %model_name,
+        text_count = metrics.text_count,
+        empty_text_count = metrics.empty_text_count,
+        total_text_chars = metrics.total_text_chars,
+        max_text_chars = metrics.max_text_chars,
+        total_text_bytes = metrics.total_text_bytes,
+        "embedding request received"
+    );
+
+    if metrics.text_count > MAX_TEXTS_PER_REQUEST {
+        tracing::warn!(
+            request_id,
+            model = %model_name,
+            text_count = metrics.text_count,
+            max_texts = MAX_TEXTS_PER_REQUEST,
+            status = StatusCode::BAD_REQUEST.as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "embedding request rejected: too many texts"
+        );
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "too many texts in embedding request: max {}, got {}",
+                MAX_TEXTS_PER_REQUEST, metrics.text_count
+            ),
+        );
+    }
+
+    if metrics.text_count == 0 {
+        tracing::info!(
+            request_id,
+            model = %model_name,
+            status = StatusCode::OK.as_u16(),
+            embeddings_count = 0usize,
+            embedding_dimensions = 0usize,
+            elapsed_ms = started.elapsed().as_millis(),
+            "embedding request completed"
+        );
+        return Json(EmbedResponse {
+            embeddings: Vec::new(),
+        })
+        .into_response();
+    }
+
     let cache_dir = state.cache_dir.clone();
     let runtime = Arc::clone(&state.runtime);
+    let worker_model_name = model_name.clone();
     let texts = request.texts;
 
     let outcome = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
         let mut guard = runtime
             .lock()
             .map_err(|_| anyhow!("local embeddings runtime lock poisoned"))?;
-        match ensure_runtime(&mut guard, &cache_dir, &model_name).and_then(|model| {
+        match ensure_runtime(&mut guard, &cache_dir, &worker_model_name).and_then(|model| {
             model
                 .embed(texts, None)
                 .map_err(|error| anyhow!("local embeddings runtime failed: {}", error))
@@ -256,14 +354,44 @@ async fn embed(State(state): State<AppState>, Json(request): Json<EmbedRequest>)
     .await;
 
     match outcome {
-        Ok(Ok(embeddings)) => Json(EmbedResponse { embeddings }).into_response(),
+        Ok(Ok(embeddings)) => {
+            let embedding_dimensions = embeddings.first().map(Vec::len).unwrap_or(0);
+            tracing::info!(
+                request_id,
+                model = %model_name,
+                status = StatusCode::OK.as_u16(),
+                embeddings_count = embeddings.len(),
+                embedding_dimensions,
+                elapsed_ms = started.elapsed().as_millis(),
+                "embedding request completed"
+            );
+            Json(EmbedResponse { embeddings }).into_response()
+        }
         Ok(Err(error)) => {
+            tracing::warn!(
+                request_id,
+                model = %model_name,
+                status = StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %error,
+                "embedding request failed"
+            );
             json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", error))
         }
-        Err(error) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("local embeddings worker task failed: {}", error),
-        ),
+        Err(error) => {
+            tracing::warn!(
+                request_id,
+                model = %model_name,
+                status = StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %error,
+                "embedding request worker task failed"
+            );
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("local embeddings worker task failed: {}", error),
+            )
+        }
     }
 }
 
@@ -271,15 +399,14 @@ async fn embed(State(state): State<AppState>, Json(request): Json<EmbedRequest>)
 async fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,hyper=warn,reqwest=warn"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let bind = configured_bind();
     let state = AppState {
         cache_dir: configured_cache_dir(),
         default_model: configured_model(),
         runtime: Arc::new(Mutex::new(RuntimeState::default())),
+        request_counter: Arc::new(AtomicU64::new(0)),
     };
 
     tracing::info!(
@@ -291,7 +418,20 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/embed", post(embed))
-        .with_state(state);
+        .with_state(state)
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<_>| {
+                    tracing::info_span!(
+                        "embeddings_http_request",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                    )
+                })
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_failure(DefaultOnFailure::new().level(Level::WARN)),
+        );
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await

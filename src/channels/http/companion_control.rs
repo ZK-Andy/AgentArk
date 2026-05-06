@@ -1,17 +1,18 @@
 use axum::{
-    Json,
     extract::{
-        Path, Query, State,
         ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Path, Query, State,
     },
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
+    Json,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 
-use super::{AppState, ErrorResponse};
+use super::{request_matches_active_tunnel, AppState, ErrorResponse};
 
 fn actor_label(
     maybe_caller: Option<&crate::actions::ActionCallerPrincipal>,
@@ -46,29 +47,43 @@ struct CompanionWsAuth {
     token: String,
 }
 
-fn companion_ws_secure(headers: &HeaderMap) -> bool {
-    if crate::core::net::allow_insecure_local_transport() {
+fn companion_tunnel_url_is_https(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| parsed.scheme() == "https")
+}
+
+async fn companion_request_allowed(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+) -> bool {
+    if super::auth::is_trusted_local_ui_request(headers, addr) {
         return true;
     }
-    let forwarded_proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .unwrap_or_default();
-    if forwarded_proto.eq_ignore_ascii_case("https") || forwarded_proto.eq_ignore_ascii_case("wss")
-    {
-        return true;
-    }
-    headers
-        .get("forwarded")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value.split(';').any(|part| {
-                part.trim().eq_ignore_ascii_case("proto=https")
-                    || part.trim().eq_ignore_ascii_case("proto=wss")
-            })
-        })
-        .unwrap_or(false)
+
+    let tunnel = state.tunnel.read().await;
+    let Some(tunnel_url) = tunnel.url.as_deref() else {
+        return false;
+    };
+    tunnel.active
+        && tunnel.companion_enabled
+        && companion_tunnel_url_is_https(tunnel_url)
+        && request_matches_active_tunnel(headers, Some(tunnel_url))
+}
+
+async fn companion_request_is_active_non_https_tunnel(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> bool {
+    let tunnel = state.tunnel.read().await;
+    let Some(tunnel_url) = tunnel.url.as_deref() else {
+        return false;
+    };
+    tunnel.active
+        && tunnel.companion_enabled
+        && !companion_tunnel_url_is_https(tunnel_url)
+        && request_matches_active_tunnel(headers, Some(tunnel_url))
 }
 
 fn companion_ws_header_auth(headers: &HeaderMap) -> Option<CompanionWsAuth> {
@@ -670,7 +685,14 @@ const COMPANION_WEB_HTML: &str = r##"<!doctype html>
 </html>
 "##;
 
-pub(super) async fn companion_web() -> Response {
+pub(super) async fn companion_web(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if !companion_request_allowed(&state, &headers, addr).await {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let mut response = Html(COMPANION_WEB_HTML).into_response();
     response
         .headers_mut()
@@ -685,9 +707,6 @@ fn companion_ws_url_from_base(base: &str) -> Option<String> {
     }
     if let Some(rest) = trimmed.strip_prefix("https://") {
         return Some(format!("wss://{}/companion/ws", rest));
-    }
-    if let Some(rest) = trimmed.strip_prefix("http://") {
-        return Some(format!("ws://{}/companion/ws", rest));
     }
     None
 }
@@ -939,14 +958,18 @@ pub(super) async fn get_audit(
 
 pub(super) async fn companion_ws(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !companion_ws_secure(&headers) {
-        return json_error(
-            StatusCode::UPGRADE_REQUIRED,
-            "Companion WebSocket requires TLS in production.",
-        );
+    if !companion_request_allowed(&state, &headers, addr).await {
+        if companion_request_is_active_non_https_tunnel(&state, &headers).await {
+            return json_error(
+                StatusCode::UPGRADE_REQUIRED,
+                "AgentArk Companion requires secure AgentArk remote access.",
+            );
+        }
+        return StatusCode::NOT_FOUND.into_response();
     }
     let initial_auth = companion_ws_header_auth(&headers);
     ws.on_upgrade(move |socket| handle_companion_socket(state, socket, initial_auth))
@@ -1421,4 +1444,18 @@ async fn handle_companion_socket(
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn companion_websocket_url_is_advertised_only_for_https_tunnels() {
+        assert_eq!(
+            companion_ws_url_from_base("https://agentark.example"),
+            Some("wss://agentark.example/companion/ws".to_string())
+        );
+        assert_eq!(companion_ws_url_from_base("http://agentark.example"), None);
+    }
 }

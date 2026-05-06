@@ -34,6 +34,9 @@ pub(super) struct PackedConversationContext {
     pub(super) history: Vec<ConversationMessage>,
     pub(super) total_loaded: usize,
     pub(super) used_chars: usize,
+    pub(super) history_token_budget: usize,
+    pub(super) summary_token_budget: usize,
+    pub(super) message_token_budget: usize,
     pub(super) used_digest: bool,
     pub(super) digest: Option<String>,
     pub(super) compacted_messages: usize,
@@ -79,6 +82,184 @@ impl Agent {
             .unwrap_or(0)
     }
 
+    fn chat_history_budget_config() -> crate::core::context_budget::HistoryBudgetConfig {
+        crate::core::context_budget::HistoryBudgetConfig {
+            scope_env: "CHAT",
+            default_context_window_tokens: DEFAULT_CHAT_HISTORY_CONTEXT_WINDOW_TOKENS,
+            default_budget_ratio_percent: DEFAULT_CHAT_HISTORY_BUDGET_RATIO_PERCENT,
+            min_history_token_budget: MIN_CHAT_HISTORY_TOKEN_BUDGET,
+            max_summary_tokens: MAX_CHAT_HISTORY_SUMMARY_TOKENS,
+        }
+    }
+
+    fn llm_for_history_role(&self, role: &ModelRole) -> LlmClient {
+        self.llm_candidates_for_role(role)
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.client)
+            .unwrap_or_else(|| self.llm.clone())
+    }
+
+    fn chat_history_budget_for_role(
+        &self,
+        role: &ModelRole,
+        user_message: &str,
+        fixed_prompt_env: &str,
+        default_fixed_prompt_tokens: usize,
+    ) -> crate::core::context_budget::HistoryTokenBudget {
+        let llm = self.llm_for_history_role(role);
+        let fixed_prompt_tokens = crate::core::context_budget::read_usize_env(fixed_prompt_env)
+            .unwrap_or(default_fixed_prompt_tokens)
+            .saturating_add(crate::core::context_budget::estimate_tokens_from_text(
+                user_message,
+            ));
+        crate::core::context_budget::history_budget_for_llm(
+            &llm,
+            Self::chat_history_budget_config(),
+            fixed_prompt_tokens,
+        )
+    }
+
+    fn chat_history_budget(
+        &self,
+        user_message: &str,
+    ) -> crate::core::context_budget::HistoryTokenBudget {
+        self.chat_history_budget_for_role(
+            &ModelRole::Primary,
+            user_message,
+            "AGENTARK_CHAT_FIXED_PROMPT_TOKENS",
+            DEFAULT_CHAT_FIXED_PROMPT_TOKENS,
+        )
+    }
+
+    pub(super) fn direct_chat_history_budget(
+        &self,
+        user_message: &str,
+    ) -> crate::core::context_budget::HistoryTokenBudget {
+        self.chat_history_budget_for_role(
+            &ModelRole::Fast,
+            user_message,
+            "AGENTARK_DIRECT_CHAT_FIXED_PROMPT_TOKENS",
+            DEFAULT_DIRECT_CHAT_FIXED_PROMPT_TOKENS,
+        )
+    }
+
+    pub(super) fn chat_message_token_budget(
+        budget: crate::core::context_budget::HistoryTokenBudget,
+    ) -> usize {
+        crate::core::context_budget::read_usize_env("AGENTARK_CHAT_MESSAGE_TOKEN_BUDGET")
+            .unwrap_or_else(|| budget.history_tokens.saturating_div(16))
+            .clamp(MIN_CHAT_MESSAGE_TOKEN_BUDGET, MAX_CHAT_MESSAGE_TOKEN_BUDGET)
+    }
+
+    fn chat_digest_point_token_budget(
+        budget: crate::core::context_budget::HistoryTokenBudget,
+    ) -> usize {
+        crate::core::context_budget::read_usize_env("AGENTARK_CHAT_DIGEST_POINT_TOKENS")
+            .unwrap_or_else(|| {
+                budget
+                    .summary_tokens
+                    .saturating_div(28)
+                    .max(DEFAULT_CHAT_DIGEST_POINT_TOKENS)
+            })
+            .clamp(32, 512)
+    }
+
+    pub(super) fn prompt_recent_token_budget(
+        budget: crate::core::context_budget::HistoryTokenBudget,
+        env_name: &str,
+        ratio_percent: usize,
+    ) -> usize {
+        crate::core::context_budget::read_usize_env(env_name).unwrap_or_else(|| {
+            budget
+                .history_tokens
+                .saturating_mul(ratio_percent.clamp(5, 90))
+                / 100
+        })
+    }
+
+    fn truncate_chat_message_content(content: &str, max_tokens: usize) -> String {
+        crate::core::context_budget::truncate_to_token_budget(content, max_tokens)
+    }
+
+    fn storage_message_token_estimate(
+        message: &crate::storage::entities::message::Model,
+        max_message_tokens: usize,
+    ) -> usize {
+        let content = Self::truncate_chat_message_content(&message.content, max_message_tokens);
+        crate::core::context_budget::estimate_role_message_tokens(&message.role, &content)
+    }
+
+    pub(super) fn conversation_message_token_estimate(
+        message: &ConversationMessage,
+        max_message_tokens: usize,
+    ) -> usize {
+        let content = Self::truncate_chat_message_content(&message.content, max_message_tokens);
+        crate::core::context_budget::estimate_role_message_tokens(&message.role, &content)
+    }
+
+    fn storage_messages_token_estimate(
+        messages: &[crate::storage::entities::message::Model],
+        max_message_tokens: usize,
+    ) -> usize {
+        messages.iter().fold(0usize, |total, message| {
+            total.saturating_add(Self::storage_message_token_estimate(
+                message,
+                max_message_tokens,
+            ))
+        })
+    }
+
+    fn select_recent_start_by_token_budget(
+        messages: &[crate::storage::entities::message::Model],
+        max_tokens: usize,
+        max_message_tokens: usize,
+    ) -> usize {
+        if messages.is_empty() {
+            return 0;
+        }
+
+        let mut used_tokens = 0usize;
+        let mut start = messages.len();
+        for (idx, message) in messages.iter().enumerate().rev() {
+            let message_tokens = Self::storage_message_token_estimate(message, max_message_tokens);
+            if start < messages.len()
+                && used_tokens.saturating_add(message_tokens) > max_tokens.max(1)
+            {
+                break;
+            }
+            used_tokens = used_tokens.saturating_add(message_tokens);
+            start = idx;
+        }
+
+        if start == messages.len() {
+            messages.len().saturating_sub(1)
+        } else {
+            start
+        }
+    }
+
+    fn conversation_digest_token_estimate(summary: Option<&str>) -> usize {
+        summary
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                crate::core::context_budget::estimate_tokens_from_text(value).saturating_add(4)
+            })
+            .unwrap_or(0)
+    }
+
+    fn storage_message_to_conversation_message(
+        message: crate::storage::entities::message::Model,
+        max_message_tokens: usize,
+    ) -> ConversationMessage {
+        ConversationMessage {
+            role: message.role,
+            content: Self::truncate_chat_message_content(&message.content, max_message_tokens),
+            _timestamp: Self::parse_message_timestamp(&message.timestamp),
+        }
+    }
+
     fn normalize_conversation_digest_point_key(text: &str) -> String {
         text.split_whitespace()
             .map(|segment| {
@@ -93,7 +274,11 @@ impl Agent {
             .to_ascii_lowercase()
     }
 
-    fn compact_message_for_digest(role: &str, text: &str) -> Option<String> {
+    fn compact_message_for_digest(
+        role: &str,
+        text: &str,
+        point_max_tokens: usize,
+    ) -> Option<String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return None;
@@ -112,7 +297,10 @@ impl Agent {
                     .to_string(),
             });
         }
-        Some(safe_truncate(trimmed, CONTEXT_DIGEST_POINT_MAX_CHARS))
+        Some(crate::core::context_budget::truncate_point_tokens(
+            trimmed,
+            point_max_tokens,
+        ))
     }
 
     fn push_recent_unique_digest_point(points: &mut Vec<String>, point: String) {
@@ -127,17 +315,53 @@ impl Agent {
             points.remove(existing_idx);
         }
         points.push(point);
-        while points.len() > CONTEXT_DIGEST_MAX_POINTS_PER_ROLE {
-            points.remove(0);
+    }
+
+    fn estimate_digest_snapshot_tokens(snapshot: &ConversationDigestSnapshot) -> usize {
+        let base_tokens = crate::core::context_budget::estimate_tokens_from_text(
+            "Conversation recap from earlier compacted turns. Compacted earlier messages. User intents and requests. Assistant commitments and outcomes.",
+        );
+        snapshot
+            .user_intents
+            .iter()
+            .chain(snapshot.assistant_outcomes.iter())
+            .fold(base_tokens, |total, point| {
+                total
+                    .saturating_add(crate::core::context_budget::estimate_tokens_from_text(
+                        point,
+                    ))
+                    .saturating_add(3)
+            })
+    }
+
+    fn prune_conversation_digest_snapshot(
+        snapshot: &mut ConversationDigestSnapshot,
+        max_summary_tokens: usize,
+    ) {
+        while Self::estimate_digest_snapshot_tokens(snapshot) > max_summary_tokens
+            && snapshot.user_intents.len() + snapshot.assistant_outcomes.len() > 1
+        {
+            let remove_user = snapshot.user_intents.len() >= snapshot.assistant_outcomes.len()
+                && !snapshot.user_intents.is_empty();
+            if remove_user {
+                snapshot.user_intents.remove(0);
+            } else if !snapshot.assistant_outcomes.is_empty() {
+                snapshot.assistant_outcomes.remove(0);
+            } else {
+                break;
+            }
         }
     }
 
     fn extend_conversation_digest_snapshot(
         snapshot: &mut ConversationDigestSnapshot,
         messages: &[crate::storage::entities::message::Model],
+        point_max_tokens: usize,
+        max_summary_tokens: usize,
     ) {
         for message in messages {
-            let Some(point) = Self::compact_message_for_digest(&message.role, &message.content)
+            let Some(point) =
+                Self::compact_message_for_digest(&message.role, &message.content, point_max_tokens)
             else {
                 continue;
             };
@@ -149,11 +373,13 @@ impl Agent {
                 _ => {}
             }
         }
+        Self::prune_conversation_digest_snapshot(snapshot, max_summary_tokens);
     }
 
     fn render_conversation_digest(
         snapshot: &ConversationDigestSnapshot,
         compacted_messages: usize,
+        max_summary_tokens: usize,
     ) -> String {
         let mut out = String::from("Conversation recap from earlier compacted turns.\n");
         out.push_str(&format!(
@@ -177,18 +403,29 @@ impl Agent {
             }
         }
 
-        safe_truncate(out.trim(), CONTEXT_DIGEST_MAX_CHARS)
+        crate::core::context_budget::truncate_to_token_budget(out.trim(), max_summary_tokens)
     }
 
     fn build_conversation_digest(
         compacted_messages: &[crate::storage::entities::message::Model],
         total_messages: usize,
+        point_max_tokens: usize,
+        max_summary_tokens: usize,
     ) -> ConversationDigest {
         let mut snapshot = ConversationDigestSnapshot::default();
-        Self::extend_conversation_digest_snapshot(&mut snapshot, compacted_messages);
+        Self::extend_conversation_digest_snapshot(
+            &mut snapshot,
+            compacted_messages,
+            point_max_tokens,
+            max_summary_tokens,
+        );
         let compacted_count = compacted_messages.len();
         ConversationDigest {
-            summary: Self::render_conversation_digest(&snapshot, compacted_count),
+            summary: Self::render_conversation_digest(
+                &snapshot,
+                compacted_count,
+                max_summary_tokens,
+            ),
             total_messages,
             updated_at: chrono::Utc::now().to_rfc3339(),
             compacted_messages: compacted_count,
@@ -200,9 +437,11 @@ impl Agent {
     fn select_salient_older_messages(
         older: &[crate::storage::entities::message::Model],
         query_tokens: &HashSet<String>,
-        limit: usize,
+        token_budget: usize,
+        max_message_tokens: usize,
+        seen_ids: &HashSet<String>,
     ) -> Vec<crate::storage::entities::message::Model> {
-        if older.is_empty() || query_tokens.is_empty() || limit == 0 {
+        if older.is_empty() || query_tokens.is_empty() || token_budget == 0 {
             return Vec::new();
         }
 
@@ -225,8 +464,26 @@ impl Agent {
             .collect();
 
         scored.sort_by(|a, b| b.1.cmp(&a.1));
-        let mut selected_idx: Vec<usize> =
-            scored.into_iter().take(limit).map(|(idx, _)| idx).collect();
+        let mut selected_idx: Vec<usize> = Vec::new();
+        let mut used_tokens = 0usize;
+        for (idx, _) in scored {
+            let Some(message) = older.get(idx) else {
+                continue;
+            };
+            if seen_ids.contains(&message.id) {
+                continue;
+            }
+            let message_tokens = Self::storage_message_token_estimate(message, max_message_tokens);
+            if !selected_idx.is_empty() && used_tokens.saturating_add(message_tokens) > token_budget
+            {
+                continue;
+            }
+            used_tokens = used_tokens.saturating_add(message_tokens);
+            selected_idx.push(idx);
+            if used_tokens >= token_budget {
+                break;
+            }
+        }
         selected_idx.sort_unstable();
 
         selected_idx
@@ -237,14 +494,32 @@ impl Agent {
 
     fn select_recent_older_messages(
         older: &[crate::storage::entities::message::Model],
-        limit: usize,
+        token_budget: usize,
+        max_message_tokens: usize,
+        seen_ids: &HashSet<String>,
     ) -> Vec<crate::storage::entities::message::Model> {
-        if older.is_empty() || limit == 0 {
+        if older.is_empty() || token_budget == 0 {
             return Vec::new();
         }
 
-        let start = older.len().saturating_sub(limit);
-        older[start..].to_vec()
+        let mut selected = Vec::new();
+        let mut used_tokens = 0usize;
+        for message in older.iter().rev() {
+            if seen_ids.contains(&message.id) {
+                continue;
+            }
+            let message_tokens = Self::storage_message_token_estimate(message, max_message_tokens);
+            if !selected.is_empty() && used_tokens.saturating_add(message_tokens) > token_budget {
+                break;
+            }
+            used_tokens = used_tokens.saturating_add(message_tokens);
+            selected.push(message.clone());
+            if used_tokens >= token_budget {
+                break;
+            }
+        }
+        selected.reverse();
+        selected
     }
 
     pub(super) async fn build_packed_conversation_context(
@@ -278,9 +553,31 @@ impl Agent {
             return packed;
         }
 
-        let split_at = all_messages.len().saturating_sub(CONTEXT_RECENT_TAIL);
+        let budget = self.chat_history_budget(user_message);
+        let max_message_tokens = Self::chat_message_token_budget(budget);
+        let point_max_tokens = Self::chat_digest_point_token_budget(budget);
+        packed.history_token_budget = budget.history_tokens;
+        packed.summary_token_budget = budget.summary_tokens;
+        packed.message_token_budget = max_message_tokens;
+        let fetched_tokens =
+            Self::storage_messages_token_estimate(&all_messages, max_message_tokens);
+        let has_unfetched_older_messages = packed.total_loaded > all_messages.len();
+        let split_at = if has_unfetched_older_messages || fetched_tokens > budget.history_tokens {
+            let recent_budget = budget
+                .history_tokens
+                .saturating_sub(budget.summary_tokens)
+                .max(budget.history_tokens / 2)
+                .max(MIN_CHAT_HISTORY_TOKEN_BUDGET.min(budget.history_tokens));
+            Self::select_recent_start_by_token_budget(
+                &all_messages,
+                recent_budget,
+                max_message_tokens,
+            )
+        } else {
+            0
+        };
         let (older, recent) = all_messages.split_at(split_at);
-        let target_compacted_messages = packed.total_loaded.saturating_sub(CONTEXT_RECENT_TAIL);
+        let target_compacted_messages = packed.total_loaded.saturating_sub(recent.len());
         let mut digest_opt =
             self.load_conversation_digest(conversation_id)
                 .await
@@ -289,7 +586,7 @@ impl Agent {
                         && !digest.summary.trim().is_empty()
                         && digest.compacted_messages <= target_compacted_messages
                 });
-        let refresh_needed = target_compacted_messages >= CONTEXT_MIN_MSGS_FOR_DIGEST
+        let refresh_needed = target_compacted_messages > 0
             && digest_opt
                 .as_ref()
                 .map(|digest| digest.compacted_messages < target_compacted_messages)
@@ -326,23 +623,36 @@ impl Agent {
                 if page.is_empty() {
                     break;
                 }
-                Self::extend_conversation_digest_snapshot(&mut digest.snapshot, &page);
+                Self::extend_conversation_digest_snapshot(
+                    &mut digest.snapshot,
+                    &page,
+                    point_max_tokens,
+                    budget.summary_tokens,
+                );
                 offset = offset.saturating_add(page.len() as u64);
             }
             digest.compacted_messages = offset as usize;
             digest.total_messages = packed.total_loaded;
             digest.updated_at = chrono::Utc::now().to_rfc3339();
             digest.digest_version = CONTEXT_DIGEST_VERSION;
-            digest.summary =
-                Self::render_conversation_digest(&digest.snapshot, digest.compacted_messages);
+            digest.summary = Self::render_conversation_digest(
+                &digest.snapshot,
+                digest.compacted_messages,
+                budget.summary_tokens,
+            );
             if !digest.summary.trim().is_empty() {
                 self.save_conversation_digest(conversation_id, &digest)
                     .await;
                 packed.digest_refreshed = true;
                 digest_opt = Some(digest);
             }
-        } else if digest_opt.is_none() && older.len() >= CONTEXT_MIN_MSGS_FOR_DIGEST {
-            let digest = Self::build_conversation_digest(older, packed.total_loaded);
+        } else if digest_opt.is_none() && !older.is_empty() {
+            let digest = Self::build_conversation_digest(
+                older,
+                packed.total_loaded,
+                point_max_tokens,
+                budget.summary_tokens,
+            );
             if !digest.summary.trim().is_empty() {
                 self.save_conversation_digest(conversation_id, &digest)
                     .await;
@@ -356,59 +666,65 @@ impl Agent {
 
         if let Some(digest) = digest_opt.as_ref().filter(|d| !d.summary.trim().is_empty()) {
             packed.used_digest = true;
-            packed.digest = Some(safe_truncate(&digest.summary, CONTEXT_DIGEST_MAX_CHARS));
+            packed.digest = Some(crate::core::context_budget::truncate_to_token_budget(
+                &digest.summary,
+                budget.summary_tokens,
+            ));
             packed.compacted_messages = digest.compacted_messages;
         }
 
+        let digest_tokens = Self::conversation_digest_token_estimate(packed.digest.as_deref());
+        let recent_tokens = Self::storage_messages_token_estimate(recent, max_message_tokens);
+        let support_budget = budget
+            .history_tokens
+            .saturating_sub(digest_tokens)
+            .saturating_sub(recent_tokens);
+        let recent_older_budget = support_budget.saturating_mul(40) / 100;
+        let salient_budget = support_budget.saturating_sub(recent_older_budget);
         let query_tokens: HashSet<String> = tokenize_lower(user_message).into_iter().collect();
-        let recent_older =
-            Self::select_recent_older_messages(older, CONTEXT_SHORT_FOLLOWUP_OLDER_LIMIT);
+        let recent_older = Self::select_recent_older_messages(
+            older,
+            recent_older_budget,
+            max_message_tokens,
+            &seen_ids,
+        );
         for msg in recent_older {
             if !seen_ids.insert(msg.id.clone()) {
                 continue;
             }
-            selected.push(ConversationMessage {
-                role: msg.role,
-                content: safe_truncate(&msg.content, CONTEXT_MAX_MESSAGE_CHARS),
-                _timestamp: Self::parse_message_timestamp(&msg.timestamp),
-            });
+            selected.push(Self::storage_message_to_conversation_message(
+                msg,
+                max_message_tokens,
+            ));
         }
-        let salient =
-            Self::select_salient_older_messages(older, &query_tokens, CONTEXT_SALIENT_OLDER_LIMIT);
+        let salient = Self::select_salient_older_messages(
+            older,
+            &query_tokens,
+            salient_budget,
+            max_message_tokens,
+            &seen_ids,
+        );
         for msg in salient {
             if !seen_ids.insert(msg.id.clone()) {
                 continue;
             }
-            selected.push(ConversationMessage {
-                role: msg.role,
-                content: safe_truncate(&msg.content, CONTEXT_MAX_MESSAGE_CHARS),
-                _timestamp: Self::parse_message_timestamp(&msg.timestamp),
-            });
+            selected.push(Self::storage_message_to_conversation_message(
+                msg,
+                max_message_tokens,
+            ));
         }
 
         for msg in recent {
             if !seen_ids.insert(msg.id.clone()) {
                 continue;
             }
-            selected.push(ConversationMessage {
-                role: msg.role.clone(),
-                content: safe_truncate(&msg.content, CONTEXT_MAX_MESSAGE_CHARS),
-                _timestamp: Self::parse_message_timestamp(&msg.timestamp),
-            });
+            selected.push(Self::storage_message_to_conversation_message(
+                msg.clone(),
+                max_message_tokens,
+            ));
         }
 
-        // Keep recent continuity first, then shrink from oldest non-summary lines.
-        let mut total_chars: usize = selected.iter().map(|m| m.content.len()).sum();
-        while total_chars > CONTEXT_MAX_CHARS && selected.len() > 4 {
-            let removable = selected.len().saturating_sub(4);
-            if removable == 0 {
-                break;
-            }
-            total_chars = total_chars.saturating_sub(selected[0].content.len());
-            selected.remove(0);
-        }
-
-        packed.used_chars = total_chars;
+        packed.used_chars = selected.iter().map(|m| m.content.len()).sum();
         packed.history = selected;
         packed
     }

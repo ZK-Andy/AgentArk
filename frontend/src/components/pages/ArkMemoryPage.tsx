@@ -139,6 +139,67 @@ function replayGateLabel(status: string): string {
   return normalized[0].toUpperCase() + normalized.slice(1);
 }
 
+function tokenLabel(value: unknown, fallback = "Unknown"): string {
+  const normalized = str(value, "").trim().replace(/[_-]+/g, " ");
+  if (!normalized) return fallback;
+  return normalized
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function healthSeverityColor(
+  severity: unknown,
+): "default" | "info" | "warning" | "error" | "success" {
+  const normalized = str(severity, "").trim().toLowerCase();
+  if (normalized === "warning" || normalized === "review") return "warning";
+  if (normalized === "error" || normalized === "failed") return "error";
+  if (normalized === "success" || normalized === "ok") return "success";
+  if (normalized === "info") return "info";
+  return "default";
+}
+
+function healthFindingTitle(finding: JsonRecord, fallbackIndex: number): string {
+  return (
+    str(finding.title, "").trim() ||
+    tokenLabel(finding.kind, `Finding ${fallbackIndex + 1}`)
+  );
+}
+
+function healthFindingDetail(finding: JsonRecord): string {
+  return (
+    str(finding.last_error_detail, "").trim() ||
+    str(finding.detail, "").trim() ||
+    "No additional detail was recorded."
+  );
+}
+
+function healthReviewPattern(finding: JsonRecord): JsonRecord {
+  return asRecord(finding.review_pattern);
+}
+
+function healthReviewPatternLabel(pattern: JsonRecord): string {
+  const count = num(pattern.similar_review_count);
+  const suggested = str(pattern.suggested_outcome, "").trim();
+  if (count <= 0) return "";
+  const suffix = suggested ? `, most often: ${tokenLabel(suggested)}` : "";
+  return `${count} similar reviewed pattern${count === 1 ? "" : "s"}${suffix}`;
+}
+
+function healthSourceContext(finding: JsonRecord): JsonRecord {
+  return asRecord(finding.source_context);
+}
+
+function healthSourceTitle(source: JsonRecord): string {
+  const title = str(source.conversation_title, "").trim();
+  const channel = str(source.conversation_channel, "").trim();
+  if (title && channel) return `${title} (${tokenLabel(channel)})`;
+  if (title) return title;
+  if (channel) return tokenLabel(channel);
+  return "Source message";
+}
+
 type ArkMemoryPageProps = {
   autoRefresh: boolean;
   onNavigateToView?: (view: string, replace?: boolean) => void;
@@ -153,11 +214,13 @@ export default function ArkMemoryPage({
     "current",
   );
   const [notice, setNotice] = useState<string | null>(null);
+  const [healthDetailsOpen, setHealthDetailsOpen] = useState(false);
   const invalidateArkMemory = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["arkmemory-summary"] }),
       queryClient.invalidateQueries({ queryKey: ["arkmemory-queue"] }),
       queryClient.invalidateQueries({ queryKey: ["arkmemory-ledger"] }),
+      queryClient.invalidateQueries({ queryKey: ["arkmemory-health"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-stats"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-facts"] }),
       queryClient.invalidateQueries({ queryKey: ["memory-preferences"] }),
@@ -179,6 +242,11 @@ export default function ArkMemoryPage({
   const ledgerQ = useQuery({
     queryKey: ["arkmemory-ledger"],
     queryFn: () => api.rawGet("/arkmemory/ledger?limit=80"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
+  const healthQ = useQuery({
+    queryKey: ["arkmemory-health"],
+    queryFn: () => api.rawGet("/arkmemory/health?limit=50"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
 
@@ -206,12 +274,29 @@ export default function ArkMemoryPage({
       await invalidateArkMemory();
     },
   });
+  const applyHealthMutation = useMutation({
+    mutationFn: ({
+      id,
+      outcome,
+    }: {
+      id: string;
+      outcome: "acknowledged" | "expected_sensitive_skip" | "false_positive_safe_memory";
+    }) =>
+      api.rawPost(`/arkmemory/health/${encodeURIComponent(id)}/apply`, {
+        outcome,
+      }),
+    onSuccess: async () => {
+      setNotice("Memory health finding marked reviewed.");
+      await invalidateArkMemory();
+    },
+  });
 
   const summary = asRecord(summaryQ.data);
   const currentMemory = asRecord(summary.current_memory);
   const capturePipeline = asRecord(summary.capture_pipeline);
   const queueItems = pickRecords(queueQ.data, "items");
   const ledgerEvents = pickRecords(ledgerQ.data, "events");
+  const healthFindings = pickRecords(healthQ.data, "findings");
   const historyEvents = useMemo(
     () => ledgerEvents.filter(arkmemoryHistoryEventVisible),
     [ledgerEvents],
@@ -251,17 +336,25 @@ export default function ArkMemoryPage({
       setMemoryTab("current");
     }
   }, [memoryTab, showQueueTab]);
+  useEffect(() => {
+    if (failedCaptureCount > 0) {
+      setHealthDetailsOpen(true);
+    }
+  }, [failedCaptureCount]);
   const busy =
     approveQueueMutation.isPending ||
     rejectQueueMutation.isPending ||
-    rollbackMutation.isPending;
+    rollbackMutation.isPending ||
+    applyHealthMutation.isPending;
   const firstError =
     summaryQ.error ||
     queueQ.error ||
     ledgerQ.error ||
+    healthQ.error ||
     approveQueueMutation.error ||
     rejectQueueMutation.error ||
-    rollbackMutation.error;
+    rollbackMutation.error ||
+    applyHealthMutation.error;
   const memoryTabValue =
     memoryTab === "current" ? 0 : memoryTab === "queue" ? 1 : showQueueTab ? 2 : 1;
 
@@ -344,11 +437,244 @@ export default function ArkMemoryPage({
         </Alert>
       ) : null}
       {failedCaptureCount > 0 ? (
-        <Alert severity="warning">
+        <Alert
+          severity="warning"
+          action={
+            <Button
+              color="inherit"
+              size="small"
+              onClick={() => setHealthDetailsOpen(true)}
+            >
+              Review
+            </Button>
+          }
+        >
           {failedCaptureCount === 1
             ? "1 memory capture needs attention."
             : `${failedCaptureCount} memory captures need attention.`}
         </Alert>
+      ) : null}
+      {healthFindings.length > 0 || healthDetailsOpen ? (
+        <Accordion
+          disableGutters
+          expanded={healthDetailsOpen}
+          onChange={(_event, expanded) => setHealthDetailsOpen(expanded)}
+          className="list-shell"
+          sx={{
+            background: "transparent",
+            "&:before": { display: "none" },
+          }}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+            <Stack
+              direction="row"
+              spacing={1}
+              useFlexGap
+              sx={{ alignItems: "center", flexWrap: "wrap", width: "100%" }}
+            >
+              <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                Memory Health
+              </Typography>
+              <Chip
+                size="small"
+                variant="outlined"
+                color={healthFindings.length > 0 ? "warning" : "default"}
+                label={`${healthFindings.length} finding${
+                  healthFindings.length === 1 ? "" : "s"
+                }`}
+              />
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+            <Stack spacing={1}>
+              {healthQ.isLoading ? (
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  Loading memory health details...
+                </Typography>
+              ) : null}
+              {healthQ.error ? (
+                <Alert severity="warning">{errMessage(healthQ.error)}</Alert>
+              ) : null}
+              {!healthQ.isLoading && !healthQ.error && healthFindings.length === 0 ? (
+                <Alert severity="info">
+                  No active memory health findings are currently reported.
+                </Alert>
+              ) : null}
+              {healthFindings.map((finding, index) => {
+                const id = str(finding.id, `health-${index}`).trim();
+                const captureEventId = str(finding.capture_event_id, "").trim();
+                const status = str(finding.status, "").trim();
+                const captureKind = str(finding.capture_kind, "").trim();
+                const lastErrorCode = str(finding.last_error_code, "").trim();
+                const reviewPattern = healthReviewPattern(finding);
+                const reviewPatternLabel = healthReviewPatternLabel(reviewPattern);
+                const sourceContext = healthSourceContext(finding);
+                const sourceTime = humanTs(str(sourceContext.source_message_at, ""));
+                const sourcePreview = str(
+                  sourceContext.source_message_preview,
+                  "",
+                ).trim();
+                const sourceMessageId = str(
+                  sourceContext.source_message_id,
+                  "",
+                ).trim();
+                const sourceChars = num(sourceContext.source_message_chars, -1);
+                const isSensitiveSkip = status === "rejected_sensitive_input";
+                const created = humanTs(str(finding.created_at, ""));
+                return (
+                  <Box
+                    key={id}
+                    className="metadata-box"
+                    sx={{ borderColor: "var(--ui-rgba-255-193-7-180)" }}
+                  >
+                    <Stack spacing={0.85}>
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        useFlexGap
+                        sx={{
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <Stack
+                          direction="row"
+                          spacing={0.75}
+                          useFlexGap
+                          sx={{ alignItems: "center", flexWrap: "wrap", minWidth: 0 }}
+                        >
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            color={healthSeverityColor(finding.severity)}
+                            label={tokenLabel(finding.severity, "Review")}
+                          />
+                          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                            {healthFindingTitle(finding, index)}
+                          </Typography>
+                        </Stack>
+                        <Stack
+                          direction="row"
+                          spacing={0.75}
+                          useFlexGap
+                          sx={{ flexWrap: "wrap", justifyContent: "flex-end" }}
+                        >
+                          {isSensitiveSkip ? (
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              color="warning"
+                              disabled={busy || !id}
+                              onClick={() =>
+                                applyHealthMutation.mutate({
+                                  id,
+                                  outcome: "expected_sensitive_skip",
+                                })
+                              }
+                            >
+                              Correct skip
+                            </Button>
+                          ) : null}
+                          {isSensitiveSkip ? (
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              color="warning"
+                              disabled={busy || !id}
+                              onClick={() =>
+                                applyHealthMutation.mutate({
+                                  id,
+                                  outcome: "false_positive_safe_memory",
+                                })
+                              }
+                            >
+                              False positive
+                            </Button>
+                          ) : (
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              color="warning"
+                              disabled={busy || !id}
+                              onClick={() =>
+                                applyHealthMutation.mutate({
+                                  id,
+                                  outcome: "acknowledged",
+                                })
+                              }
+                            >
+                              Mark reviewed
+                            </Button>
+                          )}
+                        </Stack>
+                      </Stack>
+                      <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                        {healthFindingDetail(finding)}
+                      </Typography>
+                      <Box className="metadata-box">
+                        <Stack spacing={0.45}>
+                          <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                            Source: {healthSourceTitle(sourceContext)}
+                            {sourceTime.label !== "-" ? ` - ${sourceTime.label}` : ""}
+                            {sourceChars >= 0 ? ` - ${sourceChars} chars` : ""}
+                            {sourceMessageId ? ` - msg ${sourceMessageId.slice(0, 8)}` : ""}
+                          </Typography>
+                          {sourcePreview ? (
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                color: "text.secondary",
+                                overflowWrap: "anywhere",
+                              }}
+                            >
+                              {sourcePreview}
+                            </Typography>
+                          ) : null}
+                        </Stack>
+                      </Box>
+                      {reviewPatternLabel ? (
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                          {reviewPatternLabel}
+                        </Typography>
+                      ) : null}
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        useFlexGap
+                        sx={{ flexWrap: "wrap", color: "text.secondary" }}
+                      >
+                        {status ? (
+                          <Typography variant="caption">
+                            Status: {tokenLabel(status)}
+                          </Typography>
+                        ) : null}
+                        {captureKind ? (
+                          <Typography variant="caption">
+                            Type: {tokenLabel(captureKind)}
+                          </Typography>
+                        ) : null}
+                        {lastErrorCode ? (
+                          <Typography variant="caption">
+                            Error: {tokenLabel(lastErrorCode)}
+                          </Typography>
+                        ) : null}
+                        {captureEventId ? (
+                          <Typography variant="caption">
+                            Capture: {captureEventId.slice(0, 18)}
+                          </Typography>
+                        ) : null}
+                        <Typography variant="caption" title={created.tip}>
+                          Updated: {created.label}
+                        </Typography>
+                      </Stack>
+                    </Stack>
+                  </Box>
+                );
+              })}
+            </Stack>
+          </AccordionDetails>
+        </Accordion>
       ) : null}
 
       <Box className="list-shell stat-strip">

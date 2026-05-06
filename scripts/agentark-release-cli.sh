@@ -118,6 +118,7 @@ show_help() {
     echo "  restart    Restart AgentArk"
     echo "  logs       View live logs"
     echo "  status     Show running containers"
+    echo "  backup     Backup Docker volumes"
     echo "  update     Install the latest tagged release and restart"
     echo "  setup      Run setup wizard"
     echo "  uninstall  Stop and remove containers"
@@ -165,6 +166,9 @@ case "${1:-help}" in
         ;;
     status)
         run_start_script status
+        ;;
+    backup)
+        run_start_script backup
         ;;
     setup)
         docker exec -it agentark-control /app/agentark --setup

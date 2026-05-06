@@ -49,17 +49,21 @@ export function OrbitSwitcher({
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
   const [icon, setIcon] = useState("");
-  const [color, setColor] = useState("");
+  const [color, setColor] = useState("#58e0ff");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
   const activeOrbit = orbits.find((orbit) => orbit.id === activeOrbitId) ?? null;
   const menuOpen = Boolean(menuAnchor);
+  const duplicateCreateName = orbits.some(
+    (orbit) =>
+      orbit.name.trim().toLocaleLowerCase() === name.trim().toLocaleLowerCase(),
+  );
 
   const reset = useCallback(() => {
     setName("");
     setIcon("");
-    setColor("");
+    setColor("#58e0ff");
     setError(null);
   }, []);
 
@@ -69,6 +73,14 @@ export function OrbitSwitcher({
       const trimmed = name.trim();
       if (!trimmed) {
         setError("Name is required.");
+        return;
+      }
+      if (
+        orbits.some(
+          (orbit) => orbit.name.trim().toLocaleLowerCase() === trimmed.toLocaleLowerCase(),
+        )
+      ) {
+        setError("A canvas with this name already exists.");
         return;
       }
       setSubmitting(true);
@@ -91,7 +103,7 @@ export function OrbitSwitcher({
         setSubmitting(false);
       }
     },
-    [name, icon, color, onCreated, reset],
+    [name, icon, color, onCreated, orbits, reset],
   );
 
   return (
@@ -162,7 +174,7 @@ export function OrbitSwitcher({
             </IconButton>
           </span>
         </Tooltip>
-        <Tooltip title="New orbit">
+        <Tooltip title="New canvas">
           <Button
             size="small"
             variant="outlined"
@@ -184,7 +196,7 @@ export function OrbitSwitcher({
         maxWidth="xs"
         fullWidth
       >
-        <DialogTitle>Create orbit</DialogTitle>
+        <DialogTitle>New canvas</DialogTitle>
         <Box component="form" onSubmit={handleSubmit}>
           <DialogContent>
             <Stack spacing={2}>
@@ -192,9 +204,14 @@ export function OrbitSwitcher({
                 autoFocus
                 label="Name"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  setError(null);
+                }}
                 size="small"
                 fullWidth
+                error={duplicateCreateName}
+                helperText={duplicateCreateName ? "A canvas with this name already exists." : " "}
               />
               <TextField
                 label="Icon (emoji or short glyph, optional)"
@@ -205,12 +222,12 @@ export function OrbitSwitcher({
                 slotProps={{ htmlInput: { maxLength: 8 } }}
               />
               <TextField
-                label="Color (CSS color, optional)"
+                label="Color"
+                type="color"
                 value={color}
                 onChange={(e) => setColor(e.target.value)}
                 size="small"
                 fullWidth
-                placeholder="#7c3aed"
               />
               {error ? (
                 <Typography variant="caption" color="error">
@@ -231,7 +248,11 @@ export function OrbitSwitcher({
               type="submit"
               variant="contained"
               size="small"
-              disabled={submitting || !name.trim()}
+              disabled={
+                submitting ||
+                !name.trim() ||
+                duplicateCreateName
+              }
             >
               Create
             </Button>

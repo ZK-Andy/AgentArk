@@ -3,7 +3,7 @@
 //! Orbits are folders under `<DATA_DIR>/arkorbit/L2/orbits/<id>/`. No
 //! ArkOrbit database tables are created or queried in this redesign.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use std::path::Path;
 use std::sync::Arc;
@@ -49,6 +49,35 @@ impl ArkOrbitService {
                 Some(trimmed)
             }
         })
+    }
+
+    fn normalized_orbit_name(value: &str) -> String {
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    }
+
+    async fn ensure_unique_orbit_name(
+        &self,
+        user_id: &str,
+        name: &str,
+        excluding_orbit_id: Option<&str>,
+    ) -> Result<()> {
+        let target = Self::normalized_orbit_name(name);
+        for orbit in self.list_orbits(user_id).await? {
+            if orbit.user_id != user_id && !orbit.user_id.is_empty() {
+                continue;
+            }
+            if excluding_orbit_id.is_some_and(|id| id == orbit.id) {
+                continue;
+            }
+            if Self::normalized_orbit_name(&orbit.name) == target {
+                bail!("ArkOrbit: orbit name '{}' already exists", name);
+            }
+        }
+        Ok(())
     }
 
     pub async fn list_orbits(&self, user_id: &str) -> Result<Vec<Orbit>> {
@@ -102,6 +131,7 @@ impl ArkOrbitService {
     ) -> Result<Orbit> {
         let user_id = Self::require_non_empty(user_id, "user_id")?;
         let name = Self::require_non_empty(name, "name")?;
+        self.ensure_unique_orbit_name(&user_id, &name, None).await?;
         self.create_orbit_internal(
             &user_id,
             &name,
@@ -147,7 +177,10 @@ impl ArkOrbitService {
             .await?
             .ok_or_else(|| anyhow!("ArkOrbit: orbit '{}' not found", orbit_id))?;
         if let Some(name) = patch.name {
-            orbit.name = Self::require_non_empty(&name, "name")?;
+            let name = Self::require_non_empty(&name, "name")?;
+            self.ensure_unique_orbit_name(&orbit.user_id, &name, Some(&orbit.id))
+                .await?;
+            orbit.name = name;
         }
         if let Some(icon) = patch.icon {
             orbit.icon = Self::normalize_optional(icon);
@@ -211,6 +244,54 @@ impl ArkOrbitService {
             .ensure_orbit_dir(orbit_id)?
             .join("data")
             .join("chat-history"))
+    }
+
+    pub fn chat_session_path(&self, orbit_id: &str) -> Result<std::path::PathBuf> {
+        Ok(self
+            .store
+            .ensure_orbit_dir(orbit_id)?
+            .join("data")
+            .join("chat-session.txt"))
+    }
+
+    pub fn ensure_orbit_chat_session(&self, orbit_id: &str) -> Result<String> {
+        LayeredStore::validate_orbit_id(orbit_id)?;
+        let path = self.chat_session_path(orbit_id)?;
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let session_id = raw.trim();
+                if Uuid::parse_str(session_id).is_ok() {
+                    Ok(session_id.to_string())
+                } else {
+                    self.rotate_orbit_chat_session(orbit_id)
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.rotate_orbit_chat_session(orbit_id)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn rotate_orbit_chat_session(&self, orbit_id: &str) -> Result<String> {
+        LayeredStore::validate_orbit_id(orbit_id)?;
+        let path = self.chat_session_path(orbit_id)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let session_id = Uuid::new_v4().to_string();
+        std::fs::write(path, &session_id)?;
+        Ok(session_id)
+    }
+
+    pub fn orbit_chat_session_matches(&self, orbit_id: &str, expected: &str) -> Result<bool> {
+        LayeredStore::validate_orbit_id(orbit_id)?;
+        let path = self.chat_session_path(orbit_id)?;
+        match std::fs::read_to_string(path) {
+            Ok(raw) => Ok(raw.trim() == expected),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn parse_chat_messages(raw: &str) -> Vec<OrbitChatMessage> {
@@ -373,6 +454,17 @@ impl ArkOrbitService {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+            let summary_path = self
+                .store
+                .ensure_orbit_dir(orbit_id)?
+                .join("data")
+                .join("chat-summary.md");
+            match std::fs::remove_file(summary_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.rotate_orbit_chat_session(orbit_id)?;
             return Ok(None);
         }
         let history_dir = self.chat_history_dir(orbit_id)?;
@@ -384,11 +476,18 @@ impl ArkOrbitService {
         );
         let archive_path = history_dir.join(format!("{}.jsonl", id));
         std::fs::rename(&path, &archive_path)?;
+        let summary_path = self
+            .store
+            .ensure_orbit_dir(orbit_id)?
+            .join("data")
+            .join("chat-summary.md");
+        match std::fs::remove_file(summary_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.rotate_orbit_chat_session(orbit_id)?;
         Ok(Self::summarize_chat_transcript(id, false, messages))
-    }
-
-    pub fn l0_skill_catalog(&self) -> String {
-        self.store.l0_skill_catalog()
     }
 
     pub async fn reconcile_filesystem(&self) -> Result<()> {

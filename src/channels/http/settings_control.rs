@@ -1207,6 +1207,7 @@ pub(super) async fn update_settings(
         agent.storage.clone()
     };
     let mut deferred_profile_bytes: Option<Vec<u8>> = None;
+    let mut deferred_runtime_timezone: Option<Option<String>> = None;
     let mut deferred_search_config_dir: Option<PathBuf> = None;
     let mut deferred_data_lifecycle_settings: Option<DataLifecycleSettings> = None;
     let existing_daily_brief_tasks = {
@@ -1371,8 +1372,22 @@ pub(super) async fn update_settings(
         ) {
             profile.onboarding_complete = true;
         }
+        deferred_runtime_timezone = Some(profile.timezone.clone());
         if let Ok(bytes) = serde_json::to_vec(&*profile) {
             deferred_profile_bytes = Some(bytes);
+        }
+    }
+
+    if let Some(runtime_timezone) = deferred_runtime_timezone.as_ref() {
+        if let Some(timezone) = runtime_timezone.as_deref() {
+            std::env::set_var("AGENTARK_LOG_TIMEZONE", timezone);
+        } else {
+            std::env::remove_var("AGENTARK_LOG_TIMEZONE");
+        }
+        let mut agent = state.agent.write().await;
+        agent.llm.set_runtime_timezone(runtime_timezone.as_deref());
+        for (_, client) in agent.model_pool.values_mut() {
+            client.set_runtime_timezone(runtime_timezone.as_deref());
         }
     }
 
@@ -4261,18 +4276,47 @@ pub(super) async fn update_settings(
 
 pub(super) async fn test_llm_connection(provider: &LlmProvider) -> Result<(), String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     match provider {
-        LlmProvider::Ollama { base_url, .. } => {
-            let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
-            let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+        LlmProvider::Ollama { base_url, model } => {
+            let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+            let payload = serde_json::json!({
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are checking whether this model endpoint is reachable. Reply with OK."
+                    },
+                    {
+                        "role": "user",
+                        "content": "Connection check"
+                    }
+                ],
+                "stream": false,
+                "options": {
+                    "num_predict": 1
+                }
+            });
+            let resp = client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             if resp.status().is_success() {
                 Ok(())
             } else {
-                Err(format!("Ollama returned {}", resp.status()))
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!(
+                    "Ollama model check returned {}: {}",
+                    status,
+                    body.trim()
+                ))
             }
         }
         LlmProvider::OpenAI {
@@ -4338,8 +4382,25 @@ pub(super) async fn test_llm_connection(provider: &LlmProvider) -> Result<(), St
                 ));
             }
             let base = request_config.base_url.trim_end_matches('/');
-            let url = format!("{}/models", base);
-            let mut request = client.get(url);
+            let url = format!("{}/chat/completions", base);
+            let payload = serde_json::json!({
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are checking whether this model endpoint is reachable. Reply with OK."
+                    },
+                    {
+                        "role": "user",
+                        "content": "Connection check"
+                    }
+                ],
+                "stream": false
+            });
+            let mut request = client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .json(&payload);
             if !request_config.api_key.trim().is_empty() {
                 request = request.bearer_auth(&request_config.api_key);
             }
@@ -4348,49 +4409,52 @@ pub(super) async fn test_llm_connection(provider: &LlmProvider) -> Result<(), St
                     .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
                     .header("X-Title", crate::branding::PRODUCT_NAME);
             }
-            let mut resp = request.send().await.map_err(|e| e.to_string())?;
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                && request_config.uses_codex_cli_oauth
-            {
-                let refreshed = force_refresh_codex_cli_api_key(&client)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .unwrap_or_default();
-                request_config.api_key = refreshed;
-                let mut retry = client.get(format!("{}/models", base));
-                if !request_config.api_key.trim().is_empty() {
-                    retry = retry.bearer_auth(&request_config.api_key);
-                }
-                if request_config.is_openrouter {
-                    retry = retry
-                        .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
-                        .header("X-Title", crate::branding::PRODUCT_NAME);
-                }
-                resp = retry.send().await.map_err(|e| e.to_string())?;
-            }
+            let resp = request.send().await.map_err(|e| e.to_string())?;
             if resp.status().is_success() {
                 Ok(())
             } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
                 Err(format!(
-                    "{} returned {}",
+                    "{} model check returned {}: {}",
                     request_config.provider_label,
-                    resp.status()
+                    status,
+                    body.trim()
                 ))
             }
         }
-        LlmProvider::Anthropic { api_key, .. } => {
-            let url = "https://api.anthropic.com/v1/models";
+        LlmProvider::Anthropic { api_key, model } => {
+            let url = "https://api.anthropic.com/v1/messages";
+            let payload = serde_json::json!({
+                "model": model,
+                "max_tokens": 1,
+                "system": "You are checking whether this model endpoint is reachable. Reply with OK.",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Connection check"
+                    }
+                ]
+            });
             let resp = client
-                .get(url)
+                .post(url)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", "application/json")
+                .json(&payload)
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
             if resp.status().is_success() {
                 Ok(())
             } else {
-                Err(format!("Anthropic returned {}", resp.status()))
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!(
+                    "Anthropic model check returned {}: {}",
+                    status,
+                    body.trim()
+                ))
             }
         }
     }
@@ -5799,7 +5863,7 @@ pub(super) async fn test_model_connection(
     };
 
     let connectivity = match tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(25),
         test_llm_connection(&provider),
     )
     .await

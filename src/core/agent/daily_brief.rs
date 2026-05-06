@@ -1394,22 +1394,26 @@ impl Agent {
                 .await;
         }
 
+        let mut attempts = Vec::new();
         if is_external_notification_channel(&requested)
             && !self
                 .notification_channel_is_configured_any(&requested)
                 .await
         {
-            return vec![NotificationDispatchOutcome {
-                channel: requested.clone(),
-                success: false,
-                error: Some(format!(
+            attempts.push(NotificationDispatchOutcome::pre_send_failure(
+                requested.clone(),
+                format!(
                     "{} delivery is not connected",
                     notification_channel_display_name(&requested)
-                )),
-            }];
+                ),
+            ));
         }
 
-        vec![self.try_send_notification_reported(&requested, brief).await]
+        attempts.extend(
+            self.notify_preferred_channel_reported_with_hint(brief, Some(&requested), true)
+                .await,
+        );
+        attempts
     }
 
     pub(super) async fn run_daily_brief_and_notify_reported_with_hint(

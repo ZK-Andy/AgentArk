@@ -3,6 +3,12 @@ use super::*;
 const ROUTER_CALL_TIMEOUT_MS: u64 = 12_000;
 const ROUTER_CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 512;
 
+#[derive(Debug, Clone)]
+pub(super) struct ActiveRoutingComplexityPolicy {
+    pub version: String,
+    pub policy: crate::core::self_evolve::policy_evolution::RoutingComplexityPolicy,
+}
+
 fn router_call_timeout_ms() -> u64 {
     std::env::var("AGENTARK_ROUTER_TIMEOUT_MS")
         .ok()
@@ -78,20 +84,18 @@ fn parse_routing_decision_from_text(
 }
 
 impl Agent {
-    async fn routing_complexity_policy(
+    async fn load_routing_complexity_policy_by_key(
         &self,
+        key: &str,
     ) -> crate::core::self_evolve::policy_evolution::RoutingComplexityPolicy {
-        match self
-            .storage
-            .get(crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY)
-            .await
-        {
+        match self.storage.get(key).await {
             Ok(Some(raw)) => {
                 match crate::core::self_evolve::policy_evolution::routing_complexity_policy_from_slice(&raw) {
                     Ok(policy) => policy,
                     Err(error) => {
                         tracing::warn!(
                             error = %error,
+                            key,
                             "Stored routing complexity policy is invalid; using default structural policy"
                         );
                         Default::default()
@@ -102,6 +106,7 @@ impl Agent {
             Err(error) => {
                 tracing::warn!(
                     error = %error,
+                    key,
                     "Failed to load routing complexity policy; using default structural policy"
                 );
                 Default::default()
@@ -109,13 +114,71 @@ impl Agent {
         }
     }
 
+    pub(super) async fn active_routing_complexity_policy_for_message(
+        &self,
+        message: &str,
+    ) -> ActiveRoutingComplexityPolicy {
+        let mut selected = ActiveRoutingComplexityPolicy {
+            version: "routing-policy-default-v1".to_string(),
+            policy: self
+                .load_routing_complexity_policy_by_key(
+                    crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
+                )
+                .await,
+        };
+
+        let canary_state = self
+            .storage
+            .get(crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| {
+                serde_json::from_slice::<
+                    crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+                >(&raw)
+                .ok()
+            });
+        if let Some(state) = canary_state {
+            if !state.baseline_version.trim().is_empty() {
+                selected.version = state.baseline_version.clone();
+            }
+            if state.enabled
+                && crate::core::self_evolve::strategy_runtime::should_use_canary(
+                    &Self::prompt_seed_for_message(message),
+                    state.rollout_percent,
+                )
+            {
+                selected = ActiveRoutingComplexityPolicy {
+                    version: state.candidate_version,
+                    policy: self
+                        .load_routing_complexity_policy_by_key(
+                            crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY,
+                        )
+                        .await,
+                };
+            }
+        }
+
+        selected
+    }
+
+    pub(super) async fn active_routing_policy_version_for_message(&self, message: &str) -> String {
+        self.active_routing_complexity_policy_for_message(message)
+            .await
+            .version
+    }
+
     async fn classify_complexity_fallback(
         &self,
         message: &str,
     ) -> crate::core::task_router::RoutingDecision {
-        let policy = self.routing_complexity_policy().await;
+        let active_policy = self
+            .active_routing_complexity_policy_for_message(message)
+            .await;
         let complexity = crate::core::self_evolve::policy_evolution::classify_message_complexity(
-            &policy, message,
+            &active_policy.policy,
+            message,
         );
         crate::core::task_router::RoutingDecision {
             needs_delegation: false,
@@ -123,9 +186,9 @@ impl Agent {
             sub_agents: vec![],
             reasoning: "Structural fallback classification".to_string(),
             confidence: match complexity {
-                QueryComplexity::Complex => policy.complex_score_threshold,
-                QueryComplexity::Medium => policy.medium_score_threshold,
-                QueryComplexity::Simple => 1.0 - policy.medium_score_threshold,
+                QueryComplexity::Complex => active_policy.policy.complex_score_threshold,
+                QueryComplexity::Medium => active_policy.policy.medium_score_threshold,
+                QueryComplexity::Simple => 1.0 - active_policy.policy.medium_score_threshold,
             },
             should_clarify: false,
             clarification_question: None,

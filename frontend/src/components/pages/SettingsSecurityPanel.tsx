@@ -129,7 +129,7 @@ export function SettingsSecurityPanel({
                 >
                     <Box
                       className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "security" }}
+                      sx={{ minHeight: 0 }}
                     >
                       <Stack spacing={1}>
                         {renderSettingsSectionIntro({
@@ -155,12 +155,29 @@ export function SettingsSecurityPanel({
                         ) : hasCustomMasterPassword ? (
                           <Stack spacing={1.1}>
                             <Stack
+                              direction="row"
+                              spacing={0.75}
+                              sx={{ alignItems: "center" }}
+                            >
+                              <Chip
+                                size="small"
+                                color="success"
+                                variant="outlined"
+                                label="Custom password set"
+                              />
+                              <Typography
+                                variant="caption"
+                                sx={{ color: "text.secondary" }}
+                              >
+                                Sign-in protected · remote access can be enabled below.
+                              </Typography>
+                            </Stack>
+                            <Stack
                               direction={{ xs: "column", sm: "row" }}
                               spacing={1}
                             >
                               <Button
                                 variant="contained"
-                                size="large"
                                 onClick={() => openPasswordDialog("change")}
                                 disabled={passwordMutationPending}
                               >
@@ -169,7 +186,6 @@ export function SettingsSecurityPanel({
                               <Button
                                 color="error"
                                 variant="outlined"
-                                size="large"
                                 onClick={() => openPasswordDialog("remove")}
                                 disabled={passwordMutationPending}
                               >
@@ -177,13 +193,46 @@ export function SettingsSecurityPanel({
                               </Button>
                             </Stack>
                           </Stack>
-                        ) : null}
+                        ) : (
+                          <Stack spacing={1.1}>
+                            <Stack
+                              direction="row"
+                              spacing={0.75}
+                              sx={{ alignItems: "center" }}
+                            >
+                              <Chip
+                                size="small"
+                                variant="outlined"
+                                label="No custom password"
+                              />
+                              <Typography
+                                variant="caption"
+                                sx={{ color: "text.secondary" }}
+                              >
+                                Built-in encryption is active. Add a master password
+                                to gate sign-in and unlock remote access.
+                              </Typography>
+                            </Stack>
+                            <Stack
+                              direction={{ xs: "column", sm: "row" }}
+                              spacing={1}
+                            >
+                              <Button
+                                variant="contained"
+                                onClick={() => openPasswordDialog("set")}
+                                disabled={passwordMutationPending}
+                              >
+                                Set Master Password
+                              </Button>
+                            </Stack>
+                          </Stack>
+                        )}
                       </Stack>
                     </Box>
 
                     <Box
                       className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "abuse" }}
+                      sx={{ minHeight: 0 }}
                     >
                       <Stack spacing={1.1}>
                         {renderSettingsSectionIntro({
@@ -300,7 +349,7 @@ export function SettingsSecurityPanel({
                     {showInternalServiceSection ? (
                       <Box
                         className="list-shell"
-                        sx={{ minHeight: 0, gridArea: "internal" }}
+                        sx={{ minHeight: 0 }}
                       >
                       <Stack spacing={1.25}>
                         {renderSettingsSectionIntro({
@@ -465,7 +514,7 @@ export function SettingsSecurityPanel({
 
                     <Box
                       className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "remote" }}
+                      sx={{ minHeight: 0 }}
                     >
                       <Stack spacing={1.25}>
                         {renderSettingsSectionIntro({
@@ -743,97 +792,123 @@ export function SettingsSecurityPanel({
                                 }}
                               />
                             ) : null}
-                            <Stack
-                              direction={{ xs: "column", sm: "row" }}
-                              spacing={1}
-                              useFlexGap
-                              sx={{
-                                flexWrap: "wrap",
-                              }}
-                            >
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                onClick={handleTunnelProviderSave}
-                                disabled={tunnelSaveMutation.isPending}
+                            {/*
+                              Buttons grouped into two semantic rows:
+                                Row 1 — Configure: Save + Check setup
+                                Row 2 — Lifecycle: Start (primary) / Stop, plus
+                                        Copy / Open helpers only shown when a
+                                        URL actually exists.
+                            */}
+                            <Stack spacing={1}>
+                              <Stack
+                                direction={{ xs: "column", sm: "row" }}
+                                spacing={1}
+                                useFlexGap
+                                sx={{ flexWrap: "wrap" }}
                               >
-                                {tunnelSaveMutation.isPending
-                                  ? "Saving..."
-                                  : "Save"}
-                              </Button>
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                onClick={handleTunnelProviderTest}
-                                disabled={
-                                  tunnelSaveMutation.isPending ||
-                                  tunnelTestMutation.isPending
-                                }
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  onClick={handleTunnelProviderSave}
+                                  disabled={tunnelSaveMutation.isPending}
+                                >
+                                  {tunnelSaveMutation.isPending
+                                    ? "Saving..."
+                                    : "Save configuration"}
+                                </Button>
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  onClick={handleTunnelProviderTest}
+                                  disabled={
+                                    tunnelSaveMutation.isPending ||
+                                    tunnelTestMutation.isPending
+                                  }
+                                >
+                                  {tunnelTestMutation.isPending
+                                    ? "Checking..."
+                                    : "Check setup"}
+                                </Button>
+                              </Stack>
+                              <Stack
+                                direction={{ xs: "column", sm: "row" }}
+                                spacing={1}
+                                useFlexGap
+                                sx={{ flexWrap: "wrap", alignItems: "center" }}
                               >
-                                {tunnelTestMutation.isPending
-                                  ? "Checking..."
-                                  : "Check setup"}
-                              </Button>
-                              <Button
-                                size="small"
-                                variant="contained"
-                                onClick={handleTunnelStart}
-                                disabled={
-                                  tunnelSaveMutation.isPending ||
-                                  tunnelStartMutation.isPending ||
-                                  toBool(tunnel.active) ||
-                                  !selectedTunnelAvailable
-                                }
-                              >
-                                {tunnelStartMutation.isPending
-                                  ? "Starting..."
-                                  : getTunnelStartButtonLabel(
-                                      selectedTunnelMeta,
-                                      hasCustomMasterPassword,
-                                    )}
-                              </Button>
-                              <Button
-                                size="small"
-                                onClick={handleTunnelStop}
-                                disabled={
-                                  tunnelStopMutation.isPending ||
-                                  !toBool(tunnel.active)
-                                }
-                              >
-                                {tunnelStopMutation.isPending
-                                  ? "Stopping..."
-                                  : getTunnelStopButtonLabel(
-                                      selectedTunnelMeta,
-                                    )}
-                              </Button>
-                              <Button
-                                size="small"
-                                onClick={async () => {
-                                  const url = str(tunnel.url, "");
-                                  if (!url) return;
-                                  await navigator.clipboard.writeText(url);
-                                  setSuccess("Tunnel URL copied.");
-                                }}
-                                disabled={!str(tunnel.url, "").trim()}
-                              >
-                                Copy link
-                              </Button>
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                onClick={() => {
-                                  const url = str(tunnel.url, "").trim();
-                                  if (!url) return;
-                                  window.open(
-                                    url,
-                                    "_blank",
-                                    "noopener,noreferrer",
-                                  );
-                                }}
-                                disabled={!str(tunnel.url, "").trim()}
-                              >
-                                Open link
-                              </Button>
+                                {toBool(tunnel.active) ? (
+                                  <Button
+                                    size="small"
+                                    color="error"
+                                    variant="outlined"
+                                    onClick={handleTunnelStop}
+                                    disabled={tunnelStopMutation.isPending}
+                                  >
+                                    {tunnelStopMutation.isPending
+                                      ? "Stopping..."
+                                      : getTunnelStopButtonLabel(
+                                          selectedTunnelMeta,
+                                        )}
+                                  </Button>
+                                ) : (
+                                  <Button
+                                    size="small"
+                                    variant="contained"
+                                    onClick={handleTunnelStart}
+                                    disabled={
+                                      tunnelSaveMutation.isPending ||
+                                      tunnelStartMutation.isPending ||
+                                      !selectedTunnelAvailable
+                                    }
+                                  >
+                                    {tunnelStartMutation.isPending
+                                      ? "Starting..."
+                                      : getTunnelStartButtonLabel(
+                                          selectedTunnelMeta,
+                                          hasCustomMasterPassword,
+                                        )}
+                                  </Button>
+                                )}
+                                {str(tunnel.url, "").trim() ? (
+                                  <>
+                                    <Box
+                                      sx={{
+                                        width: 1,
+                                        height: 22,
+                                        background:
+                                          "var(--ui-rgba-255-255-255-080)",
+                                        mx: 0.25,
+                                      }}
+                                    />
+                                    <Button
+                                      size="small"
+                                      onClick={async () => {
+                                        const url = str(tunnel.url, "");
+                                        if (!url) return;
+                                        await navigator.clipboard.writeText(url);
+                                        setSuccess("Tunnel URL copied.");
+                                      }}
+                                    >
+                                      Copy link
+                                    </Button>
+                                    <Button
+                                      size="small"
+                                      variant="outlined"
+                                      onClick={() => {
+                                        const url = str(tunnel.url, "").trim();
+                                        if (!url) return;
+                                        window.open(
+                                          url,
+                                          "_blank",
+                                          "noopener,noreferrer",
+                                        );
+                                      }}
+                                    >
+                                      Open link
+                                    </Button>
+                                  </>
+                                ) : null}
+                              </Stack>
                             </Stack>
                             {advancedTunnelConfigFields.length > 0 ? (
                               <Accordion
@@ -920,7 +995,7 @@ export function SettingsSecurityPanel({
 
                     <Box
                       className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "vault" }}
+                      sx={{ minHeight: 0 }}
                     >
                       <Stack spacing={1}>
                         {renderSettingsSectionIntro({
@@ -1148,7 +1223,7 @@ export function SettingsSecurityPanel({
 
                     <Box
                       className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "privacy" }}
+                      sx={{ minHeight: 0 }}
                     >
                       <Stack spacing={1.5}>
                         {renderSettingsSectionIntro({

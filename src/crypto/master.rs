@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use super::{derive_key, generate_salt, KeyManager, KEY_LEN};
 
+pub const INSTALL_MASTER_SECRET_PATH: &str = "/run/secrets/agentark_master_key";
+
 /// Persisted master password metadata
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MasterMeta {
@@ -28,12 +30,16 @@ struct MasterMeta {
     /// True when this installation is using a generated bootstrap password.
     #[serde(default)]
     bootstrap: bool,
+    /// True when this installation is using the Docker install-managed secret.
+    #[serde(default)]
+    install_managed: bool,
 }
 
 pub struct PreparedMasterPassword {
     pub(crate) key_manager: Arc<KeyManager>,
     meta_json: String,
     bootstrap: bool,
+    install_managed: bool,
 }
 
 pub struct MasterPasswordManager {
@@ -55,6 +61,35 @@ impl MasterPasswordManager {
 
     fn keyfile_path(&self) -> PathBuf {
         self.config_dir.join(".keyfile")
+    }
+
+    pub fn read_install_master_secret() -> Result<Option<String>> {
+        let path = Path::new(INSTALL_MASTER_SECRET_PATH);
+        match std::fs::read_to_string(path) {
+            Ok(value) => {
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(anyhow!(
+                        "Install-managed encryption secret at {} is empty",
+                        INSTALL_MASTER_SECRET_PATH
+                    ));
+                }
+                Ok(Some(trimmed))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(anyhow!(
+                "Failed to read install-managed encryption secret at {}: {}",
+                INSTALL_MASTER_SECRET_PATH,
+                error
+            )),
+        }
+    }
+
+    pub fn docker_stack_requires_install_master_secret() -> bool {
+        std::env::var("AGENTARK_STACK_ROLE")
+            .ok()
+            .map(|role| role.trim().to_ascii_lowercase())
+            .is_some_and(|role| matches!(role.as_str(), "control" | "executor"))
     }
 
     fn derive_bootstrap_password(&self) -> Result<String> {
@@ -90,6 +125,13 @@ impl MasterPasswordManager {
         Ok(self.load_meta()?.bootstrap)
     }
 
+    pub fn is_install_managed_password_active(&self) -> Result<bool> {
+        if !self.is_password_set() {
+            return Ok(false);
+        }
+        Ok(self.load_meta()?.install_managed)
+    }
+
     pub fn bootstrap_password_if_active(&self) -> Result<Option<String>> {
         if self.is_bootstrap_password_active()? {
             Ok(Some(self.derive_bootstrap_password()?))
@@ -120,21 +162,22 @@ impl MasterPasswordManager {
         Ok(Arc::new(km))
     }
 
-    fn set_password_with_mode(&self, password: &str, bootstrap: bool) -> Result<Arc<KeyManager>> {
-        let prepared = self.prepare_password_with_mode(password, bootstrap)?;
-        let key = prepared.key_manager.clone();
-        self.commit_prepared_password(prepared)?;
-        Ok(key)
+    pub fn prepare_password(&self, password: &str) -> Result<PreparedMasterPassword> {
+        self.prepare_password_with_mode(password, false, false)
     }
 
-    pub fn prepare_password(&self, password: &str) -> Result<PreparedMasterPassword> {
-        self.prepare_password_with_mode(password, false)
+    pub fn prepare_install_managed_password(
+        &self,
+        password: &str,
+    ) -> Result<PreparedMasterPassword> {
+        self.prepare_password_with_mode(password, false, true)
     }
 
     fn prepare_password_with_mode(
         &self,
         password: &str,
         bootstrap: bool,
+        install_managed: bool,
     ) -> Result<PreparedMasterPassword> {
         // Generate separate salts for encryption and verification
         let enc_salt = generate_salt();
@@ -153,12 +196,14 @@ impl MasterPasswordManager {
             verification_hash: hex::encode(v_hash),
             version: 1,
             bootstrap,
+            install_managed,
         };
         let json = serde_json::to_string_pretty(&meta)?;
         Ok(PreparedMasterPassword {
             key_manager: Arc::new(km),
             meta_json: json,
             bootstrap,
+            install_managed,
         })
     }
 
@@ -169,16 +214,33 @@ impl MasterPasswordManager {
             tracing::info!(
                 "Bootstrap master password initialized (per-install, derived from local keyfile)"
             );
+        } else if prepared.install_managed {
+            tracing::info!("Master password initialized from install-managed Docker secret volume");
         } else {
             tracing::info!("Master password set - encryption keys derived from password");
         }
         Ok(())
     }
 
-    /// Set a master password (first time or overwrite)
-    /// Returns the new unified encryption key
-    pub fn set_password(&self, password: &str) -> Result<Arc<KeyManager>> {
-        self.set_password_with_mode(password, false)
+    /// Initialize from the install-managed secret without racing split services.
+    /// If another service wins the metadata write, this unlocks with the same
+    /// secret and the committed salts.
+    pub fn initialize_startup_password_if_needed(&self, password: &str) -> Result<Arc<KeyManager>> {
+        if self.is_password_set() {
+            return self.unlock(password);
+        }
+
+        let prepared = self.prepare_install_managed_password(password)?;
+        let key = prepared.key_manager.clone();
+        if crate::crypto::atomic_write_file_if_absent(
+            &self.meta_path(),
+            prepared.meta_json.as_bytes(),
+        )? {
+            tracing::info!("Master password initialized from install-managed startup secret");
+            return Ok(key);
+        }
+
+        self.unlock(password)
     }
 
     /// Initialize a per-install bootstrap password if no master password is configured.
@@ -188,7 +250,7 @@ impl MasterPasswordManager {
             return Ok(None);
         }
         let bootstrap_password = self.derive_bootstrap_password()?;
-        let prepared = self.prepare_password_with_mode(&bootstrap_password, true)?;
+        let prepared = self.prepare_password_with_mode(&bootstrap_password, true, false)?;
         let key = prepared.key_manager.clone();
 
         if crate::crypto::atomic_write_file_if_absent(
@@ -276,7 +338,9 @@ mod tests {
 
         assert!(!mgr.is_password_set());
 
-        let key = mgr.set_password("test-password-123").unwrap();
+        let prepared = mgr.prepare_password("test-password-123").unwrap();
+        let key = prepared.key_manager.clone();
+        mgr.commit_prepared_password(prepared).unwrap();
         assert!(mgr.is_password_set());
         assert!(!mgr.is_bootstrap_password_active().unwrap());
 
@@ -360,11 +424,70 @@ mod tests {
     }
 
     #[test]
+    fn install_managed_secret_initializes_without_keyfile_bootstrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MasterPasswordManager::new(tmp.path(), tmp.path());
+
+        let key = mgr
+            .initialize_startup_password_if_needed("install-secret")
+            .unwrap();
+
+        assert!(mgr.is_password_set());
+        assert!(!mgr.is_bootstrap_password_active().unwrap());
+        assert!(mgr.is_install_managed_password_active().unwrap());
+        assert!(!tmp.path().join(".keyfile").exists());
+
+        let unlocked = mgr.unlock("install-secret").unwrap();
+        let ciphertext = key.encrypt(b"install-managed").unwrap();
+        let decrypted = unlocked.decrypt(&ciphertext).unwrap();
+        assert_eq!(&decrypted[..], b"install-managed");
+    }
+
+    #[test]
+    fn install_managed_initialization_is_atomic_across_concurrent_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = std::sync::Arc::new(MasterPasswordManager::new(tmp.path(), tmp.path()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        let handles = (0..8)
+            .map(|_| {
+                let mgr = mgr.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    mgr.initialize_startup_password_if_needed("install-secret")
+                        .expect("install-managed init should succeed")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let keys = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread should complete"))
+            .collect::<Vec<_>>();
+
+        assert!(mgr.is_install_managed_password_active().unwrap());
+        assert!(!tmp.path().join(".keyfile").exists());
+        let canonical = mgr
+            .unlock("install-secret")
+            .expect("install secret should unlock");
+        let ciphertext = canonical.encrypt(b"install-race-roundtrip").unwrap();
+
+        for key in keys {
+            let decrypted = key
+                .decrypt(&ciphertext)
+                .expect("all callers should share one key");
+            assert_eq!(&decrypted[..], b"install-race-roundtrip");
+        }
+    }
+
+    #[test]
     fn test_remove_password() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = MasterPasswordManager::new(tmp.path(), tmp.path());
 
-        mgr.set_password("my-password").unwrap();
+        let prepared = mgr.prepare_password("my-password").unwrap();
+        mgr.commit_prepared_password(prepared).unwrap();
         assert!(mgr.is_password_set());
 
         let _new_key = mgr.remove_password().unwrap();

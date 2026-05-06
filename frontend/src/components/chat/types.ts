@@ -11,6 +11,69 @@ export interface ChatPayloadView {
   lineCount: number;
 }
 
+export type SurfaceStatus = "pending" | "running" | "done" | "error" | "waiting";
+
+export type SurfaceFallback = "generic-artifact" | "text" | "json" | "activity" | "trace";
+
+export interface SurfacePayload {
+  role: string;
+  contentType: string;
+  text?: string;
+  json?: unknown;
+  uri?: string;
+  path?: string;
+  preview?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SurfaceArtifact {
+  id: string;
+  role: string;
+  contentType: string;
+  label?: string;
+  text?: string;
+  json?: unknown;
+  uri?: string;
+  path?: string;
+  preview?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SurfaceDescriptor {
+  protocolVersion: 1;
+  renderer: {
+    id: string;
+    version: number;
+    fallback: SurfaceFallback;
+  };
+  call: {
+    runId?: string;
+    callId: string;
+    sequence?: number;
+    parentStepId?: string;
+  };
+  tool?: {
+    id: string;
+    displayName?: string;
+  };
+  status: SurfaceStatus;
+  title?: string;
+  capabilities?: string[];
+  input?: SurfacePayload[];
+  output?: SurfacePayload[];
+  artifacts?: SurfaceArtifact[];
+  timing?: {
+    startedAt?: string;
+    completedAt?: string;
+    updatedAt?: string;
+  };
+  error?: {
+    code?: string;
+    message: string;
+    detail?: unknown;
+  };
+}
+
 export interface ChatStepCard {
   id: string;
   index: number;
@@ -26,6 +89,7 @@ export interface ChatStepCard {
   payloadView: ChatPayloadView | null;
   isHeartbeat: boolean;
   time: string;
+  surface?: SurfaceDescriptor | null;
 }
 
 export interface ComputerPaneFile {
@@ -33,14 +97,8 @@ export interface ComputerPaneFile {
   content: string;
 }
 
-export type ComputerViewKind =
-  | "terminal"
-  | "file"
-  | "browse"
-  | "search"
-  | "app_deploy"
-  | "status";
+export type ComputerViewKind = string;
 
-export type ComputerPaneTab = "computer" | "activity" | "trace";
+export type ComputerPaneTab = "computer" | "files" | "activity";
 
 export type ChipStatus = "running" | "done" | "issue" | "idle";

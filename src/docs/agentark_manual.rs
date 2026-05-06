@@ -1,20 +1,20 @@
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BundledHelpSection {
+pub(crate) struct AgentArkManualSection {
     pub label: &'static str,
     pub items: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BundledHelpDoc {
+pub(crate) struct AgentArkManualDoc {
     pub title: &'static str,
     pub slug: &'static str,
     pub tags: &'static [&'static str],
     pub summary: &'static str,
-    pub sections: &'static [BundledHelpSection],
+    pub sections: &'static [AgentArkManualSection],
 }
 
-pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
-    BundledHelpDoc {
+pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
+    AgentArkManualDoc {
         title: "What AgentArk is",
         slug: "what-agentark-is",
         tags: &[
@@ -28,7 +28,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Not an agent. An Ark for agents: build from prompts and tools, deploy as apps, automations, or watchers, monitor every action, secure every boundary, self-evolve from your usage.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "core inversion",
                 items: &[
                     "AgentArk is not itself an agent. It is the runtime that agents live inside.",
@@ -36,7 +36,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Ark is the security layer. It is the wrapper that contains, observes, and enforces what those agents are allowed to do, and the audit surface where every action becomes reviewable.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what the Ark does",
                 items: &[
                     "Build: assemble agents from structured prompts, action schemas, connected tools, and integrations registered through the action catalog.",
@@ -46,7 +46,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Self-evolve: prompts, classifiers, routing policies, and specialist behavior tune themselves from your own usage signals; ArkEvolve reviews changes before they ship.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "why the inversion matters",
                 items: &[
                     "Most agent products are agents. AgentArk is the platform around them.",
@@ -57,7 +57,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Install and first run",
         slug: "install-and-first-run",
         tags: &[
@@ -71,7 +71,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Two supported starts: Docker Compose or source build. After startup, finish model setup, embeddings, security, and the first delivery channel.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "docker",
                 items: &[
                     "Clone the repo and enter it.",
@@ -80,7 +80,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Complete the first-run setup.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "source",
                 items: &[
                     "Set `AGENTARK_DATABASE_URL` to a working Postgres instance.",
@@ -89,7 +89,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Open `http://localhost:8990` if you started headless.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "checklist",
                 items: &[
                     "Configure at least one LLM in Settings > Models.",
@@ -100,7 +100,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Enable the Daily Brief once the selected channel is ready.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "The web UI opens without the no-model-configured warning.",
@@ -111,7 +111,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Configured integrations or channels show connected or configured instead of not configured.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer order",
                 items: &[
                     "How to start the product.",
@@ -124,7 +124,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "User/system data contract",
         slug: "user-system-data-contract",
         tags: &[
@@ -140,7 +140,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "AgentArk separates personal runtime data from release-owned system files so upgrades can refresh the app without overwriting custom state.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "user-owned",
                 items: &[
                     "`/app/data/**`.",
@@ -152,7 +152,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "`/app/data/cli_skills/**`.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "system-owned",
                 items: &[
                     "Built-in prompt bundles.",
@@ -160,7 +160,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Default extension packs.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "release rule",
                 items: &[
                     "Release updates may replace system-owned files.",
@@ -171,7 +171,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Skill imports and semantic security review",
         slug: "skill-imports-and-semantic-security-review",
         tags: &[
@@ -185,11 +185,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Imported SKILL.md content is reviewed by the configured model for security capabilities, then a deterministic policy decides whether the skill can be installed or updated.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Skills.", "Custom skill import and update flows."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "review model",
                 items: &[
                     "The configured model classifies what the skill wants to do into a stable security capability vocabulary.",
@@ -198,7 +198,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Unknown high-risk behavior is treated conservatively instead of being silently accepted.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "capability examples",
                 items: &[
                     "Examples include environment reads, file reads or writes, network calls, shell execution, package install, lifecycle hooks, clipboard use, browser automation, encoded payloads, persistence changes, keystroke capture, screen/audio/camera capture, and secret requests.",
@@ -206,7 +206,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Declared capabilities from manifests, plugins, packs, and runtime bindings should map into the same vocabulary where possible.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "install and update behavior",
                 items: &[
                     "New skill imports run semantic review before signing and persistence.",
@@ -215,7 +215,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Skills changed on disk outside the reviewed API path must be re-imported or updated through the reviewed flow before they can run.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "operator review",
                 items: &[
                     "The import response can show capabilities, matched rules, review model, and review summary.",
@@ -223,7 +223,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "A clean import review is not a permanent trust grant for future edits; modified skill content needs a fresh review.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rules",
                 items: &[
                     "Do not describe skill security as exact phrase or regex scanning.",
@@ -233,7 +233,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Settings and navigation map",
         slug: "settings-and-navigation",
         tags: &[
@@ -246,7 +246,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Use exact UI paths when users ask where to configure something in __PRODUCT_NAME__.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "primary areas",
                 items: &[
                     "Mission Control / Chat: main operator workflow, overview, execution, approvals, and alerts.",
@@ -272,7 +272,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Settings > Security / Advanced: security controls and expert settings.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "routing guidance",
                 items: &[
                     "Credentials go to Settings.",
@@ -295,7 +295,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Health findings and remediation use ArkPulse in Ark Core.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rule",
                 items: &[
                     "For where-do-I-configure-X questions, answer with the exact path first and then the steps.",
@@ -303,7 +303,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Companion devices",
         slug: "companion-devices",
         tags: &[
@@ -321,11 +321,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Settings > Integrations > Companion Devices pairs scoped devices such as iPhone, Android, desktops, home servers, Raspberry Pi, and custom agents without turning them into admin sessions.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Settings > Integrations > Companion Devices."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what it is",
                 items: &[
                     "Companion devices are paired execution surfaces with explicit capability grants.",
@@ -334,7 +334,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Pairing establishes identity; grants define allowed capabilities; approvals allow a specific sensitive action to run now.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "security boundaries",
                 items: &[
                     "A companion device is not a UI session, admin session, or API key.",
@@ -350,7 +350,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Command results from a companion are recorded as device-reported unless a future native verifier proves the OS action happened.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "setup flow",
                 items: &[
                     "Choose a preset or Custom Device.",
@@ -362,7 +362,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Active devices send a pulse message for liveness; missed pulses are operational/security signals, not permission changes.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "commands",
                 items: &[
                     "Companion commands are typed JSON actions with capability, action id, arguments, requested scopes, and resource scope.",
@@ -371,7 +371,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "High-risk typed commands should create an approval request instead of dispatching directly.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "when answering users",
                 items: &[
                     "If the user asks where to connect an iPhone or another device, lead with Settings > Integrations > Companion Devices.",
@@ -382,7 +382,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Mission Control, chat, and approvals",
         slug: "mission-control-chat-and-approvals",
         tags: &[
@@ -394,7 +394,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Chat is the main command surface. Mission Control is the daily overview for approvals, live work, highlights, suggestions, and attention items.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "entry points",
                 items: &[
                     "Chat is where users ask questions, draft, summarize, research, browse, code, call tools, or start multi-step work.",
@@ -402,7 +402,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Older Inbox references now map to Mission Control attention surfaces.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "how to use",
                 items: &[
                     "Start in Chat when the user wants help right away.",
@@ -410,14 +410,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Return to Mission Control when AgentArk is waiting for approval or has surfaced something that needs review.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what belongs where",
                 items: &[
                     "Chat: questions, drafts, summaries, research, browser work, coding, tool execution, and starting new tasks.",
                     "Mission Control: daily overview, suggestions, approvals, alerts, review items, and operational shortcuts.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "Tasks that need approval appear in Mission Control and in the related Tasks flow.",
@@ -427,7 +427,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Chat shortcuts and safe actions",
         slug: "chat-shortcuts-and-safe-actions",
         tags: &[
@@ -441,14 +441,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "These are optional high-frequency shortcuts, not the only valid phrasing. Normal natural-language requests should still route through the usual path.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "credentials",
                 items: &[
                     "Use the secure credential form shown in chat or the credential fields in Settings.",
                     "Credential flows keep values encrypted and out of normal model-visible arguments and traces.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "notifications",
                 items: &[
                     "`/notifications pause`.",
@@ -456,14 +456,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "`/notifications status`.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "delegation",
                 items: &[
                     "`/delegate <task description>`.",
                     "Use the explicit `/delegate` command when you want to force multi-agent delegation.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "rollback",
                 items: &[
                     "`/rollback task:<uuid>`.",
@@ -472,7 +472,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Natural-language variants like `undo watcher:<uuid>` may also work.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "constraints",
                 items: &[
                     "These shortcuts are intentionally conservative.",
@@ -482,17 +482,17 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Models and provider setup",
         slug: "models-and-provider-setup",
         tags: &["models", "providers", "llm", "setup", "routing", "research"],
         summary: "Settings > Models configures the model pool for normal chat, coding, research, fallback behavior, and the separate embeddings path.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Settings > Models."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "recommended setup",
                 items: &[
                     "Add one Primary model slot first.",
@@ -502,7 +502,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Save settings and confirm the slot is enabled.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "embeddings",
                 items: &[
                     "Settings > Models > Embeddings is separate from chat model slots.",
@@ -512,7 +512,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "User-managed Ollama can be used there if the user points __PRODUCT_NAME__ at it explicitly, but Ollama is not bundled for embeddings by default.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "roles",
                 items: &[
                     "Primary: general default.",
@@ -522,7 +522,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Fallback: used if the preferred slot fails.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "Settings > Models shows at least one enabled slot.",
@@ -532,7 +532,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The Embeddings tab shows disabled, a ready local model, or a reachable external endpoint.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "Saved but unavailable at runtime usually means the provider key or base URL is missing or invalid.",
@@ -543,7 +543,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Embeddings and retrieval",
         slug: "embeddings-and-retrieval",
         tags: &[
@@ -557,11 +557,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Settings > Models > Embeddings configures retrieval-backed features such as memory lookup, document search, and other semantic matching flows.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Settings > Models > Embeddings."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "how it works",
                 items: &[
                     "Chat model slots and embeddings are separate.",
@@ -570,7 +570,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The default embedding mode is the Local isolated sidecar.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "local setup",
                 items: &[
                     "Provider: local built-in Hugging Face embeddings.",
@@ -579,7 +579,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The model is managed by __PRODUCT_NAME__ and initializes on first dense retrieval use.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "external embeddings",
                 items: &[
                     "External is optional.",
@@ -587,7 +587,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "User-managed Ollama can be used here if the user points __PRODUCT_NAME__ at it explicitly.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "health",
                 items: &[
                     "Ready means the local model or external endpoint is healthy.",
@@ -595,7 +595,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Unreachable or Failed means retrieval-backed features are not healthy enough yet.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "The Embeddings tab shows a healthy backend.",
@@ -603,7 +603,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Document search, memory lookup, and related context features do not report embedding health failures.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "Chat can work while retrieval still feels weak if embeddings are unhealthy.",
@@ -613,7 +613,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Media generation providers",
         slug: "media-generation-providers",
         tags: &[
@@ -626,11 +626,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Settings > Media configures image and video generation providers, their API keys, defaults, and fallbacks.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Settings > Media."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what is here",
                 items: &[
                     "Provider API keys for supported media backends.",
@@ -640,7 +640,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Fallback video provider.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "setup",
                 items: &[
                     "Save the API key for the provider you want to use.",
@@ -650,14 +650,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Save settings.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "Settings > Media shows configured providers instead of No media providers.",
                     "Image or video tasks stop failing for missing provider credentials.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "A provider key can exist even when no default provider was selected.",
@@ -667,7 +667,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Messaging channels and daily brief",
         slug: "messaging-channels-and-daily-brief",
         tags: &[
@@ -684,11 +684,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Settings > Integrations > Messaging Channels configures where __PRODUCT_NAME__ reaches the user and where the Daily Brief is delivered.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Settings > Integrations > Messaging Channels."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "channels",
                 items: &[
                     "Bundled channels include Telegram, Slack, Discord, Matrix, Teams, WhatsApp, Google Chat, Signal, iMessage, LINE, WeChat, QQ, and Email.",
@@ -696,7 +696,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Unconfigured custom messaging channels are not exposed to the agent's notification chooser until their required credentials are saved.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "setup",
                 items: &[
                     "Enable the channel you want.",
@@ -707,7 +707,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Check the status card until it changes from Not configured to a ready state.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "daily brief",
                 items: &[
                     "The Daily Brief section lives in the same Messaging Channels area.",
@@ -716,7 +716,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Custom Messaging Channels can be selected for delivery after they are configured and pass the registry readiness check.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "The channel card reads Ready to deliver instead of Needs target or Not configured.",
@@ -725,7 +725,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "A test run arrives in the selected channel once delivery is fully configured.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "Credentials may be saved without a recipient or room target.",
@@ -735,17 +735,17 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Prebuilt connectors and integration quickstarts",
         slug: "prebuilt-connectors-and-integration-quickstarts",
         tags: &["integrations", "connectors", "oauth", "setup", "status"],
         summary: "Settings > Integrations > Prebuilt Connectors is the standard path for built-in service integrations such as Google Workspace, GitHub, Notion, Twilio, Moltbook, and others. User-added pack-based integrations live in the separate Custom Integrations panel.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Settings > Integrations > Prebuilt Connectors."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "standard flow",
                 items: &[
                     "Pick the connector you want.",
@@ -754,7 +754,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Re-check the connector status.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "status",
                 items: &[
                     "Not configured: required secret or config is missing.",
@@ -763,7 +763,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Error: connector responded, but the current config failed.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "guidance",
                 items: &[
                     "Gmail and Google Workspace have a dedicated bundled doc because provider-side setup is more detailed.",
@@ -772,14 +772,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Some connectors do not expose a strong background feed, so Watchers or Webhooks may be better for proactive behavior.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "The connector moves to Connected.",
                     "__PRODUCT_NAME__ can use the related tool or action without re-asking for setup.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "A secret can be saved while the dispatch toggle is still off.",
@@ -789,7 +789,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Custom integrations and extension packs",
         slug: "custom-integrations-and-extension-packs",
         tags: &[
@@ -806,11 +806,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Settings > Integrations > Custom Integrations is the user-managed surface for pack-based integrations that are installed, imported, or scaffolded separately from built-in connectors.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Settings > Integrations > Custom Integrations."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what belongs here",
                 items: &[
                     "Use this panel for user-added integrations such as Linear, ClickUp, HubSpot, or internal APIs when they are not a built-in connector.",
@@ -818,7 +818,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Once installed and enabled, pack features can become normal agent-usable actions instead of staying a one-off import.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "how to add one",
                 items: &[
                     "Ask in chat to install the integration you want, or open Settings > Integrations > Custom Integrations and add it there.",
@@ -826,7 +826,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If the service already exists as a bundled or catalog pack, install that pack first; otherwise scaffold a draft pack and review the generated bindings.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "connect and authenticate",
                 items: &[
                     "After install, open the custom integration card and complete Setup or Connect.",
@@ -835,7 +835,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Secrets for custom integrations should be stored encrypted and associated with the integration connection rather than treated as plain chat content.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "manage and verify",
                 items: &[
                     "Use the card actions or overflow menu to enable or disable the integration, test setup, review runtime status, open Setup again, inspect recent runs, or remove it.",
@@ -844,7 +844,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "A healthy custom integration appears in Installed, shows a ready-like status, and can be used by the agent without repeating setup each time.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "security review",
                 items: &[
                     "Pack manifests, plugin bindings, and custom integration actions should declare or derive machine capabilities that map into the shared security vocabulary.",
@@ -852,7 +852,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Review any pack that combines sensitive reads, shell or code execution, file writes, persistence, network delivery, or secret access.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "status meanings",
                 items: &[
                     "Needs setup: the pack is installed but still missing credentials, OAuth completion, or another required connection step.",
@@ -861,7 +861,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Draft or Needs attention: the pack exists but still needs review, correction, or a connection fix before depending on it.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "Different services can resolve to multiple install paths or auth architectures, so confirm the target when the request is ambiguous.",
@@ -870,7 +870,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The wrong workspace, tenant, or account can be connected even when the auth flow technically succeeds.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rule",
                 items: &[
                     "If the user asks how to add an unsupported service integration, answer with the Custom Integrations path first, then the install, connect, verify, and management flow.",
@@ -879,7 +879,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Add Gmail access through Google Workspace",
         slug: "gmail-google-workspace",
         tags: &[
@@ -892,7 +892,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Preferred path: connect Google Workspace once, then use Gmail and Calendar access from the same Google sign-in.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "inside __PRODUCT_NAME__",
                 items: &[
                     "Open Settings > Integrations > Prebuilt Connectors.",
@@ -904,7 +904,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Return to __PRODUCT_NAME__ and verify Google Workspace shows connected.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "in Google Cloud",
                 items: &[
                     "Create or select a Google Cloud project.",
@@ -915,7 +915,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Enable the APIs that match your selected bundles, including Gmail API for Gmail access.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "Google Workspace no longer says not configured or needs auth.",
@@ -923,7 +923,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "__PRODUCT_NAME__ can list Gmail or use Google Workspace helper actions without asking for setup again.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "Redirect URI mismatch is the most common issue; it must exactly match the origin and `/oauth/callback` path used by this deployment.",
@@ -931,7 +931,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Missing Gmail API or wrong bundle selection will leave Gmail unavailable.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "preference",
                 items: &[
                     "If the user asks specifically for Gmail access, prefer this Google Workspace path unless they explicitly want the separate legacy Gmail-only connector.",
@@ -939,17 +939,17 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Run Moltbook for the first time",
         slug: "moltbook-first-run",
         tags: &["moltbook", "social", "integrations", "setup", "run"],
         summary: "Moltbook uses its own top-level page for API key setup, status, and run-now controls.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "path",
                 items: &["Top-level Moltbook page."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "steps",
                 items: &[
                     "Open the Moltbook page from the main navigation.",
@@ -961,7 +961,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Click Run now when you want an immediate run.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what the page shows",
                 items: &[
                     "Whether Moltbook is enabled.",
@@ -971,7 +971,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Whether the stored key is missing or failing authentication.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "After a successful run, the page shows recent Moltbook activity instead of No Moltbook runs yet.",
@@ -979,7 +979,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If posting is enabled and safe, the activity log shows run steps and any created post links.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "No API key configured.",
@@ -987,7 +987,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Disabled mode prevents runs even when config exists.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rule",
                 items: &[
                     "If the user asks how to run Moltbook, answer with the top-level Moltbook path, key setup, save, run-now, and verification steps.",
@@ -995,7 +995,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Library, memory, documents, and MCP",
         slug: "library-memory-documents-and-mcp",
         tags: &[
@@ -1010,7 +1010,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Library, memory, documents, and MCP are related but distinct surfaces.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "paths",
                 items: &[
                     "Library > Documents.",
@@ -1023,18 +1023,18 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Settings > Knowledge > MCP Servers.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "how to think about them",
                 items: &[
                     "Library > Documents is for uploaded files and indexed document context.",
                     "Facts are durable facts the system has stored.",
                     "Preferences are long-lived user preferences and rules.",
                     "User Data is for captured notes, links, and user-supplied structured data.",
-                    "Knowledge is for reusable knowledge-base items, including bundled product-help docs after sync.",
+                    "Knowledge is for reusable knowledge-base items, including AgentArk manual and capability entries after sync.",
                     "MCP Servers are external tool servers that extend what __PRODUCT_NAME__ can access.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "when to use each",
                 items: &[
                     "Use Library > Documents for file upload and search.",
@@ -1044,7 +1044,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use Settings > Knowledge > MCP Servers when you want to add or manage external MCP-backed tools.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "Uploaded files appear in Library > Documents.",
@@ -1052,7 +1052,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Enabled MCP servers appear in the MCP list and expose their tools or resources.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "common confusion",
                 items: &[
                     "Documents are file-centric; Knowledge is reusable KB content.",
@@ -1062,17 +1062,17 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Tasks, watchers, goals, and apps",
         slug: "tasks-watchers-goals-and-apps",
         tags: &["tasks", "watchers", "goals", "apps", "automation", "deploy"],
         summary: "Tasks, Watchers, Goals, and Apps are different top-level operational surfaces.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pages",
                 items: &["Tasks.", "Watchers.", "Goals.", "Apps."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "differences",
                 items: &[
                     "Tasks are one-off or recurring work with queue state, approvals, and retries.",
@@ -1082,7 +1082,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Apps are built artifacts, deployed surfaces, runtime state, and public or local links.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "recommended usage",
                 items: &[
                     "Use Tasks when the work should run later or on a schedule.",
@@ -1091,7 +1091,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use Apps when the agent built or deployed a website, dashboard, or service.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "states",
                 items: &[
                     "Tasks can be pending, awaiting approval, running, paused, input needed, completed, failed, or cancelled.",
@@ -1100,7 +1100,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Apps can be enabled or disabled, running or stopped, and guarded or public.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "A scheduled job appears in Tasks.",
@@ -1109,7 +1109,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "A successful deployment appears in Apps with at least one local or public URL.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "A task can exist but still be waiting for approval in Mission Control.",
@@ -1120,7 +1120,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Input needed and unattended runs",
         slug: "input-needed-and-unattended-runs",
         tags: &[
@@ -1134,28 +1134,28 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Input needed means an unattended or background run could not continue safely because required fields, targets, or secrets were missing.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "surfaces",
                 items: &[
                     "Main surface: Tasks.",
                     "Related surfaces: Notifications and Trace.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "core rule",
                 items: &[
                     "If the user is present in chat, __PRODUCT_NAME__ can ask follow-up questions.",
                     "If the run is unattended, scheduled, or backgrounded, __PRODUCT_NAME__ should not guess missing critical inputs.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what it means",
                 items: &[
                     "The run paused instead of inventing missing values.",
                     "The task should show the missing fields and guidance for how to fix them.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "where to fix",
                 items: &[
                     "Non-secret inputs are fixed in Tasks using the task detail and input-edit flow.",
@@ -1163,7 +1163,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Connector-specific credentials must be fixed in the relevant integration settings first.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "resume",
                 items: &[
                     "Open the affected task in Tasks.",
@@ -1172,7 +1172,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Resume or retry after the missing inputs are available.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "why fail closed",
                 items: &[
                     "Guessing can change who or what gets acted on.",
@@ -1180,7 +1180,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Failing closed is safer than performing the wrong action unattended.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "examples",
                 items: &[
                     "Chat run: __PRODUCT_NAME__ can ask which repo or which thread.",
@@ -1189,7 +1189,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "App deploy and access guard",
         slug: "app-deploy-and-access-guard",
         tags: &[
@@ -1202,7 +1202,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "App deployment is primarily chat-driven, and deployed apps are managed in the top-level Apps page.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "main places",
                 items: &[
                     "Ask in Chat to build or deploy an app.",
@@ -1210,7 +1210,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use Settings > Advanced > App Deploy Defaults to control the default deploy-guard behavior for new app deploys.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "deployment flow",
                 items: &[
                     "Ask __PRODUCT_NAME__ in chat to build or deploy the app or repo.",
@@ -1219,7 +1219,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use restart, stop, delete, or guard controls from the app card when needed.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "access guard",
                 items: &[
                     "Access guard protects a deployed app with an access password.",
@@ -1228,7 +1228,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If guard is enabled, visitors must provide the access password before viewing the app.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "A successful deploy produces a local URL and sometimes a public URL.",
@@ -1236,7 +1236,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If guard is enabled, the app card says guard is enabled and the visitor flow requests the key.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "Deployment can succeed partially while the runtime fails to start.",
@@ -1246,7 +1246,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Environment, deployment, and investigation",
         slug: "environment-deployment-and-investigation",
         tags: &[
@@ -1265,7 +1265,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Use this when the user asks where this instance is running, what it can access, what is connected, or how to inspect live runtime state safely.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "core rule",
                 items: &[
                     "Lead with confirmed live state when available, not stale docs alone.",
@@ -1273,7 +1273,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If deployment topology, permissions, or connected systems cannot be confirmed live, say they were not confirmed instead of guessing.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what can be inspected live",
                 items: &[
                     "Current workspace, config/data locations, and managed app roots when the runtime exposes them.",
@@ -1283,7 +1283,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Memory, knowledge, document, and approval/permission state that the instance already tracks.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "where to inspect",
                 items: &[
                     "Start in Chat with the current runtime access summary and action catalog because they are request-scoped live clues.",
@@ -1293,7 +1293,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use Settings > Security, Settings > Advanced, and Settings > Observability for approvals, runtime policy, export, and deploy defaults.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "permissions and approvals",
                 items: &[
                     "Having an action or connector available is not the same thing as having approval to execute every side effect.",
@@ -1302,7 +1302,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Secret values stay encrypted and should never be surfaced as plain-text answers.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "deployment and memory caveats",
                 items: &[
                     "Public app reachability depends on deployment state, tunnel/exposure setup, and access guard.",
@@ -1310,7 +1310,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If the user asks for exact machine memory ceilings, verify from the live runtime or container/orchestrator layer rather than inferring from static product docs.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer order",
                 items: &[
                     "What is confirmed live right now.",
@@ -1320,7 +1320,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "ArkReflect retrospectives",
         slug: "arkreflect-retrospectives",
         tags: &[
@@ -1340,7 +1340,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "ArkReflect is the Ark Core panorama for understanding a selected day, week, or month: where work clustered, what sources contributed, how background agents helped, and what patterns stood out.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "where it lives",
                 items: &[
                     "Open Ark Core > ArkReflect in the web UI.",
@@ -1348,7 +1348,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The page is intentionally a broad personal recap, not a raw analytics table.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what it shows",
                 items: &[
                     "A plain-language narrative summary of the selected period.",
@@ -1360,7 +1360,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "An examples drawer that keeps technical evidence available without forcing it into the novice-first view.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "data model",
                 items: &[
                     "ArkReflect does not store raw per-message chat embeddings.",
@@ -1369,7 +1369,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Raw source records remain in their owning systems; ArkReflect caches only the derived work-unit view needed for fast recaps.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "API queries",
                 items: &[
                     "Read cached data with `GET /reflect?period=weekly&from=2026-05-01T00:00:00Z&to=2026-05-08T00:00:00Z`.",
@@ -1379,7 +1379,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The response includes `clusters`, `source_counts`, `baseline_source_counts`, `embedding_status`, `refresh_status`, `cache_status`, `related_history`, and `unclustered_units`.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "runtime behavior",
                 items: &[
                     "`GET /reflect` should be treated as a cached read. Do not expect it to scan all sources, embed, and cluster inline.",
@@ -1390,7 +1390,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If semantic embeddings are unavailable, ArkReflect can still show source-aware activity summaries while semantic grouping catches up.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rules",
                 items: &[
                     "When the user asks what they worked on in a day, week, or month, point to ArkReflect before Trace or Analytics unless they specifically need a single run or cost breakdown.",
@@ -1401,7 +1401,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Trace, analytics, and ArkPulse",
         slug: "trace-analytics-and-arkpulse",
         tags: &[
@@ -1416,11 +1416,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Trace, Analytics, ArkReflect, and ArkPulse are separate surfaces for execution history, aggregate metrics, personal retrospectives, and operational health.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pages",
                 items: &["Trace.", "Analytics.", "ArkReflect.", "ArkPulse."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what each one is for",
                 items: &[
                     "Trace shows step-by-step execution history for what the agent actually did.",
@@ -1429,7 +1429,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "ArkPulse shows operational health and fix guidance across the instance.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "prompt telemetry in Trace",
                 items: &[
                     "Recent primary-agent runs can include a `Prompt Telemetry` trace step.",
@@ -1437,7 +1437,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use Trace for a single run when the question is what was sent to the model or which prompt section dominated that request.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "how to use them",
                 items: &[
                     "Open Trace when the user asks what the agent did or when a run needs debugging.",
@@ -1447,7 +1447,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Open ArkPulse when the user asks whether the system is healthy or wants guided remediation for operational findings.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "ArkPulse specifics",
                 items: &[
                     "ArkPulse can surface findings about runtime state, apps, tunnels, and related health issues.",
@@ -1455,7 +1455,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Advisory-only findings still need manual action.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "A recent run creates a trace entry.",
@@ -1463,7 +1463,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "ArkPulse shows either findings or a clean recent run state.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "Analytics is not the right place for a single failed run; use Trace.",
@@ -1475,7 +1475,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "ArkEvolve and self-learning",
         slug: "self-learning-and-evolution",
         tags: &[
@@ -1492,7 +1492,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "ArkEvolve is the top-level page for local memory-driven learning, impact, canary tests, and review; Settings > Advanced holds ArkSentinel and ArkEvolve switches.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "learning pipeline",
                 items: &[
                     "Completed or degraded runs are recorded as provisional experience runs.",
@@ -1505,7 +1505,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "This pipeline is offline-first personalization through local memory, retrieval context, prompts, routing, and policy state; it does not imply continuous base-model weight updates by default.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "self-evolve",
                 items: &[
                     "Self-evolve focuses on improved routing-policy generation and testing, not silent retraining of the base model.",
@@ -1514,7 +1514,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Promotion mode, last promotion result, and canary state show rollout stage.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "parameter-updating learning",
                 items: &[
                     "If a deployment adds learning that changes model parameters, describe it as a separate higher-risk capability.",
@@ -1522,7 +1522,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "For federated learning setups, require secure aggregation and privacy protections before making stronger claims.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "ArkEvolve page",
                 items: &[
                     "ArkEvolve > What happened explains recent tested or promoted changes in plain language.",
@@ -1533,7 +1533,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "ArkEvolve > Controls keeps developer-mode canary actions; Settings > Advanced holds ArkEvolve and ArkSentinel switches plus app deploy defaults.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "ArkSentinel",
                 items: &[
                     "Background learning is the live operational status view for heuristic reflection, experience consolidation, pattern induction, and candidate generation.",
@@ -1541,7 +1541,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use ArkSentinel > Background learning to inspect whether queued learning jobs are running and what changed recently.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rules",
                 items: &[
                     "If the user asks how self-learning works, explain the pipeline first and then the current instance status.",
@@ -1555,7 +1555,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "ArkEvolve GEPA background optimizer",
         slug: "arkevolve-gepa-background-optimizer",
         tags: &[
@@ -1572,7 +1572,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "GEPA is the bundled ArkEvolve prompt optimizer. It runs in the background after AgentArk is quiet, uses the same active model configured in Settings > Models, and hands candidates back to ArkEvolve replay and canary gates.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what it is",
                 items: &[
                     "GEPA is a DSPy-backed optimizer bridge for prompt and specialist-prompt candidates; it is not base-model weight retraining.",
@@ -1581,7 +1581,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The normal path is automatic. The UI should surface Background improvement status, queue, evidence, guardrail, and latest result rather than asking a novice user to understand or trigger GEPA.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "when it runs",
                 items: &[
                     "The scheduler starts about 90 seconds after the HTTP runtime starts, then checks about every 30 minutes.",
@@ -1591,7 +1591,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Default guardrails reserve at most 1 GEPA run per day, about 1 USD per day, about 0.50 USD per run, and 24 metric calls per run unless changed by operator controls.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "data flow",
                 items: &[
                     "Rust reads recent `experience_runs`, the current prompt bundle profile, the current specialist prompt bundle profile, benchmark profiles, and recent lineage.",
@@ -1601,7 +1601,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Job status files move through `/app/.agentark/self_evolve/gepa/pending`, `running`, `completed`, and `failed`; detailed run artifacts live under `/app/.agentark/self_evolve/gepa/runs`.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "tables and keys",
                 items: &[
                     "`experience_runs` is the source evidence table. Inspect `id`, `updated_at`, `success_state`, `correction_state`, `request_text`, `outcome_summary`, `failure_reason`, `prompt_version`, `model_slot`, `metadata`, `consolidated`, and `heuristic_reflected`.",
@@ -1611,7 +1611,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Specialist prompt rollout state is stored in `kv_store` under `specialist_prompt_bundle_profile_v1`, `specialist_prompt_bundle_profile_canary_v1`, `specialist_prompt_bundle_canary_state_v1`, and `specialist_prompt_bundle_last_result_v1`.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "operator queries",
                 items: &[
                     "Recent evidence: `SELECT id, updated_at, success_state, correction_state, prompt_version, model_slot FROM experience_runs ORDER BY updated_at DESC LIMIT 20;`",
@@ -1620,7 +1620,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use the ArkEvolve Background improvement card and ArkSentinel > Background learning > Prompt tuning before asking a user to inspect SQL directly.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "bloat and retention",
                 items: &[
                     "GEPA run artifacts are pruned after 30 days and capped to about 80 run directories.",
@@ -1629,7 +1629,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "The larger long-term database growth source is `experience_runs` and related trace/history tables; use Settings > Data Cleanup for runtime retention instead of adding GEPA-specific table resets.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rules",
                 items: &[
                     "When asked whether GEPA is ready, prefer live API/UI/DB state over this static documentation.",
@@ -1640,7 +1640,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Prompt telemetry and prompt cost review",
         slug: "prompt-telemetry-and-prompt-cost-review",
         tags: &[
@@ -1656,7 +1656,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Prompt telemetry measures final prompt and tool-schema size without changing runtime prompt assembly. Use Trace for one run, ArkEvolve > Review for aggregates and review items, and observability export for numeric metrics when enabled.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "where to inspect",
                 items: &[
                     "Trace > Trace Detail for a single run.",
@@ -1664,7 +1664,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Settings > Observability and the external observability backend for exported numeric prompt metrics when export is enabled.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what it measures",
                 items: &[
                     "Final system prompt chars after assembly.",
@@ -1673,7 +1673,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Estimated total request chars and token estimate.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what it does not do",
                 items: &[
                     "It does not automatically trim prompt sections or rewrite runtime assembly logic.",
@@ -1681,7 +1681,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Observability export is metrics-only; it should not export raw prompt text, raw tool schemas, or user content.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "canary safety",
                 items: &[
                     "Prompt, classifier-prompt, and specialist-prompt canaries are watched against resolved experience runs.",
@@ -1689,7 +1689,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Weaker negative signals remain review items in ArkEvolve > Review so the operator can choose `Disable canary` or `Keep active`.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "A recent run shows a `Prompt Telemetry` step in Trace.",
@@ -1698,7 +1698,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If canary safety triggers, the operator sees a notification and a prompt canary safety item in ArkEvolve > Review.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rules",
                 items: &[
                     "When the user asks where prompt telemetry lives, answer with the exact UI path first and then describe which surface is per-run versus aggregated.",
@@ -1708,7 +1708,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Plugins, webhooks, and custom APIs",
         slug: "plugins-webhooks-and-custom-apis",
         tags: &[
@@ -1721,14 +1721,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Webhooks & APIs and Plugins are related integration surfaces, but they cover different flows.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "paths",
                 items: &[
                     "Settings > Integrations > Webhooks & APIs.",
                     "Settings > Integrations > Plugins.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what belongs where",
                 items: &[
                     "Webhooks & APIs covers incoming webhook sources, webhook events, and imported custom APIs.",
@@ -1736,7 +1736,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Custom Integrations covers user-added extension-pack integrations that the agent installs or scaffolds as reusable tools.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "webhooks",
                 items: &[
                     "Create or edit a webhook source.",
@@ -1745,7 +1745,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Review incoming events and downstream execution in Trace or Tasks.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "custom APIs",
                 items: &[
                     "Import or configure the custom API in the same Webhooks & APIs area.",
@@ -1753,7 +1753,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use it from chat or from flows that depend on that API.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "plugins",
                 items: &[
                     "Install or edit the plugin.",
@@ -1761,7 +1761,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Save so plugin actions and test controls become available.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "behavior",
                 items: &[
                     "Plugins only receive the platform events you explicitly enable.",
@@ -1770,7 +1770,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Pack-based Custom Integrations are also distinct from prebuilt connectors and from raw custom API imports.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "A webhook source passes its test action.",
@@ -1780,7 +1780,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Security, advanced settings, and secrets",
         slug: "security-advanced-and-secrets",
         tags: &[
@@ -1794,11 +1794,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Settings > Security covers master password, encrypted secrets, and security logs. Settings > Advanced covers lower-level expert controls.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "paths",
                 items: &["Settings > Security.", "Settings > Advanced."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "use Security for",
                 items: &[
                     "Master password and secret protection.",
@@ -1806,7 +1806,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Security logs.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "use Advanced for",
                 items: &[
                     "Lower-level runtime and integration controls.",
@@ -1814,7 +1814,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Expert-only settings that are not part of normal onboarding.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "secret-handling rules",
                 items: &[
                     "Prefer settings forms, connector setup, or explicit secret-save flows.",
@@ -1822,7 +1822,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Treat encrypted secret storage as the source of truth for provider keys, tokens, and connector credentials.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what to explain",
                 items: &[
                     "Secrets are stored encrypted and handled separately from normal model generation.",
@@ -1834,7 +1834,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Advanced settings should only be changed when the operator knows why the default is insufficient.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "After saving a secret-backed config, the related feature stops showing Not configured.",
@@ -1842,7 +1842,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If a master password change or protected secret flow succeeded, the instance can still read its encrypted settings.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "A secret can exist while another required non-secret field is still missing.",
@@ -1852,7 +1852,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Swarm, agents, and delegation",
         slug: "swarm-agents-and-delegation",
         tags: &[
@@ -1864,11 +1864,11 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "The top-level Agents page shows specialist agents and swarm state, but normal users can still trigger delegation directly from chat.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "primary surface",
                 items: &["Top-level Agents page backed by the swarm system."],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "how it works",
                 items: &[
                     "__PRODUCT_NAME__ can delegate parts of complex work to specialist agents.",
@@ -1877,7 +1877,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Swarm config controls which specialists exist and how they are provisioned.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what to tell users",
                 items: &[
                     "Users can ask in chat for monitoring, escalation, deep research, or multi-step execution and __PRODUCT_NAME__ decides when swarm delegation is appropriate.",
@@ -1885,7 +1885,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Updating swarm configuration may require restart before a new saved roster fully activates.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "Agents shows registered specialist agents when swarm is configured.",
@@ -1893,7 +1893,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "During delegated work, agent status moves away from fully idle.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "The instance may have no configured specialist agents.",
@@ -1903,7 +1903,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "Browser automation, search, and research",
         slug: "browser-search-and-research",
         tags: &[
@@ -1916,7 +1916,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
         ],
         summary: "Web search, research, and browser automation are primarily chat-native workflows rather than settings-first flows.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "what they do",
                 items: &[
                     "Web search is quick source lookup.",
@@ -1924,7 +1924,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Browser automation covers website navigation, form filling, reading pages, screenshots, and login-like workflows with user assist when needed.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "how to use them",
                 items: &[
                     "Ask in Chat for online research or browser work.",
@@ -1933,7 +1933,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Use Trace afterward to inspect what happened.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "behavior",
                 items: &[
                     "Research is not the same as a simple web search.",
@@ -1941,14 +1941,14 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "If the user asks for provider-side setup that drifts over time, keep __PRODUCT_NAME__-specific steps from local docs and verify external console steps with official web sources.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "A research run cites or reflects source-backed findings.",
                     "A browser run leaves trace evidence of navigation, reading, screenshots, or interaction steps.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "pitfalls",
                 items: &[
                     "The user may want a current answer without enabling research or web use.",
@@ -1958,13 +1958,13 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
             },
         ],
     },
-    BundledHelpDoc {
+    AgentArkManualDoc {
         title: "__PRODUCT_NAME__ capabilities overview",
         slug: "capabilities-overview",
         tags: &["capabilities", "features", "overview", "general"],
         summary: "__PRODUCT_NAME__ is a self-hosted personal AI Agent OS for daily life and work that combines private chat, durable memory, tasks, agents, apps, integrations, companion devices, approvals, smart model routing, evolution, and audit trails.",
         sections: &[
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "core capabilities",
                 items: &[
                     "Personal AI Agent OS workflow across the web UI, CLI, Telegram, WhatsApp, integrations, and companion devices for summaries, drafts, reminders, follow-up, research, app work, and action requests.",
@@ -1981,7 +1981,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Operational power features including swarm agents, execution supervision, traces, analytics, ArkPulse, plugins, custom APIs, webhooks, and extension packs.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "how it evolves over time",
                 items: &[
                     "Completed or corrected runs can become evidence for durable memory, lessons, and procedures.",
@@ -1991,7 +1991,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Do not imply that __PRODUCT_NAME__ silently retrains base model weights unless that deployment explicitly adds parameter-updating learning with documented controls.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "security and cost posture",
                 items: &[
                     "Secrets are stored encrypted and handled separately from normal model generation.",
@@ -2000,7 +2000,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Settings > Models and Analytics help operators inspect the configured model mix and cost trends.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "where to look in the UI",
                 items: &[
                     "Chat for the main day-to-day workflow.",
@@ -2017,7 +2017,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                     "Tasks / Watchers / Goals / Apps / Trace / Analytics / ArkPulse for deeper operational workflows.",
                 ],
             },
-            BundledHelpSection {
+            AgentArkManualSection {
                 label: "answer rule",
                 items: &[
                     "When the user asks what __PRODUCT_NAME__ can do, answer with a short product-specific Markdown list, not a generic chatbot skill list.",
@@ -2029,7 +2029,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
     },
 ];
 
-pub(crate) fn render_bundled_help_doc(doc: &BundledHelpDoc) -> String {
+pub(crate) fn render_agentark_manual_doc(doc: &AgentArkManualDoc) -> String {
     let mut out = String::from(doc.summary.trim());
 
     for section in doc.sections {

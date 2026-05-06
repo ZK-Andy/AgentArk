@@ -1,13 +1,25 @@
 use crate::actions::ActionDef;
-use crate::docs::product_help::{BUNDLED_HELP_DOCS, render_bundled_help_doc};
+use crate::docs::agentark_manual::{render_agentark_manual_doc, AGENTARK_MANUAL_DOCS};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub const CURATED_SOURCE: &str = "agentark_help";
-pub const RUNTIME_SOURCE: &str = "agentark_runtime_help";
-pub const DOCUMENT_ID_PREFIX: &str = "product_help:";
-pub const DOCUMENT_CONTENT_TYPE: &str = "application/x-agentark-product-help";
-const PRODUCT_HELP_CHUNK_MAX_CHARS: usize = 1_400;
+pub const CURATED_SOURCE: &str = "agentark_manual";
+pub const RUNTIME_SOURCE: &str = "agentark_capabilities";
+pub const DOCUMENT_ID_PREFIX: &str = "agentark_knowledge:";
+pub const DOCUMENT_CONTENT_TYPE: &str = "application/x-agentark-knowledge";
+pub const INTERNAL_DOCUMENT_CONTENT_TYPE_PREFIX: &str = "application/x-agentark-";
+const AGENTARK_KNOWLEDGE_CHUNK_MAX_CHARS: usize = 1_400;
+
+pub fn is_agentark_knowledge_document_id(value: &str) -> bool {
+    value.trim().starts_with(DOCUMENT_ID_PREFIX)
+}
+
+pub fn is_internal_agentark_document_content_type(value: &str) -> bool {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(INTERNAL_DOCUMENT_CONTENT_TYPE_PREFIX)
+}
 
 #[derive(Debug, Clone)]
 pub struct SeedKnowledgeItem {
@@ -19,10 +31,11 @@ pub struct SeedKnowledgeItem {
 }
 
 #[derive(Debug, Clone)]
-pub struct SeedProductHelpDocument {
+pub struct SeedAgentArkKnowledgeDocument {
     pub id: String,
     pub filename: String,
     pub content_type: &'static str,
+    pub source: &'static str,
     pub title: String,
     pub content: String,
     pub url: Option<String>,
@@ -35,28 +48,31 @@ fn branded_product_text(text: &str) -> String {
 }
 
 pub fn build_seed_knowledge_items(actions: &[ActionDef]) -> Vec<SeedKnowledgeItem> {
-    let mut items = bundled_docs();
+    let mut items = build_runtime_action_catalog_docs(actions);
     items.extend(build_ui_topology_docs());
     items.extend(build_connect_flow_docs());
-    items.extend(build_runtime_action_catalog_docs(actions));
+    items.extend(bundled_docs());
     items
 }
 
-pub fn build_seed_product_help_documents(actions: &[ActionDef]) -> Vec<SeedProductHelpDocument> {
+pub fn build_seed_agentark_knowledge_documents(
+    actions: &[ActionDef],
+) -> Vec<SeedAgentArkKnowledgeDocument> {
     build_seed_knowledge_items(actions)
         .into_iter()
-        .map(seed_product_help_document)
+        .map(seed_agentark_knowledge_document)
         .collect()
 }
 
-fn seed_product_help_document(item: SeedKnowledgeItem) -> SeedProductHelpDocument {
-    let id = product_help_document_id(&item);
-    let filename = product_help_filename(&item);
-    let chunks = product_help_chunks(&item);
-    SeedProductHelpDocument {
+fn seed_agentark_knowledge_document(item: SeedKnowledgeItem) -> SeedAgentArkKnowledgeDocument {
+    let id = agentark_knowledge_document_id(&item);
+    let filename = agentark_knowledge_filename(&item);
+    let chunks = agentark_knowledge_chunks(&item);
+    SeedAgentArkKnowledgeDocument {
         id,
         filename,
         content_type: DOCUMENT_CONTENT_TYPE,
+        source: item.source,
         title: item.title,
         content: item.content,
         url: item.url,
@@ -65,7 +81,7 @@ fn seed_product_help_document(item: SeedKnowledgeItem) -> SeedProductHelpDocumen
     }
 }
 
-fn product_help_document_id(item: &SeedKnowledgeItem) -> String {
+fn agentark_knowledge_document_id(item: &SeedKnowledgeItem) -> String {
     let mut hasher = Sha256::new();
     hasher.update(item.source.as_bytes());
     hasher.update(b"\n");
@@ -83,7 +99,7 @@ fn product_help_document_id(item: &SeedKnowledgeItem) -> String {
     format!("{DOCUMENT_ID_PREFIX}{hash}")
 }
 
-fn product_help_filename(item: &SeedKnowledgeItem) -> String {
+fn agentark_knowledge_filename(item: &SeedKnowledgeItem) -> String {
     let source = item.source.replace('_', "-");
     let mut slug = item
         .title
@@ -103,14 +119,15 @@ fn product_help_filename(item: &SeedKnowledgeItem) -> String {
     format!("{}-{}.md", source, slug)
 }
 
-fn product_help_chunks(item: &SeedKnowledgeItem) -> Vec<String> {
-    let header = product_help_chunk_header(item);
-    let max_body_chars = PRODUCT_HELP_CHUNK_MAX_CHARS.saturating_sub(header.chars().count() + 2);
+fn agentark_knowledge_chunks(item: &SeedKnowledgeItem) -> Vec<String> {
+    let header = agentark_knowledge_chunk_header(item);
+    let max_body_chars =
+        AGENTARK_KNOWLEDGE_CHUNK_MAX_CHARS.saturating_sub(header.chars().count() + 2);
     let max_body_chars = max_body_chars.max(400);
     let mut chunks = Vec::new();
     let mut current = String::new();
 
-    for block in product_help_content_blocks(&item.content, max_body_chars) {
+    for block in agentark_knowledge_content_blocks(&item.content, max_body_chars) {
         let separator = if current.is_empty() { "" } else { "\n\n" };
         let candidate_len =
             current.chars().count() + separator.chars().count() + block.chars().count();
@@ -133,7 +150,7 @@ fn product_help_chunks(item: &SeedKnowledgeItem) -> Vec<String> {
     chunks
 }
 
-fn product_help_chunk_header(item: &SeedKnowledgeItem) -> String {
+fn agentark_knowledge_chunk_header(item: &SeedKnowledgeItem) -> String {
     let mut lines = vec![
         format!("title: {}", item.title.trim()),
         format!("source: {}", item.source),
@@ -157,7 +174,7 @@ fn product_help_chunk_header(item: &SeedKnowledgeItem) -> String {
     lines.join("\n")
 }
 
-fn product_help_content_blocks(content: &str, max_chars: usize) -> Vec<String> {
+fn agentark_knowledge_content_blocks(content: &str, max_chars: usize) -> Vec<String> {
     let mut blocks = Vec::new();
     for block in content
         .split("\n\n")
@@ -186,7 +203,7 @@ fn product_help_content_blocks(content: &str, max_chars: usize) -> Vec<String> {
                     blocks.push(current.trim().to_string());
                     current.clear();
                 }
-                blocks.extend(split_long_product_help_text(line, max_chars));
+                blocks.extend(split_long_agentark_knowledge_text(line, max_chars));
                 continue;
             }
             if !current.is_empty() {
@@ -201,7 +218,7 @@ fn product_help_content_blocks(content: &str, max_chars: usize) -> Vec<String> {
     blocks
 }
 
-fn split_long_product_help_text(text: &str, max_chars: usize) -> Vec<String> {
+fn split_long_agentark_knowledge_text(text: &str, max_chars: usize) -> Vec<String> {
     let chars = text.chars().collect::<Vec<_>>();
     chars
         .chunks(max_chars.max(1))
@@ -210,11 +227,11 @@ fn split_long_product_help_text(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 fn bundled_docs() -> Vec<SeedKnowledgeItem> {
-    BUNDLED_HELP_DOCS
+    AGENTARK_MANUAL_DOCS
         .iter()
         .map(|doc| SeedKnowledgeItem {
             title: branded_product_text(doc.title),
-            content: branded_product_text(&render_bundled_help_doc(doc)),
+            content: branded_product_text(&render_agentark_manual_doc(doc)),
             source: CURATED_SOURCE,
             url: Some(crate::branding::help_uri(&format!("help/{}", doc.slug))),
             tags: Some(doc.tags.join(", ")),
@@ -428,7 +445,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
     }
     environment_content.push_str(
         "\nInvestigation guidance.\n\n\
-- Use the request-scoped runtime access summary and action catalog as the live source of truth for what this instance can do right now.\n\
+- Use the request-scoped runtime access summary and AgentArk capability registry as the live source of truth for what this instance can do right now.\n\
 - Use integration inventory for connected channels and connectors.\n\
 - Use MCP Servers and Plugins settings when the user asks about external capability extensions.\n\
 - Use Tasks, Watchers, Goals, Apps, Trace, Analytics, and ArkPulse to inspect durable work and operational state.\n\
@@ -472,7 +489,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
 - ArkMemory > Current Memory > Facts | Learned facts and operating constraints captured by the memory system.\n\
 - ArkMemory > Current Memory > Preferences | Durable user preferences and rules.\n\
 - ArkMemory > Current Memory > User Data | Notes, links, and captured user data.\n\
-- ArkMemory > Current Memory > Knowledge | Reusable knowledge-base items, including bundled product docs after sync.\n\
+- ArkMemory > Current Memory > Knowledge | Reusable knowledge-base items, including AgentArk manual/capability entries after sync.\n\
 - Settings > Knowledge > MCP Servers | External MCP server configuration.";
     items.push(SeedKnowledgeItem {
         title: "Library, documents, and memory surfaces".to_string(),
@@ -543,7 +560,7 @@ fn build_runtime_action_catalog_docs(actions: &[ActionDef]) -> Vec<SeedKnowledge
     let chunk_size = 16;
     for (idx, chunk) in sorted.chunks(chunk_size).enumerate() {
         let mut content = format!(
-            "Live action snapshot. If an action appears here, this {} instance can use it when the request matches and required credentials/config are present.\n\n",
+            "Live AgentArk capability registry snapshot. If an action appears here, this {} instance can use it when the request matches and required credentials/config are present. This registry is authoritative for current capability availability; curated manual docs are supplemental explanation only.\n\n",
             crate::branding::PRODUCT_NAME,
         );
         for action in chunk {
@@ -552,17 +569,31 @@ fn build_runtime_action_catalog_docs(actions: &[ActionDef]) -> Vec<SeedKnowledge
             } else {
                 action.capabilities.join(", ")
             };
+            let metadata = action.planner_metadata();
+            let auth = if metadata.requires_auth || action.authorization.requires_auth {
+                "requires auth/config"
+            } else {
+                "no explicit auth"
+            };
             content.push_str(&format!(
-                "- `{}` | capabilities: {} | {}\n",
-                action.name, caps, action.description
+                "- `{}` | capabilities: {} | source: {:?} | role: {:?} | integration: {:?} | delivery: {:?} | side_effect: {:?} | auth: {} | {}\n",
+                action.name,
+                caps,
+                action.source,
+                metadata.role,
+                metadata.integration_class,
+                metadata.delivery_mode,
+                metadata.side_effect_level,
+                auth,
+                action.description
             ));
         }
         items.push(SeedKnowledgeItem {
-            title: format!("Live action catalog {}", idx + 1),
+            title: format!("Live capability registry {}", idx + 1),
             content,
             source: RUNTIME_SOURCE,
             url: Some(crate::branding::help_uri(&format!(
-                "help/runtime/actions-{}",
+                "help/runtime/capabilities-{}",
                 idx + 1
             ))),
             tags: Some(action_chunk_tags(chunk).join(", ")),
@@ -627,6 +658,20 @@ mod tests {
     }
 
     #[test]
+    fn internal_document_content_type_namespace_covers_legacy_help_docs() {
+        assert!(is_internal_agentark_document_content_type(
+            DOCUMENT_CONTENT_TYPE
+        ));
+        assert!(is_internal_agentark_document_content_type(
+            "application/x-agentark-product-help"
+        ));
+        assert!(!is_internal_agentark_document_content_type(
+            "application/pdf"
+        ));
+        assert!(!is_internal_agentark_document_content_type("text/markdown"));
+    }
+
+    #[test]
     fn builds_seed_docs_with_runtime_catalog() {
         let items = build_seed_knowledge_items(&[
             action("gmail_scan", "Read Gmail messages", &["gmail"]),
@@ -634,50 +679,32 @@ mod tests {
         ]);
         assert!(items.iter().any(|item| item.source == CURATED_SOURCE));
         assert!(items.iter().any(|item| item.source == RUNTIME_SOURCE));
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title.contains("Main navigation"))
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Models and provider setup")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Embeddings and retrieval")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Input needed and unattended runs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Environment, deployment, and investigation")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Chat shortcuts and safe actions")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Custom integrations and extension packs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Plugins, webhooks, and custom APIs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Runtime environment and investigation")
-        );
+        assert!(items
+            .iter()
+            .any(|item| item.title.contains("Main navigation")));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Models and provider setup"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Embeddings and retrieval"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Input needed and unattended runs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Environment, deployment, and investigation"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Chat shortcuts and safe actions"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Custom integrations and extension packs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Plugins, webhooks, and custom APIs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Runtime environment and investigation"));
     }
 }

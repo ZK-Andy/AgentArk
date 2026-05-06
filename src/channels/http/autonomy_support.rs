@@ -18,6 +18,8 @@ pub(super) const PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
     ".agentark/self_evolve/prompt_bundle_lineage.jsonl";
 pub(super) const SPECIALIST_PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
     ".agentark/self_evolve/specialist_prompt_bundle_lineage.jsonl";
+pub(super) const PROMPT_FRAGMENT_BUNDLE_LINEAGE_REL_PATH: &str =
+    ".agentark/self_evolve/prompt_fragment_bundle_lineage.jsonl";
 pub(super) const PROMPT_REPLAY_EVAL_SAMPLE_LIMIT: u64 = 5000;
 pub(super) const EVOLUTION_DEV_DEFAULT_LIMIT: u64 = 250;
 pub(super) const EVOLUTION_DEV_MAX_LIMIT: u64 = 500;
@@ -1007,6 +1009,9 @@ Return JSON only with this shape:\n{response_shape}\n\n\
 Decide whether this message reveals a durable opportunity for AgentArk to proactively prepare future work before the user asks again. \
 Use semantic meaning and conversational context. Do not use fixed phrases, keyword matching, regexes, punctuation, casing, or expected wording. \
 When should_suggest is true, choose exactly one kind from watcher, workflow, task, or app. \
+Use watcher for independent background monitoring, recurring checks, or alert-on-change goals. \
+Use workflow only for a multi-step recurring procedure that is not just a monitor. \
+Use task for a one-shot durable follow-up, and app for a reusable UI or deployed tool. \
 Suggest only when there is a concrete future action AgentArk can prepare as an approval-gated watcher, workflow, task, or app. \
 Do not suggest for ordinary questions, one-off explanations, generic greetings, or messages without a concrete follow-up opportunity. \
 Keep title, detail, rationale, goal_title, and goal_detail concise and user-facing. \
@@ -1057,13 +1062,17 @@ pub(super) fn build_chat_suggestion_execution_prompt(
         .unwrap_or(&suggestion.title);
     let execution_directive = match suggestion.kind.as_str() {
         "app" => {
-            "Build and deploy a concrete starter app now if feasible. Prefer a working thin slice over a plan-only response."
+            "Required durable outcome: a deployed app or tool. Build and deploy a concrete starter app now if feasible. Prefer a working thin slice over a plan-only response."
         }
-        "watcher" => "Create a concrete watcher now. Do not just describe the watcher.",
+        "watcher" => {
+            "Required durable action: watch. Create a concrete AgentArk watcher now. The polling source should be chosen from the action catalog by meaning, and the saved watcher is the outcome."
+        }
         "workflow" => {
-            "Create a concrete automation now, preferably as a watcher, scheduled task, or goal loop."
+            "Required durable outcome: a saved automation object. If the accepted work is recurring or condition-based monitoring, create a watcher. If it is timed work, schedule it. If it is one-shot follow-up, create the task or goal."
         }
-        "task" => "Create a concrete task or goal now rather than leaving this as an idea.",
+        "task" => {
+            "Required durable outcome: a saved task or goal. Create the concrete task/goal now rather than leaving this as an idea."
+        }
         _ => "Execute the best concrete automation now rather than only describing it.",
     };
 
@@ -1071,8 +1080,7 @@ pub(super) fn build_chat_suggestion_execution_prompt(
         "A Mission Control suggestion was inferred from a prior user chat, and the user has now explicitly clicked Accept.\n\
 You should execute this accepted suggestion now.\n\
 Do not merely save it as a draft goal unless you are blocked by missing information.\n\
-If the suggestion is best fulfilled by building/deploying an app, do that so the trace includes real build/runtime details.\n\
-If the suggestion is better fulfilled as a watcher, scheduled task, or goal workflow, create that concrete automation instead.\n\
+Use the accepted suggestion type as the authoritative durable outcome class.\n\
 If required inputs are missing, do the safest concrete version you can and clearly say what remains missing.\n\n\
 Accepted suggestion type: {kind_label}\n\
 Suggestion title: {title}\n\

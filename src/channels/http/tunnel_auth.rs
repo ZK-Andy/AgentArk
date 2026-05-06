@@ -307,7 +307,10 @@ pub(super) async fn ensure_control_plane_tunnel_ready(
     };
     let master_mgr = crate::crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
     let bootstrap_active = master_mgr.is_bootstrap_password_active().unwrap_or(false);
-    if !master_mgr.is_password_set() || bootstrap_active {
+    let install_managed_active = master_mgr
+        .is_install_managed_password_active()
+        .unwrap_or(false);
+    if !master_mgr.is_password_set() || bootstrap_active || install_managed_active {
         return Err(ControlPlaneTunnelError::CustomPasswordRequired);
     }
     if state.allow_insecure_no_auth {
@@ -404,7 +407,10 @@ pub(super) async fn tunnel_login(
     };
     let master_mgr = crate::crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
     let bootstrap_active = master_mgr.is_bootstrap_password_active().unwrap_or(false);
-    if !master_mgr.is_password_set() || bootstrap_active {
+    let install_managed_active = master_mgr
+        .is_install_managed_password_active()
+        .unwrap_or(false);
+    if !master_mgr.is_password_set() || bootstrap_active || install_managed_active {
         return ControlPlaneTunnelError::CustomPasswordRequired.into_response();
     }
 

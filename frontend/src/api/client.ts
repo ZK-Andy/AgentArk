@@ -381,6 +381,8 @@ type ChatStreamPayload = {
     kind: "document" | "visual" | string;
     content_type?: string | null;
   }>;
+  accepted_suggestion_id?: string;
+  sentinel_proposal_id?: string;
 };
 
 type ChatStreamHandlers = {
@@ -397,7 +399,7 @@ type ChatStreamHandlers = {
   onTaskStatus?: (payload: Record<string, unknown>) => void;
   onContent?: (payload: Record<string, unknown>) => void;
   onError?: (message: string, payload?: unknown) => void;
-  onDone?: () => void;
+  onDone?: (payload?: Record<string, unknown>) => void;
 };
 
 function parseMaybeJson(raw: string): unknown {
@@ -543,7 +545,7 @@ async function streamSseJson(
     }
     if (eventName === "done") {
       doneReceived = true;
-      handlers.onDone?.();
+      handlers.onDone?.(asObject(payloadValue));
     }
   };
 
@@ -673,7 +675,7 @@ async function streamRun(runId: string, sinceSeq = 0, handlers: ChatStreamHandle
     }
     if (eventName === "done") {
       doneReceived = true;
-      handlers.onDone?.();
+      handlers.onDone?.(asObject(payloadValue));
     }
   };
 

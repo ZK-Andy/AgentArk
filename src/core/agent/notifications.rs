@@ -65,6 +65,13 @@ pub(super) fn is_external_notification_channel(channel: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(&trimmed))
 }
 
+pub(super) fn notification_channel_uses_preferred_fallback(channel: &str) -> bool {
+    matches!(
+        channel.trim().to_ascii_lowercase().as_str(),
+        "preferred" | "push" | "auto" | "default"
+    )
+}
+
 pub(super) fn notification_channel_display_name(channel: &str) -> &str {
     match channel.trim().to_ascii_lowercase().as_str() {
         "web" => "local Web UI",
@@ -162,11 +169,10 @@ impl NotificationStore {
                 title,
                 source
             );
-            return NotificationDispatchOutcome {
-                channel: "web".to_string(),
-                success: false,
-                error: Some("Notification suppressed by bootstrap gate".to_string()),
-            };
+            return NotificationDispatchOutcome::pre_send_failure(
+                "web",
+                "Notification suppressed by bootstrap gate",
+            );
         }
         let notif = crate::storage::entities::notification::Model {
             id: uuid::Uuid::new_v4().to_string(),
@@ -182,19 +188,14 @@ impl NotificationStore {
                 let _ = self
                     .notification_events
                     .send(NotificationEvent::from_model(&notif));
-                NotificationDispatchOutcome {
-                    channel: "web".to_string(),
-                    success: true,
-                    error: None,
-                }
+                NotificationDispatchOutcome::full_success("web")
             }
             Err(error) => {
                 tracing::warn!("Failed to emit notification: {}", error);
-                NotificationDispatchOutcome {
-                    channel: "web".to_string(),
-                    success: false,
-                    error: Some(format!("Failed to store notification: {}", error)),
-                }
+                NotificationDispatchOutcome::pre_send_failure(
+                    "web",
+                    format!("Failed to store notification: {}", error),
+                )
             }
         }
     }
@@ -206,11 +207,66 @@ impl NotificationStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDeliveryDetail {
+    FullSuccess,
+    PreSendFailure,
+    PartialFailure,
+}
+
+impl NotificationDeliveryDetail {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FullSuccess => "full_success",
+            Self::PreSendFailure => "pre_send_failure",
+            Self::PartialFailure => "partial_failure",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NotificationDispatchOutcome {
     pub channel: String,
     pub success: bool,
     pub error: Option<String>,
+    pub delivery: NotificationDeliveryDetail,
+}
+
+impl NotificationDispatchOutcome {
+    pub(crate) fn full_success(channel: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            success: true,
+            error: None,
+            delivery: NotificationDeliveryDetail::FullSuccess,
+        }
+    }
+
+    pub(crate) fn pre_send_failure(channel: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            success: false,
+            error: Some(error.into()),
+            delivery: NotificationDeliveryDetail::PreSendFailure,
+        }
+    }
+
+    pub(crate) fn partial_failure(channel: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            success: false,
+            error: Some(error.into()),
+            delivery: NotificationDeliveryDetail::PartialFailure,
+        }
+    }
+
+    pub fn is_partial_failure(&self) -> bool {
+        matches!(self.delivery, NotificationDeliveryDetail::PartialFailure)
+    }
+
+    pub fn sent_any_external_chunk(&self) -> bool {
+        self.success || self.is_partial_failure()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -721,11 +777,10 @@ impl Agent {
                 title,
                 source
             );
-            return NotificationDispatchOutcome {
-                channel: "web".to_string(),
-                success: false,
-                error: Some("Notification suppressed by bootstrap gate".to_string()),
-            };
+            return NotificationDispatchOutcome::pre_send_failure(
+                "web",
+                "Notification suppressed by bootstrap gate",
+            );
         }
         let notif = crate::storage::entities::notification::Model {
             id: uuid::Uuid::new_v4().to_string(),
@@ -741,19 +796,14 @@ impl Agent {
                 let _ = self
                     .notification_events
                     .send(NotificationEvent::from_model(&notif));
-                NotificationDispatchOutcome {
-                    channel: "web".to_string(),
-                    success: true,
-                    error: None,
-                }
+                NotificationDispatchOutcome::full_success("web")
             }
             Err(e) => {
                 tracing::warn!("Failed to emit notification: {}", e);
-                NotificationDispatchOutcome {
-                    channel: "web".to_string(),
-                    success: false,
-                    error: Some(format!("Failed to store notification: {}", e)),
-                }
+                NotificationDispatchOutcome::pre_send_failure(
+                    "web",
+                    format!("Failed to store notification: {}", e),
+                )
             }
         }
     }
@@ -772,11 +822,10 @@ impl Agent {
                 title,
                 source
             );
-            return NotificationDispatchOutcome {
-                channel: "web".to_string(),
-                success: false,
-                error: Some("Notification suppressed by bootstrap gate".to_string()),
-            };
+            return NotificationDispatchOutcome::pre_send_failure(
+                "web",
+                "Notification suppressed by bootstrap gate",
+            );
         }
         self.store_notification_with_status(title, body, level, source)
             .await
@@ -963,6 +1012,7 @@ impl Agent {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| value.to_ascii_lowercase())
+            .filter(|value| !notification_channel_uses_preferred_fallback(value))
     }
 
     pub(super) async fn stored_preferred_notification_override(&self) -> Option<String> {
@@ -974,6 +1024,7 @@ impl Agent {
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty())
+            .filter(|value| !notification_channel_uses_preferred_fallback(value))
     }
 
     pub(super) async fn preferred_notification_candidates(
@@ -986,7 +1037,7 @@ impl Agent {
 
         let stored_preferred = self.stored_preferred_notification_override().await;
         let hinted_preferred = Self::preferred_notification_override_value(preferred_override);
-        for preferred in [stored_preferred, hinted_preferred].into_iter().flatten() {
+        for preferred in [hinted_preferred, stored_preferred].into_iter().flatten() {
             let eligible = if push_only {
                 is_push_notification_channel(&preferred)
                     && self.push_channel_is_configured(&preferred)
@@ -1064,7 +1115,7 @@ impl Agent {
         false
     }
 
-    pub(super) async fn notify_preferred_channel_reported_with_hint(
+    pub(crate) async fn notify_preferred_channel_reported_with_hint(
         &self,
         message: &str,
         preferred_override: Option<&str>,
@@ -1074,20 +1125,18 @@ impl Agent {
 
         if !self.notifications_unlocked().await {
             tracing::debug!("notify_preferred_channel suppressed (bootstrap gate)");
-            attempts.push(NotificationDispatchOutcome {
-                channel: "push".to_string(),
-                success: false,
-                error: Some("Notification suppressed by bootstrap gate".to_string()),
-            });
+            attempts.push(NotificationDispatchOutcome::pre_send_failure(
+                "push",
+                "Notification suppressed by bootstrap gate",
+            ));
             return attempts;
         }
         if self.push_notifications_muted().await {
             tracing::debug!("notify_preferred_channel suppressed (mute active)");
-            attempts.push(NotificationDispatchOutcome {
-                channel: "push".to_string(),
-                success: false,
-                error: Some("Push notifications are currently muted".to_string()),
-            });
+            attempts.push(NotificationDispatchOutcome::pre_send_failure(
+                "push",
+                "Push notifications are currently muted",
+            ));
             return attempts;
         }
         if enforce_duplicate_cooldown && self.push_notification_in_cooldown(message).await {
@@ -1095,14 +1144,13 @@ impl Agent {
                 "notify_preferred_channel suppressed (duplicate within {}s cooldown)",
                 PUSH_NOTIFICATION_DUPLICATE_COOLDOWN_SECS
             );
-            attempts.push(NotificationDispatchOutcome {
-                channel: "push".to_string(),
-                success: false,
-                error: Some(format!(
+            attempts.push(NotificationDispatchOutcome::pre_send_failure(
+                "push",
+                format!(
                     "Duplicate notification suppressed within {} second cooldown",
                     PUSH_NOTIFICATION_DUPLICATE_COOLDOWN_SECS
-                )),
-            });
+                ),
+            ));
             return attempts;
         }
 
@@ -1112,9 +1160,9 @@ impl Agent {
         {
             tracing::info!("notify_preferred_channel: trying '{}'", channel);
             let outcome = self.try_send_notification_reported(&channel, message).await;
-            let success = outcome.success;
+            let stop_after_attempt = outcome.sent_any_external_chunk();
             attempts.push(outcome);
-            if success {
+            if stop_after_attempt {
                 if enforce_duplicate_cooldown {
                     self.remember_push_notification_sent(message).await;
                 }
@@ -1126,11 +1174,7 @@ impl Agent {
             "notify_preferred_channel: no external channel delivered, notification stored in DB"
         );
         if attempts.is_empty() {
-            attempts.push(NotificationDispatchOutcome {
-                channel: "web".to_string(),
-                success: true,
-                error: None,
-            });
+            attempts.push(NotificationDispatchOutcome::full_success("web"));
         }
         attempts
     }
@@ -1194,20 +1238,17 @@ impl Agent {
                 .notification_channel_is_configured_any(&delivery_channel)
                 .await
         {
-            attempts.push(NotificationDispatchOutcome {
-                channel: delivery_channel.clone(),
-                success: false,
-                error: Some(
-                    crate::channels::ChannelError::not_connected(
-                        delivery_channel.clone(),
-                        format!(
-                            "{} delivery is not connected",
-                            notification_channel_display_name(&delivery_channel)
-                        ),
-                    )
-                    .to_string(),
-                ),
-            });
+            attempts.push(NotificationDispatchOutcome::pre_send_failure(
+                delivery_channel.clone(),
+                crate::channels::ChannelError::not_connected(
+                    delivery_channel.clone(),
+                    format!(
+                        "{} delivery is not connected",
+                        notification_channel_display_name(&delivery_channel)
+                    ),
+                )
+                .to_string(),
+            ));
         }
 
         if delivery_channel != "web" && delivery_channel != "in_app" {
@@ -1228,13 +1269,23 @@ impl Agent {
 
         let delivered_channel = attempts
             .iter()
-            .find(|attempt| attempt.success && attempt.channel != "web")
+            .find(|attempt| attempt.sent_any_external_chunk() && attempt.channel != "web")
             .map(|attempt| attempt.channel.clone());
         let detail = if let Some(channel) = delivered_channel.as_deref() {
-            format!(
-                "Notification delivered via {}.",
-                notification_channel_display_name(channel)
-            )
+            if attempts
+                .iter()
+                .any(|attempt| attempt.channel == channel && attempt.is_partial_failure())
+            {
+                format!(
+                    "Notification partially delivered via {}; full message kept in-app.",
+                    notification_channel_display_name(channel)
+                )
+            } else {
+                format!(
+                    "Notification delivered via {}.",
+                    notification_channel_display_name(channel)
+                )
+            }
         } else if in_app.success {
             "Notification kept in-app.".to_string()
         } else {
@@ -1262,6 +1313,7 @@ impl Agent {
                             "channel": attempt.channel,
                             "success": attempt.success,
                             "error": attempt.error,
+                            "delivery": attempt.delivery.as_str(),
                         }))
                         .collect::<Vec<_>>(),
                 }
@@ -1400,78 +1452,9 @@ impl Agent {
     /// Attempt to send a notification via a specific channel/integration.
     /// Returns true on success, false on failure.
     pub async fn try_send_notification(&self, channel: &str, message: &str) -> bool {
-        let safe_message = match Self::sanitize_outbound_notification_message(channel, message) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!("{}", error);
-                return false;
-            }
-        };
-
-        match channel {
-            #[cfg(feature = "telegram")]
-            "telegram" => crate::channels::telegram::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "slack" => crate::channels::slack::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "discord" => crate::channels::discord::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "matrix" => crate::channels::matrix::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "teams" => crate::channels::teams::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "whatsapp" => crate::channels::whatsapp::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "google_chat" => crate::channels::google_chat::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "signal" => crate::channels::signal::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "imessage" => crate::channels::imessage::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "line" => crate::channels::line::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "wechat" => crate::channels::wechat::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "qq" => crate::channels::qq::send_message(self, &safe_message)
-                .await
-                .is_ok(),
-            "email" => self
-                .send_email_notification_reported(&safe_message)
-                .await
-                .is_ok(),
-            "web" => {
-                // Web notifications are already stored in DB
-                true
-            }
-            other => {
-                if let Some(result) = self
-                    .try_send_registry_messaging_channel(other, &safe_message)
-                    .await
-                {
-                    return result.is_ok();
-                }
-                // Try as a generic integration that supports Notify
-                self.integrations
-                    .execute(
-                        other,
-                        "notify",
-                        &serde_json::json!({"message": safe_message}),
-                    )
-                    .await
-                    .is_ok()
-            }
-        }
+        self.try_send_notification_reported(channel, message)
+            .await
+            .sent_any_external_chunk()
     }
 
     pub async fn notify_preferred_channel_reported(
@@ -1492,56 +1475,87 @@ impl Agent {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!("{}", error);
-                return NotificationDispatchOutcome {
-                    channel: channel_name,
-                    success: false,
-                    error: Some(error),
-                };
+                return NotificationDispatchOutcome::pre_send_failure(channel_name, error);
             }
         };
-        let result: std::result::Result<(), String> = match channel {
+
+        let chunks = notification_chunks_for_channel(channel, &safe_message);
+        let total_chunks = chunks.len();
+        let mut sent_chunks = 0usize;
+        for (idx, chunk) in chunks.iter().enumerate() {
+            match self.send_notification_chunk_once(channel, chunk).await {
+                Ok(()) => {
+                    sent_chunks += 1;
+                }
+                Err(error) if sent_chunks == 0 => {
+                    return NotificationDispatchOutcome::pre_send_failure(channel_name, error);
+                }
+                Err(error) => {
+                    return NotificationDispatchOutcome::partial_failure(
+                        channel_name,
+                        format!(
+                            "Chunk {}/{} failed after {} chunk(s) were sent: {}",
+                            idx + 1,
+                            total_chunks,
+                            sent_chunks,
+                            error
+                        ),
+                    );
+                }
+            }
+        }
+
+        NotificationDispatchOutcome::full_success(channel_name)
+    }
+
+    async fn send_notification_chunk_once(
+        &self,
+        channel: &str,
+        safe_message: &str,
+    ) -> std::result::Result<(), String> {
+        match channel {
             #[cfg(feature = "telegram")]
-            "telegram" => crate::channels::telegram::send_message(self, &safe_message)
+            "telegram" => crate::channels::telegram::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "slack" => crate::channels::slack::send_message(self, &safe_message)
+            "slack" => crate::channels::slack::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "discord" => crate::channels::discord::send_message(self, &safe_message)
+            "discord" => crate::channels::discord::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "matrix" => crate::channels::matrix::send_message(self, &safe_message)
+            "matrix" => crate::channels::matrix::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "teams" => crate::channels::teams::send_message(self, &safe_message)
+            "teams" => crate::channels::teams::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "whatsapp" => crate::channels::whatsapp::send_message(self, &safe_message)
+            "whatsapp" => crate::channels::whatsapp::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "google_chat" => crate::channels::google_chat::send_message(self, &safe_message)
+            "google_chat" => crate::channels::google_chat::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "signal" => crate::channels::signal::send_message(self, &safe_message)
+            "signal" => crate::channels::signal::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "imessage" => crate::channels::imessage::send_message(self, &safe_message)
+            "imessage" => crate::channels::imessage::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "line" => crate::channels::line::send_message(self, &safe_message)
+            "line" => crate::channels::line::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "wechat" => crate::channels::wechat::send_message(self, &safe_message)
+            "wechat" => crate::channels::wechat::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "qq" => crate::channels::qq::send_message(self, &safe_message)
+            "qq" => crate::channels::qq::send_message(self, safe_message)
                 .await
                 .map_err(|e| e.to_string()),
-            "email" => self.send_email_notification_reported(&safe_message).await,
+            "email" => self.send_email_notification_reported(safe_message).await,
             "web" => Ok(()),
             other => {
                 if let Some(result) = self
-                    .try_send_registry_messaging_channel(other, &safe_message)
+                    .try_send_registry_messaging_channel(other, safe_message)
                     .await
                 {
                     result
@@ -1557,19 +1571,43 @@ impl Agent {
                         .map_err(|e| e.to_string())
                 }
             }
-        };
-
-        match result {
-            Ok(()) => NotificationDispatchOutcome {
-                channel: channel_name,
-                success: true,
-                error: None,
-            },
-            Err(error) => NotificationDispatchOutcome {
-                channel: channel_name,
-                success: false,
-                error: Some(error),
-            },
         }
+    }
+}
+
+fn notification_chunks_for_channel(channel: &str, safe_message: &str) -> Vec<String> {
+    match channel.trim().to_ascii_lowercase().as_str() {
+        "email" | "web" => vec![safe_message.to_string()],
+        _ => crate::channels::outbound_split::split_for_push_notification(safe_message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_override_ignores_fallback_aliases() {
+        for alias in ["preferred", "push", "auto", "default", " Preferred "] {
+            assert_eq!(
+                Agent::preferred_notification_override_value(Some(alias)),
+                None
+            );
+        }
+        assert_eq!(
+            Agent::preferred_notification_override_value(Some(" Telegram ")).as_deref(),
+            Some("telegram")
+        );
+    }
+
+    #[test]
+    fn notification_chunks_split_push_but_not_email() {
+        let long = "x".repeat(crate::channels::outbound_split::PUSH_NOTIFICATION_MAX_CHARS + 50);
+        let push_chunks = notification_chunks_for_channel("telegram", &long);
+        let email_chunks = notification_chunks_for_channel("email", &long);
+
+        assert!(push_chunks.len() > 1);
+        assert!(push_chunks[0].starts_with("[1/"));
+        assert_eq!(email_chunks, vec![long]);
     }
 }

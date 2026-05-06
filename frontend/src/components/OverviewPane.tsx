@@ -19,14 +19,21 @@ import { api } from "../api/client";
 import { isBackgroundSessionVisibleInUi } from "../lib/backgroundSessions";
 import { formatUiDateTime, formatUiRelativeDateTimeMeta } from "../lib/dateFormat";
 import { useUiStore } from "../store/uiStore";
-import { AgentStatusBar } from "./AgentStatusBar";
-import { WelcomeHero } from "./WelcomeHero";
-import { NeedsAttentionInbox } from "./NeedsAttentionInbox";
-import { buildAttentionItems } from "./NeedsAttentionInbox";
-import { TodaysHighlights } from "./TodaysHighlights";
-import { SmartSuggestions } from "./SmartSuggestions";
 import { ActivityFeed } from "./ActivityFeed";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
+import {
+  MissionTopbar,
+  MissionHeadline,
+  FocusCard,
+  type FocusState,
+  SuggestedStepCard,
+  OperationalSummaryCard,
+  AutomationPostureCard,
+  NeuralWebStatsCard,
+  SystemPostureCard,
+  NeedsAttentionCard,
+  NeuralWebGraph,
+} from "./missionControl";
 import type {
   AutonomyActionExecutionResponse,
   BackgroundSessionSummary,
@@ -741,11 +748,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     automationCounts.watchers +
     automationCounts.apps +
     automationCounts.integrations;
-  const attentionItems = useMemo(
-    () => buildAttentionItems(tasks, notifications, securityLogs, !settingsQ.isLoading, hasLlmConfigured),
-    [tasks, notifications, securityLogs, settingsQ.isLoading, hasLlmConfigured]
-  );
-  const showAttentionPanel = attentionItems.length > 0;
   const showActiveSessionsPanel = activeBackgroundSessions.length > 0;
   const showActivityFeed = traces.length > 0;
   const automationHeadline =
@@ -753,47 +755,122 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       ? `${automationSurfaceTotal} automation surfaces are currently in play.`
       : "No active automation surfaces are live right now.";
 
+  const activeObjective = currentTask?.trim()
+    ? currentTask.trim()
+    : agentPaused
+      ? "Background help is paused. Scheduled reminders still fire while proactive work stays paused."
+      : "No focus is pinned yet. Start with a question, a reminder, or your next daily brief.";
+  const focusState: FocusState = currentTask?.trim() ? "active" : agentPaused ? "paused" : "ready";
+  const primaryIntegrationLabel =
+    automationPreview.find((item) => item.kind === "integration")?.title ?? null;
+
   return (
     <Box
       data-tour-target="overview-dashboard"
-      className="overview-shell"
+      className="nw-shell overview-shell"
     >
       {hasErrors ? (
-        <Alert severity="error">
+        <Alert severity="error" sx={{ mb: 1.5 }}>
           {dataSourceErrorSummary}
         </Alert>
       ) : null}
-      <Box className="overview-command-grid">
-        <Box className="overview-main-column">
-          <Box data-tour-target="welcome-hero">
-            <WelcomeHero
-              onGoChat={() => navigateToView("chat")}
-              onRunBriefing={() => runBriefingMutation.mutate()}
-              onViewTasks={() => navigateToView("tasks")}
-              agentPaused={agentPaused}
-              briefingLoading={runBriefingMutation.isPending}
-              prompts={heroPrompts}
-              currentTaskDesc={currentTask}
-            />
-          </Box>
 
-          {showAttentionPanel ? (
-            <NeedsAttentionInbox
-              tasks={tasks}
-              notifications={notifications}
-              securityLogs={securityLogs}
-              settingsLoaded={!settingsQ.isLoading}
-              hasLlmConfigured={hasLlmConfigured}
-              onApprove={(id) => approveMutation.mutate(id)}
-              onReject={(id) => rejectMutation.mutate(id)}
-              onRetry={(id) => retryMutation.mutate(id)}
-              onNavigate={navigateToView}
-              approving={approveMutation.isPending}
-              rejecting={rejectMutation.isPending}
-              retrying={retryMutation.isPending}
+      <div className="nw-frame">
+        <MissionTopbar agentPaused={agentPaused} hasLlmConfigured={hasLlmConfigured} />
+
+        <section className="nw-dashboard">
+          <div className="nw-dashboard-heading">
+            <MissionHeadline
+              rttMs={serverStatus?.rtt_ms ?? null}
+              liveRunCount={activeBackgroundSessions.length}
             />
-          ) : (
-            <Box className="overview-inline-note">
+          </div>
+
+          <div className="nw-dashboard-main">
+            <div className="nw-dashboard-stack">
+              <FocusCard state={focusState} body={activeObjective} />
+              <SuggestedStepCard
+                prompts={heroPrompts}
+                briefing={briefingQ.data}
+                onGoChat={() => navigateToView("chat")}
+                onRunBriefing={() => runBriefingMutation.mutate()}
+                onViewTasks={() => navigateToView("tasks")}
+                onExecuteAction={handleExecuteSuggestedAction}
+                briefingLoading={runBriefingMutation.isPending}
+                executing={executeActionMutation.isPending}
+              />
+              <OperationalSummaryCard
+                tasks={tasks}
+                traces={traces}
+                liveRunCount={activeBackgroundSessions.length}
+                requestCount={null}
+              />
+              <AutomationPostureCard
+                automationCounts={automationCounts}
+                surfaceTotal={automationSurfaceTotal}
+                headline={automationHeadline}
+                primaryIntegrationLabel={primaryIntegrationLabel}
+                onOpenInventory={() => setInventoryOpen(true)}
+              />
+            </div>
+
+            <div className="nw-dashboard-center">
+              <div className="nw-dashboard-graph">
+                <NeuralWebGraph
+                  skillCount={serverStatus?.status?.skills_loaded ?? serverStatus?.status?.actions_loaded ?? 0}
+                  memoryCount={serverStatus?.status?.memory_entries ?? 0}
+                  surfaceCount={automationSurfaceTotal}
+                  integrationCount={automationCounts.integrations}
+                  taskCount={automationCounts.tasks}
+                  watcherCount={automationCounts.watchers}
+                  liveRunCount={activeBackgroundSessions.length}
+                  modelConfigured={hasLlmConfigured}
+                  autonomyActive={!agentPaused}
+                  rttMs={serverStatus?.rtt_ms ?? null}
+                  serverError={serverError}
+                />
+              </div>
+            </div>
+
+            <div className="nw-dashboard-stack">
+              <SystemPostureCard
+                serverStatus={serverStatus}
+                serverError={serverError}
+                serverLoading={serverLoading}
+                currentTaskDesc={currentTask}
+                agentPaused={agentPaused}
+                hasLlmConfigured={hasLlmConfigured}
+                automationCounts={automationCounts}
+                recentFailureTitle={recentFailedAutomationRun?.title || recentFailedAutomationRun?.summary || null}
+              />
+              <NeuralWebStatsCard
+                nodes={12}
+                edges={18}
+                coherence={0.94}
+                pulseMs={serverStatus?.rtt_ms ?? 0}
+              />
+              <NeedsAttentionCard
+                tasks={tasks}
+                notifications={notifications}
+                securityLogs={securityLogs}
+                settingsLoaded={!settingsQ.isLoading}
+                hasLlmConfigured={hasLlmConfigured}
+                onApprove={(id) => approveMutation.mutate(id)}
+                onReject={(id) => rejectMutation.mutate(id)}
+                onRetry={(id) => retryMutation.mutate(id)}
+                onNavigate={navigateToView}
+                approving={approveMutation.isPending}
+                rejecting={rejectMutation.isPending}
+                retrying={retryMutation.isPending}
+              />
+            </div>
+          </div>
+        </section>
+
+        {/* Active background sessions row (preserved) */}
+        {showActiveSessionsPanel ? (
+          <Box className="overview-inline-note overview-inline-note--sessions" sx={{ mt: 1.5 }}>
+            <Stack spacing={1}>
               <Stack
                 direction={{ xs: "column", sm: "row" }}
                 spacing={1}
@@ -803,214 +880,55 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                 }}>
                 <Box>
                   <Typography variant="overline" className="overview-inline-note__kicker">
-                    Operator Queue
-                  </Typography>
-                  <Typography variant="body2" sx={{ color: "text.primary", fontWeight: 600 }}>
-                    No approvals, failures, or urgent interventions are waiting.
-                  </Typography>
-                </Box>
-                <Button variant="outlined" size="small" onClick={() => navigateToView("tasks")}>
-                  Review Tasks
-                </Button>
-                </Stack>
-              </Box>
-          )}
-
-          {showActiveSessionsPanel ? (
-            <Box className="overview-inline-note overview-inline-note--sessions">
-              <Stack spacing={1}>
-                <Stack
-                  direction={{ xs: "column", sm: "row" }}
-                  spacing={1}
-                  sx={{
-                    alignItems: { xs: "flex-start", sm: "center" },
-                    justifyContent: "space-between"
-                  }}>
-                  <Box>
-                  <Typography variant="overline" className="overview-inline-note__kicker">
                     Active Sessions
                   </Typography>
                   <Typography variant="body2" sx={{ color: "text.primary", fontWeight: 600 }}>
                     {`${activeBackgroundSessions.length} background session${activeBackgroundSessions.length === 1 ? "" : "s"} currently have ongoing work or supervision state.`}
                   </Typography>
                 </Box>
-                  <Button variant="outlined" size="small" onClick={() => navigateToView("status")}>
-                    Open Background Work
-                  </Button>
-                </Stack>
-                <Stack spacing={0.75}>
-                  {activeBackgroundSessions.slice(0, 3).map((session) => (
-                    <Stack
-                      key={session.id}
-                      direction="row"
-                      spacing={0.75}
-                      sx={{
-                        alignItems: "center",
-                        px: 0.9,
-                        py: 0.75,
-                        borderRadius: 2,
-                        background: "var(--ui-rgba-255-255-255-030)",
-                        border: "1px solid var(--ui-rgba-255-255-255-080)"
-                      }}>
-                      <Chip size="small" label={session.status.replace(/_/g, " ")} color={automationStatusColor(session.status)} />
-                      <Box sx={{ minWidth: 0, flex: 1 }}>
-                        <Typography variant="body2" noWrap sx={{ fontWeight: 600 }} title={session.title}>
-                          {session.title}
-                        </Typography>
-                        <Typography variant="caption" noWrap title={session.live_summary} sx={{
-                          color: "text.secondary"
-                        }}>
-                          {session.live_summary}
-                        </Typography>
-                      </Box>
-                    </Stack>
-                  ))}
-                </Stack>
+                <Button variant="outlined" size="small" onClick={() => navigateToView("status")}>
+                  Open Background Work
+                </Button>
               </Stack>
-            </Box>
-          ) : null}
-
-          <Box className={`overview-bento-grid ${showActivityFeed ? "overview-bento-grid--three" : "overview-bento-grid--two"}`}>
-            <Box className="overview-panel-slot">
-              <Box className="overview-action-card mission-panel mission-panel--adaptive">
-                <Stack spacing={1.15} className="mission-panel-content">
-                  <Stack spacing={1.15} className="mission-panel-section">
-                    <Box>
-                      <Typography
-                        variant="overline"
-                        sx={{
-                          color: "var(--ui-rgba-183-188-196-680)",
-                          letterSpacing: 0,
-                          display: "block",
-                          mb: 0.35
-                        }}
-                      >
-                        Automation Posture
+              <Stack spacing={0.75}>
+                {activeBackgroundSessions.slice(0, 3).map((session) => (
+                  <Stack
+                    key={session.id}
+                    direction="row"
+                    spacing={0.75}
+                    sx={{
+                      alignItems: "center",
+                      px: 0.9,
+                      py: 0.75,
+                      borderRadius: 2,
+                      background: "var(--ui-rgba-255-255-255-030)",
+                      border: "1px solid var(--ui-rgba-255-255-255-080)"
+                    }}>
+                    <Chip size="small" label={session.status.replace(/_/g, " ")} color={automationStatusColor(session.status)} />
+                    <Box sx={{ minWidth: 0, flex: 1 }}>
+                      <Typography variant="body2" noWrap sx={{ fontWeight: 600 }} title={session.title}>
+                        {session.title}
                       </Typography>
-                      <Typography variant="h6" sx={{ fontWeight: 700, mb: 0.45 }}>
-                        Live surfaces and system drift.
-                      </Typography>
-                      <Typography variant="body2" sx={{
+                      <Typography variant="caption" noWrap title={session.live_summary} sx={{
                         color: "text.secondary"
                       }}>
-                        {automationHeadline}
+                        {session.live_summary}
                       </Typography>
                     </Box>
-
-                    <Box
-                      sx={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-                        gap: 0.85,
-                      }}
-                    >
-                      {[
-                        { label: "Tasks", value: automationCounts.tasks },
-                        { label: "Watchers", value: automationCounts.watchers },
-                        { label: "Apps", value: automationCounts.apps },
-                        { label: "Integrations", value: automationCounts.integrations },
-                      ].map((item) => (
-                        <Box
-                          key={item.label}
-                          className="mission-metric-card"
-                          sx={{
-                            px: 1,
-                            py: 0.9,
-                          }}
-                        >
-                          <Typography variant="caption" className="mission-metric-card__label">
-                            {item.label}
-                          </Typography>
-                          <Typography variant="subtitle1" className="mission-metric-card__value" sx={{ mt: 0.2 }}>
-                            {item.value}
-                          </Typography>
-                        </Box>
-                      ))}
-                    </Box>
-
-                    {recentFailedAutomationRun ? (
-                      <Alert severity="warning" sx={{ py: 0.3 }}>
-                        Degraded run: {recentFailedAutomationRun.title || recentFailedAutomationRun.summary}
-                      </Alert>
-                    ) : automationPreview.length > 0 ? (
-                      <Stack spacing={0.5}>
-                        {automationPreview.slice(0, 3).map((item) => (
-                          <Stack
-                            key={`${item.kind}-${item.id}`}
-                            direction="row"
-                            spacing={0.75}
-                            sx={{
-                              alignItems: "center",
-                              px: 0.9,
-                              py: 0.7,
-                              borderRadius: 2,
-                              background: "var(--ui-rgba-255-255-255-030)",
-                              border: "1px solid var(--ui-rgba-255-255-255-080)"
-                            }}>
-                            <Chip size="small" label={automationKindLabel(item.kind)} />
-                            <Typography variant="body2" noWrap sx={{ minWidth: 0, flex: 1 }} title={item.title}>
-                              {item.title}
-                            </Typography>
-                          </Stack>
-                        ))}
-                      </Stack>
-                    ) : (
-                      <Typography variant="body2" sx={{
-                        color: "text.secondary"
-                      }}>
-                        Runtime inventory is quiet. The system is standing by for a new surface or trigger.
-                      </Typography>
-                    )}
                   </Stack>
-
-                  <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85} className="mission-panel-footer">
-                    <Button variant="contained" size="small" onClick={() => setInventoryOpen(true)}>
-                      Automation Inventory
-                    </Button>
-                    <Button variant="outlined" size="small" onClick={() => setActivityOpen(true)}>
-                      Recent Activity
-                    </Button>
-                    <Button variant="outlined" size="small" onClick={() => navigateToView("trace")}>
-                      Open Trace
-                    </Button>
-                  </Stack>
-                </Stack>
-              </Box>
-            </Box>
-            <Box className="overview-panel-slot">
-              <TodaysHighlights tasks={tasks} traces={traces} />
-            </Box>
-            {showActivityFeed ? (
-              <Box className="overview-panel-slot">
-                <ActivityFeed
-                  traces={traces}
-                  onViewAll={() => {
-                    setActivityOpen(true);
-                  }}
-                />
-              </Box>
-            ) : null}
+                ))}
+              </Stack>
+            </Stack>
           </Box>
-        </Box>
+        ) : null}
 
-        <Box className="overview-side-column">
-          <AgentStatusBar
-            serverStatus={serverStatus}
-            serverError={serverError}
-            serverLoading={serverLoading}
-            currentTaskDesc={currentTask}
-            agentPaused={agentPaused}
-            hasLlmConfigured={hasLlmConfigured}
-            automationCounts={automationCounts}
-            recentFailureTitle={recentFailedAutomationRun?.title || recentFailedAutomationRun?.summary || null}
-          />
-          <SmartSuggestions
-            briefing={briefingQ.data}
-            onExecuteAction={handleExecuteSuggestedAction}
-            executing={executeActionMutation.isPending}
-          />
-        </Box>
-      </Box>
+        {/* Inline activity feed (preserved when traces exist and not surfaced via runtime card) */}
+        {showActivityFeed ? (
+          <div style={{ display: "none" }}>
+            <ActivityFeed traces={traces} onViewAll={() => setActivityOpen(true)} />
+          </div>
+        ) : null}
+      </div>
       {/* Automation Inventory Dialog */}
       <Dialog
         open={inventoryOpen}

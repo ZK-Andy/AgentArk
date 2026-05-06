@@ -926,7 +926,7 @@ async fn claim_daily_opportunity_nudge(
 }
 
 fn sentinel_channel_for_action(action_kind: &str) -> bool {
-    matches!(action_kind, "chat_prompt" | "create_task")
+    matches!(action_kind, "chat_prompt" | "create_task" | "watch")
 }
 
 fn decorate_action_for_sentinel(
@@ -2562,6 +2562,49 @@ pub(super) async fn approve_sentinel_proposal(
         }),
     )
         .into_response()
+}
+
+pub(super) async fn update_chat_suggestion_proposal_run_state(
+    storage: &crate::storage::Storage,
+    proposal_id: Option<&str>,
+    suggestion_id: &str,
+    status: &str,
+    run_status: &str,
+    trace_id: Option<&str>,
+    summary: Option<&str>,
+) {
+    let suggestion_id = suggestion_id.trim();
+    if suggestion_id.is_empty() {
+        return;
+    }
+    let proposal_id = proposal_id.map(str::trim).filter(|value| !value.is_empty());
+    let mut proposals = load_proposals(storage).await;
+    let now = now_rfc3339();
+    let mut changed = false;
+    for proposal in proposals.iter_mut() {
+        let is_match = proposal_id
+            .map(|id| proposal.id == id)
+            .unwrap_or_else(|| proposal.chat_suggestion_id.as_deref() == Some(suggestion_id));
+        if !is_match {
+            continue;
+        }
+        proposal.status = status.to_string();
+        proposal.run_status = Some(run_status.to_string());
+        proposal.updated_at = now.clone();
+        if proposal.approved_at.is_none() && status != "open" {
+            proposal.approved_at = Some(now.clone());
+        }
+        if let Some(trace_id) = trace_id.map(str::trim).filter(|value| !value.is_empty()) {
+            proposal.trace_id = Some(trace_id.to_string());
+        }
+        if let Some(summary) = summary.map(str::trim).filter(|value| !value.is_empty()) {
+            proposal.last_run_summary = Some(summary.to_string());
+        }
+        changed = true;
+    }
+    if changed {
+        save_proposals(storage, &proposals).await;
+    }
 }
 
 pub(super) async fn dismiss_sentinel_proposal(

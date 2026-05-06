@@ -383,36 +383,38 @@ async fn slack_api_post_message(
         "{}/chat.postMessage",
         trim_trailing_slashes(&config.api_base_url)
     );
-    let mut body = serde_json::json!({
-        "channel": destination.channel_id,
-        "text": text,
-        "mrkdwn": true,
-        "unfurl_links": true,
-        "unfurl_media": true
-    });
-    let thread_ts = destination
-        .thread_ts
-        .as_deref()
-        .or(config.default_thread_ts.as_deref());
-    if let Some(thread_ts) = thread_ts {
-        body["thread_ts"] = Value::String(thread_ts.to_string());
-    }
+    for text in super::outbound_split::split_for_provider_safe_channel("slack", text) {
+        let mut body = serde_json::json!({
+            "channel": destination.channel_id,
+            "text": text,
+            "mrkdwn": true,
+            "unfurl_links": true,
+            "unfurl_media": true
+        });
+        let thread_ts = destination
+            .thread_ts
+            .as_deref()
+            .or(config.default_thread_ts.as_deref());
+        if let Some(thread_ts) = thread_ts {
+            body["thread_ts"] = Value::String(thread_ts.to_string());
+        }
 
-    let response = super::outbound_rate_limit::send_with_bounded_retries(
-        "slack",
-        "chat.postMessage",
-        client.post(&url).bearer_auth(&config.bot_token).json(&body),
-    )
-    .await?;
+        let response = super::outbound_rate_limit::send_with_bounded_retries(
+            "slack",
+            "chat.postMessage",
+            client.post(&url).bearer_auth(&config.bot_token).json(&body),
+        )
+        .await?;
 
-    let status = response.status();
-    let payload = response
-        .json::<SlackApiResponse>()
-        .await
-        .unwrap_or_default();
-    if !status.is_success() || !payload.ok {
-        let error = payload.error.unwrap_or(status.to_string());
-        return Err(anyhow!("Slack API error: {}", error));
+        let status = response.status();
+        let payload = response
+            .json::<SlackApiResponse>()
+            .await
+            .unwrap_or_default();
+        if !status.is_success() || !payload.ok {
+            let error = payload.error.unwrap_or(status.to_string());
+            return Err(anyhow!("Slack API error: {}", error));
+        }
     }
 
     Ok(())

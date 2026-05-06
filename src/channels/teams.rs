@@ -1072,21 +1072,23 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("Teams is not configured"))?;
     let destination = load_default_destination(&config)?
         .ok_or_else(|| anyhow!("Teams has no delivery destination yet"))?;
-    send_message_to_destination(
-        &config,
-        &destination,
-        &TeamsOutboundMessage {
-            conversation_id: destination.conversation_id.clone(),
-            text: text.to_string(),
-            reply_to_id: destination.last_reply_to_id.clone(),
-            service_url: destination.service_url.clone(),
-            team_id: destination.team_id.clone(),
-            channel_id: destination.channel_id.clone(),
-            chat_id: destination.chat_id.clone(),
-            content_type: None,
-        },
-    )
-    .await?;
+    for chunk in super::outbound_split::split_for_provider_safe_channel("teams", text) {
+        send_message_to_destination(
+            &config,
+            &destination,
+            &TeamsOutboundMessage {
+                conversation_id: destination.conversation_id.clone(),
+                text: chunk,
+                reply_to_id: destination.last_reply_to_id.clone(),
+                service_url: destination.service_url.clone(),
+                team_id: destination.team_id.clone(),
+                channel_id: destination.channel_id.clone(),
+                chat_id: destination.chat_id.clone(),
+                content_type: None,
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1427,26 +1429,30 @@ pub async fn handle_activity(
     };
 
     if !response_text.trim().is_empty() {
-        if let Err(error) = send_message_to_destination(
-            config,
-            &destination,
-            &TeamsOutboundMessage {
-                conversation_id: conversation_id.clone(),
-                text: response_text.clone(),
-                reply_to_id: activity
-                    .id
-                    .clone()
-                    .or_else(|| destination.last_reply_to_id.clone()),
-                service_url: destination.service_url.clone(),
-                team_id: destination.team_id.clone(),
-                channel_id: destination.channel_id.clone(),
-                chat_id: destination.chat_id.clone(),
-                content_type: None,
-            },
-        )
-        .await
+        for chunk in super::outbound_split::split_for_provider_safe_channel("teams", &response_text)
         {
-            tracing::warn!("Teams reply send failed: {}", error);
+            if let Err(error) = send_message_to_destination(
+                config,
+                &destination,
+                &TeamsOutboundMessage {
+                    conversation_id: conversation_id.clone(),
+                    text: chunk,
+                    reply_to_id: activity
+                        .id
+                        .clone()
+                        .or_else(|| destination.last_reply_to_id.clone()),
+                    service_url: destination.service_url.clone(),
+                    team_id: destination.team_id.clone(),
+                    channel_id: destination.channel_id.clone(),
+                    chat_id: destination.chat_id.clone(),
+                    content_type: None,
+                },
+            )
+            .await
+            {
+                tracing::warn!("Teams reply send failed: {}", error);
+                break;
+            }
         }
     }
 

@@ -360,6 +360,33 @@ PY
     exit 1
 }
 
+ensure_agentark_master_key_secret() {
+    local role
+    role=$(normalized_stack_role)
+    case "$role" in
+        control|executor)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    if [ ! -s /run/secrets/agentark_master_key ]; then
+        echo -e "${RED}Missing install-managed encryption secret at /run/secrets/agentark_master_key.${NC}" >&2
+        echo -e "${RED}Start AgentArk with the bundled compose file so the agentark-secrets volume is initialized.${NC}" >&2
+        echo -e "${RED}For this pre-release local data, run 'docker compose down -v' before starting again.${NC}" >&2
+        exit 1
+    fi
+
+    if ! gosu agent sh -c 'test -r /run/secrets/agentark_master_key'; then
+        echo -e "${RED}Install-managed encryption secret exists but is not readable by the agent user.${NC}" >&2
+        echo -e "${RED}Recreate the bundled compose stack so the agentark-secrets volume is initialized with readable secret permissions.${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "${GREEN}Install-managed encryption secret available from agentark-secrets volume.${NC}"
+}
+
 # Run setup as root
 setup_docker_socket
 check_volume_mount
@@ -371,14 +398,10 @@ fi
 
 load_internal_service_tokens
 build_database_url_from_secret
+ensure_agentark_master_key_secret
 
 # WhatsApp bridge is bundled in the full image and managed by the AgentArk backend on demand
 # when WhatsApp Baileys runs in bundled bridge mode. Cloud API mode does not start it.
-
-# Confirm Docker secret is available for direct app reads (if present)
-if [ -f /run/secrets/agentark_master_key ]; then
-    echo -e "${GREEN}Docker secret found - application will read the encryption secret directly from /run/secrets${NC}"
-fi
 
 # Print startup banner
 print_startup_banner

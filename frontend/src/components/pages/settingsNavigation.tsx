@@ -54,6 +54,7 @@ export const SETTINGS_NAV_GROUPS: SettingsNavGroup[] = [
     label: "Security",
     items: [
       { value: 4, label: "Security" },
+      { value: 16, label: "Sender Verification" },
       { value: 5, label: "Advanced" },
     ],
   },

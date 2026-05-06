@@ -1548,7 +1548,12 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
 
           <Box
             className="list-shell"
-            sx={{ gridColumn: { lg: "1" }, minWidth: 0 }}
+            sx={{
+              gridColumn: { lg: "1" },
+              minWidth: 0,
+              display: "flex",
+              flexDirection: "column",
+            }}
           >
             <Stack
               direction={{ xs: "column", md: "row" }}
@@ -1592,13 +1597,19 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
               </Tabs>
             </Box>
             {previewBreakdownRows.length === 0 ? (
-              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              <Typography
+                variant="body2"
+                sx={{ color: "text.secondary" }}
+              >
                 No analytics data yet for the selected range.
               </Typography>
             ) : (
               <TableContainer
                 className="table-shell"
-                sx={{ maxHeight: { xs: 360, md: 460 }, overflow: "auto" }}
+                sx={{
+                  maxHeight: { xs: 360, md: 560 },
+                  overflow: "auto",
+                }}
               >
                 <Table stickyHeader size="small">
                   <TableHead>

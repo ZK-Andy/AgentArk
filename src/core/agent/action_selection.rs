@@ -98,7 +98,10 @@ fn direct_reply_action_scope_query(message: &str, request_hints: &RequestExecuti
 pub(super) fn routing_signal_has_read_only_retrieval_need(
     routing: &crate::security::intent_classifier::InboundRoutingSignal,
 ) -> bool {
-    routing.product_help_expected || routing.live_state_expected || routing.external_info_expected
+    routing.agentark_capabilities_expected
+        || routing.agentark_manual_expected
+        || routing.live_state_expected
+        || routing.external_info_expected
 }
 
 fn semantic_read_only_action_gate_should_yield(

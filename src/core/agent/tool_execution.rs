@@ -1150,7 +1150,11 @@ impl Agent {
                 serde_json::Value::String(content.to_string()),
             );
         }
-        if out.is_empty() { None } else { Some(out) }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     fn safe_app_relative_file_key(key: &str) -> Option<String> {
@@ -1492,7 +1496,11 @@ impl Agent {
                 }
             }
         }
-        if files.is_empty() { None } else { Some(files) }
+        if files.is_empty() {
+            None
+        } else {
+            Some(files)
+        }
     }
 
     /// Recover files from a top-level object that has no `files` key and no nested wrapper.
@@ -2646,9 +2654,9 @@ impl Agent {
                         obj.insert("running".to_string(), serde_json::json!(status.running));
                         obj.insert(
                             "runtime_mode".to_string(),
-                            serde_json::json!(
-                                status.runtime_mode.unwrap_or_else(|| "stopped".to_string())
-                            ),
+                            serde_json::json!(status
+                                .runtime_mode
+                                .unwrap_or_else(|| "stopped".to_string())),
                         );
                         obj.insert(
                             "port".to_string(),
@@ -3182,6 +3190,7 @@ impl Agent {
         app_url_with_key: &str,
         app_id: &str,
         app_type: &str,
+        app_access_key: Option<&str>,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<(
         Option<String>,
@@ -3190,6 +3199,17 @@ impl Agent {
         String,
         Option<crate::integrations::browser::PageContent>,
     )> {
+        let validation_started = std::time::Instant::now();
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_validation_start",
+            app_id = %app_id,
+            app_type = %app_type,
+            has_access_key = app_access_key
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty()),
+            "app deploy validation timing start"
+        );
         let http_client = Self::build_internal_control_client().ok();
         let internal_probe_url = if app_url_with_key.starts_with("http://")
             || app_url_with_key.starts_with("https://")
@@ -3202,6 +3222,16 @@ impl Agent {
         };
 
         let Some(client) = http_client else {
+            tracing::debug!(
+                target: "agentark.turn_timing",
+                stage = "app_deploy_validation_total",
+                app_id = %app_id,
+                app_type = %app_type,
+                duration_ms = validation_started.elapsed().as_millis() as u64,
+                success = false,
+                issue = "http_client_unavailable",
+                "app deploy validation timing total"
+            );
             return Ok((
                 None,
                 false,
@@ -3230,7 +3260,16 @@ impl Agent {
             );
         }
 
-        let mut last_error = match client.get(&internal_probe_url).send().await {
+        let mut probe_request = client.get(&internal_probe_url);
+        if let Some(access_key) = app_access_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            probe_request = probe_request.header("x-agentark-app-key", access_key);
+        }
+
+        let probe_started = std::time::Instant::now();
+        let mut last_error = match probe_request.send().await {
             Ok(resp) if resp.status().is_success() => {
                 let status = resp.status();
                 let content_type = resp
@@ -3242,6 +3281,17 @@ impl Agent {
                 let body = match resp.text().await {
                     Ok(body) => body,
                     Err(error) => {
+                        tracing::debug!(
+                            target: "agentark.turn_timing",
+                            stage = "app_deploy_validation_probe",
+                            app_id = %app_id,
+                            app_type = %app_type,
+                            duration_ms = probe_started.elapsed().as_millis() as u64,
+                            success = false,
+                            status = %status,
+                            issue = "body_read_failed",
+                            "app deploy validation probe failed"
+                        );
                         return Ok((
                             None,
                             false,
@@ -3261,18 +3311,63 @@ impl Agent {
                     &body,
                 ) {
                     Ok(detail) => {
+                        tracing::debug!(
+                            target: "agentark.turn_timing",
+                            stage = "app_deploy_validation_total",
+                            app_id = %app_id,
+                            app_type = %app_type,
+                            duration_ms = validation_started.elapsed().as_millis() as u64,
+                            probe_duration_ms = probe_started.elapsed().as_millis() as u64,
+                            success = true,
+                            status = %status,
+                            "app deploy validation timing total"
+                        );
                         return Ok((None, true, 1, detail, None));
                     }
                     Err(detail) => detail,
                 }
             }
-            Ok(resp) => format!("HTTP probe failed with status {}", resp.status()),
-            Err(error) => format!("HTTP probe request failed: {}", error),
+            Ok(resp) => {
+                tracing::debug!(
+                    target: "agentark.turn_timing",
+                    stage = "app_deploy_validation_probe",
+                    app_id = %app_id,
+                    app_type = %app_type,
+                    duration_ms = probe_started.elapsed().as_millis() as u64,
+                    success = false,
+                    status = %resp.status(),
+                    "app deploy validation probe failed"
+                );
+                format!("HTTP probe failed with status {}", resp.status())
+            }
+            Err(error) => {
+                tracing::debug!(
+                    target: "agentark.turn_timing",
+                    stage = "app_deploy_validation_probe",
+                    app_id = %app_id,
+                    app_type = %app_type,
+                    duration_ms = probe_started.elapsed().as_millis() as u64,
+                    success = false,
+                    error = %safe_truncate(&error.to_string(), 240),
+                    "app deploy validation probe failed"
+                );
+                format!("HTTP probe request failed: {}", error)
+            }
         };
 
         if let Some(runtime_hint) = self.build_app_runtime_failure_hint(app_id).await {
             last_error = format!("{}\n{}", last_error, runtime_hint);
         }
+        tracing::debug!(
+            target: "agentark.turn_timing",
+            stage = "app_deploy_validation_total",
+            app_id = %app_id,
+            app_type = %app_type,
+            duration_ms = validation_started.elapsed().as_millis() as u64,
+            success = false,
+            detail = %safe_truncate(&last_error, 240),
+            "app deploy validation timing total"
+        );
         Ok((None, false, 1, last_error, None))
     }
 
@@ -4910,11 +5005,16 @@ impl Agent {
                     .collect()
             })
             .unwrap_or_default();
+        let expose_public = meta
+            .get("expose_public")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let access_guard_enabled = meta
             .get("access_guard_enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let access_key = if access_guard_enabled {
+        let public_access_guard_enabled = access_guard_enabled || expose_public;
+        let access_key = if public_access_guard_enabled {
             self.app_registry
                 .access_key(app_id)
                 .await
@@ -4922,12 +5022,10 @@ impl Agent {
         } else {
             String::new()
         };
-        let expose_public = meta
-            .get("expose_public")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
-        if meta.get("access_guard_enabled").is_none() || meta.get("access_key").is_some() {
+        if meta.get("access_guard_enabled").and_then(|v| v.as_bool()) != Some(access_guard_enabled)
+            || meta.get("access_key").is_some()
+        {
             meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
             if let Some(obj) = meta.as_object_mut() {
                 obj.remove("access_key");
@@ -5007,6 +5105,7 @@ impl Agent {
                 "access_url": relative_access_url,
                 "local_access_url": local_access_url,
                 "access_guard_enabled": access_guard_enabled,
+                "public_access_guard_enabled": public_access_guard_enabled,
                 "access_key": access_key.clone(),
                 "access_password": access_key,
                 "expose_public": expose_public,
@@ -5015,6 +5114,7 @@ impl Agent {
                     .get("runtime_mode")
                     .and_then(|value| value.as_str())
                     .unwrap_or("executor"),
+                "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
             }));
         }
 
@@ -5066,6 +5166,7 @@ impl Agent {
                     "required_secrets": required_secret_keys.clone(),
                     "required_env": required_secret_keys,
                     "required_config": required_config_keys,
+                    "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
                     "message": "Missing required inputs. Use the secure credential form in chat or Settings for sensitive values; provide config for non-sensitive values."
                 }));
             }
@@ -5136,11 +5237,13 @@ impl Agent {
                 "access_url": relative_access_url,
                 "local_access_url": local_access_url,
                 "access_guard_enabled": access_guard_enabled,
+                "public_access_guard_enabled": public_access_guard_enabled,
                 "access_key": access_key.clone(),
                 "access_password": access_key,
                 "expose_public": expose_public,
                 "port": port,
                 "runtime_preference": runtime_preference.as_str(),
+                "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
             }));
         }
 
@@ -5169,10 +5272,12 @@ impl Agent {
             "access_url": relative_access_url,
             "local_access_url": local_access_url,
             "access_guard_enabled": access_guard_enabled,
+            "public_access_guard_enabled": public_access_guard_enabled,
             "access_key": access_key.clone(),
             "access_password": access_key,
             "expose_public": expose_public,
             "runtime_preference": runtime_preference.as_str(),
+            "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
         }))
     }
 
@@ -6497,6 +6602,134 @@ impl Agent {
             results.push(value);
         }
 
+        if !imported.prompt_fragment_candidates.is_empty() {
+            let current_fragment_raw = self
+                .storage
+                .get(crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY)
+                .await
+                .ok()
+                .flatten();
+            let result =
+                crate::core::self_evolve::prompt_fragment_evolution::evaluate_external_prompt_fragment_candidates(
+                    project_root.clone(),
+                    request,
+                    current_fragment_raw.as_deref(),
+                    imported.prompt_fragment_candidates,
+                )
+                .await?;
+
+            let mut promotion_applied = false;
+            let mut canary_state: Option<
+                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+            > = None;
+            let mut replay_result: Option<
+                crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
+            > = None;
+            if result.promoted && apply_promotion {
+                if let Some(bundle) = result.promoted_prompt_fragment_bundle.as_ref() {
+                    let candidate_serialized = serde_json::to_vec(bundle)?;
+                    if let Some(existing_baseline) = current_fragment_raw.as_ref() {
+                        let _ = self
+                            .storage
+                            .set(
+                                crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+                                existing_baseline,
+                            )
+                            .await;
+                    }
+                    let baseline_bundle_version = current_fragment_raw
+                        .as_ref()
+                        .and_then(|raw| {
+                            crate::core::prompt_fragments::parse_prompt_fragment_bundle_profile(raw)
+                                .map(|bundle| bundle.version)
+                        })
+                        .unwrap_or_else(|| result.baseline_version.clone());
+                    let baseline_version =
+                        crate::core::prompt_fragments::compose_prompt_fragment_version(
+                            &baseline_bundle_version,
+                        );
+                    let candidate_version =
+                        crate::core::prompt_fragments::compose_prompt_fragment_version(
+                            &result.candidate_version,
+                        );
+                    self.storage
+                        .set(
+                            crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_PROFILE_CANARY_KEY,
+                            &candidate_serialized,
+                        )
+                        .await?;
+                    let state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+                        enabled: true,
+                        baseline_version,
+                        candidate_version,
+                        rollout_percent: canary_rollout_percent,
+                        min_samples_per_version: canary_min_samples_per_version,
+                        min_success_gain: canary_min_success_gain,
+                        max_sign_test_p_value: canary_max_sign_test_p_value,
+                        activated_at: Some(chrono::Utc::now().to_rfc3339()),
+                    };
+                    self.storage
+                        .set(
+                            crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_CANARY_STATE_KEY,
+                            &serde_json::to_vec(&state)?,
+                        )
+                        .await?;
+                    canary_state = Some(state.clone());
+                    if let Ok(traces) = self
+                        .storage
+                        .list_execution_trace_summaries(None, replay_log_limit, 0)
+                        .await
+                    {
+                        replay_result = Some(
+                            crate::core::self_evolve::strategy_runtime::evaluate_trace_prompt_telemetry_canary_by_version(
+                                &traces,
+                                "prompt_fragment_version",
+                                &state.baseline_version,
+                                &state.candidate_version,
+                                state.min_samples_per_version,
+                                state.min_success_gain,
+                                state.max_sign_test_p_value,
+                            ),
+                        );
+                    }
+                    promotion_applied = true;
+                }
+            }
+            let mut value = serde_json::to_value(&result)?;
+            if let serde_json::Value::Object(obj) = &mut value {
+                obj.insert(
+                    "mode".to_string(),
+                    serde_json::json!("gepa_import_prompt_fragment"),
+                );
+                obj.insert(
+                    "promotion_applied".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+                obj.insert(
+                    "promotion_mode".to_string(),
+                    serde_json::json!(if promotion_applied { "canary" } else { "none" }),
+                );
+                obj.insert(
+                    "canary_state".to_string(),
+                    serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "replay_evaluation".to_string(),
+                    serde_json::to_value(&replay_result).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if let Ok(bytes) = serde_json::to_vec(&value) {
+                let _ = self
+                    .storage
+                    .set(
+                        crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_LAST_RESULT_KEY,
+                        &bytes,
+                    )
+                    .await;
+            }
+            results.push(value);
+        }
+
         Ok(serde_json::json!({
             "status": "completed",
             "mode": "gepa_import",
@@ -7027,8 +7260,8 @@ impl Agent {
                         }
                     } else {
                         format!(
-                            "Policy evolution complete: no promotion ({})",
-                            result.promotion_gate
+                            "Policy evolution complete: {}",
+                            result.promotion_gate_summary
                         )
                     };
                     queue_stream_event(
@@ -7054,11 +7287,11 @@ impl Agent {
                 };
                 let policy_detail = if result.success {
                     format!(
-                        "Evaluated {} candidate policies. Accuracy {:.0}% -> {:.0}% with gate `{}`.",
+                        "Evaluated {} candidate policies. Accuracy {:.0}% -> {:.0}% with gate: {}",
                         result.evaluated_candidates,
                         result.baseline_accuracy * 100.0,
                         result.best_candidate_accuracy * 100.0,
-                        result.promotion_gate
+                        result.promotion_gate_summary
                     )
                 } else {
                     format!(
@@ -7088,6 +7321,8 @@ impl Agent {
                         "p_value": result.p_value,
                         "candidate_source": result.candidate_source.clone(),
                         "promotion_gate": result.promotion_gate.clone(),
+                        "promotion_gate_summary": result.promotion_gate_summary.clone(),
+                        "promotion_gate_report": result.promotion_gate_report.clone(),
                         "lineage_entry_id": result.lineage_entry_id.clone(),
                         "lineage_archive_path": result.lineage_archive_path.clone(),
                         "notes": result.notes.clone(),
@@ -7119,7 +7354,7 @@ impl Agent {
                 } else if result.promoted {
                     "Candidate passed the promotion gate but was not applied.".to_string()
                 } else {
-                    format!("No promotion applied because `{}`.", result.promotion_gate)
+                    format!("No promotion applied. {}", result.promotion_gate_summary)
                 };
                 push_trace_step(
                     trace_ref,
@@ -7365,8 +7600,8 @@ impl Agent {
                         }
                     } else {
                         format!(
-                            "Prompt evolution complete: no promotion ({})",
-                            result.promotion_gate
+                            "Prompt evolution complete: {}",
+                            result.promotion_gate_summary
                         )
                     };
                     queue_stream_event(
@@ -7390,11 +7625,11 @@ impl Agent {
                     "Prompt Evolution Evaluated",
                     if result.success {
                         format!(
-                            "Evaluated {} prompt candidates. Score {:.0}% -> {:.0}% with gate `{}`.",
+                            "Evaluated {} prompt candidates. Score {:.0}% -> {:.0}% with gate: {}",
                             result.evaluated_candidates,
                             result.baseline_score * 100.0,
                             result.best_candidate_score * 100.0,
-                            result.promotion_gate
+                            result.promotion_gate_summary
                         )
                     } else {
                         format!(
@@ -7434,6 +7669,8 @@ impl Agent {
                         "candidate_source": result.candidate_source.clone(),
                         "optimized_surfaces": result.optimized_surfaces.clone(),
                         "promotion_gate": result.promotion_gate.clone(),
+                        "promotion_gate_summary": result.promotion_gate_summary.clone(),
+                        "promotion_gate_report": result.promotion_gate_report.clone(),
                         "lineage_entry_id": result.lineage_entry_id.clone(),
                         "lineage_archive_path": result.lineage_archive_path.clone(),
                         "notes": result.notes.clone(),
@@ -7466,8 +7703,8 @@ impl Agent {
                     "Prompt candidate passed the promotion gate but was not applied.".to_string()
                 } else {
                     format!(
-                        "No prompt promotion applied because `{}`.",
-                        result.promotion_gate
+                        "No prompt promotion applied. {}",
+                        result.promotion_gate_summary
                     )
                 };
                 push_trace_step(
@@ -7875,8 +8112,8 @@ impl Agent {
                 }
             } else {
                 format!(
-                    "Specialist prompt evolution complete: no promotion ({})",
-                    result.promotion_gate
+                    "Specialist prompt evolution complete: {}",
+                    result.promotion_gate_summary
                 )
             };
             queue_stream_event(
@@ -7900,11 +8137,11 @@ impl Agent {
             "Specialist Prompt Evolution Evaluated",
             if result.success {
                 format!(
-                    "Evaluated {} specialist prompt candidates. Score {:.0}% -> {:.0}% with gate `{}`.",
+                    "Evaluated {} specialist prompt candidates. Score {:.0}% -> {:.0}% with gate: {}",
                     result.evaluated_candidates,
                     result.baseline_score * 100.0,
                     result.best_candidate_score * 100.0,
-                    result.promotion_gate
+                    result.promotion_gate_summary
                 )
             } else {
                 format!(
@@ -7937,6 +8174,8 @@ impl Agent {
                 "candidate_source": result.candidate_source.clone(),
                 "optimized_surfaces": result.optimized_surfaces.clone(),
                 "promotion_gate": result.promotion_gate.clone(),
+                "promotion_gate_summary": result.promotion_gate_summary.clone(),
+                "promotion_gate_report": result.promotion_gate_report.clone(),
                 "lineage_entry_id": result.lineage_entry_id.clone(),
                 "lineage_archive_path": result.lineage_archive_path.clone(),
                 "notes": result.notes.clone(),
@@ -7975,8 +8214,8 @@ impl Agent {
                     .to_string()
             } else {
                 format!(
-                    "No specialist prompt promotion applied because `{}`.",
-                    result.promotion_gate
+                    "No specialist prompt promotion applied. {}",
+                    result.promotion_gate_summary
                 )
             },
             if promotion_applied { "success" } else { "info" },
@@ -8921,32 +9160,29 @@ impl Agent {
                     }
                 }
                 if resolved_args
-                    .get("access_guard")
-                    .and_then(|v| v.as_bool())
-                    .is_none()
-                {
-                    let guard_default = self
-                        .storage
-                        .get(
-                            crate::core::self_evolve::strategy_runtime::APP_DEPLOY_ACCESS_GUARD_DEFAULT_KEY,
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|raw| String::from_utf8(raw).ok())
-                        .map(|s| s.trim().eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
-                    if let Some(obj) = resolved_args.as_object_mut() {
-                        obj.insert("access_guard".to_string(), serde_json::json!(guard_default));
-                    }
-                }
-                if resolved_args
                     .get("expose_public")
                     .and_then(|v| v.as_bool())
                     .is_none()
                 {
                     if let Some(obj) = resolved_args.as_object_mut() {
                         obj.insert("expose_public".to_string(), serde_json::json!(false));
+                    }
+                }
+                let expose_public_requested = resolved_args
+                    .get("expose_public")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if expose_public_requested {
+                    if let Some(obj) = resolved_args.as_object_mut() {
+                        obj.insert("access_guard".to_string(), serde_json::json!(true));
+                    }
+                } else if resolved_args
+                    .get("access_guard")
+                    .and_then(|v| v.as_bool())
+                    .is_none()
+                {
+                    if let Some(obj) = resolved_args.as_object_mut() {
+                        obj.insert("access_guard".to_string(), serde_json::json!(false));
                     }
                 }
                 if let Some(cid) = conversation_id
@@ -9127,12 +9363,20 @@ impl Agent {
                 let mut deploy_args_for_result = resolved_args.clone();
                 let mut app_deploy_repair_signatures = std::collections::HashSet::new();
                 for _ in 0..3 {
+                    let preflight_started = std::time::Instant::now();
                     let preflight_result = crate::actions::app::app_deploy_preflight(
                         &self.data_dir,
                         &deploy_args_for_result,
                         &self.app_registry,
                     )
                     .await;
+                    tracing::debug!(
+                        target: "agentark.turn_timing",
+                        stage = "app_deploy_preflight",
+                        duration_ms = preflight_started.elapsed().as_millis() as u64,
+                        success = preflight_result.is_ok(),
+                        "app deploy preflight timing"
+                    );
                     let Err(error) = preflight_result else {
                         break;
                     };
@@ -9163,6 +9407,7 @@ impl Agent {
                     }
                     deploy_args_for_result = repaired_args;
                 }
+                let preflight_started = std::time::Instant::now();
                 if let Err(error) = crate::actions::app::app_deploy_preflight(
                     &self.data_dir,
                     &deploy_args_for_result,
@@ -9170,6 +9415,14 @@ impl Agent {
                 )
                 .await
                 {
+                    tracing::debug!(
+                        target: "agentark.turn_timing",
+                        stage = "app_deploy_preflight_final",
+                        duration_ms = preflight_started.elapsed().as_millis() as u64,
+                        success = false,
+                        error = %safe_truncate(&error.to_string(), 240),
+                        "app deploy final preflight failed"
+                    );
                     let error_text = error.to_string();
                     let file_inventory = deploy_args_for_result
                         .get("files")
@@ -9213,6 +9466,14 @@ impl Agent {
                     results.push(formatted);
                     continue;
                 }
+                tracing::debug!(
+                    target: "agentark.turn_timing",
+                    stage = "app_deploy_preflight_final",
+                    duration_ms = preflight_started.elapsed().as_millis() as u64,
+                    success = true,
+                    "app deploy final preflight timing"
+                );
+                let deploy_started = std::time::Instant::now();
                 let deploy_result = crate::actions::app::app_deploy(
                     &self.config_dir,
                     &self.data_dir,
@@ -9222,6 +9483,13 @@ impl Agent {
                     stream_tx.clone(),
                 )
                 .await;
+                tracing::debug!(
+                    target: "agentark.turn_timing",
+                    stage = "app_deploy_action_call",
+                    duration_ms = deploy_started.elapsed().as_millis() as u64,
+                    success = deploy_result.is_ok(),
+                    "app deploy action call timing"
+                );
                 match deploy_result {
                     Ok(result) => {
                         self.trigger_arkpulse_refresh("app_deploy");
@@ -9717,7 +9985,15 @@ impl Agent {
                                 let access_guard_enabled = parsed
                                     .get("access_guard_enabled")
                                     .and_then(|v| v.as_bool())
-                                    .unwrap_or(!access_key.is_empty());
+                                    .unwrap_or(false);
+                                let expose_public = parsed
+                                    .get("expose_public")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(expose_public_requested);
+                                let public_access_guard_enabled = parsed
+                                    .get("public_access_guard_enabled")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(access_guard_enabled || expose_public);
                                 let canonical_relative_url = parsed
                                     .get("url")
                                     .and_then(|v| v.as_str())
@@ -9756,6 +10032,7 @@ impl Agent {
                                         &url_with_key,
                                         &app_id,
                                         &app_type,
+                                        Some(access_key.as_str()),
                                         stream_tx.as_ref(),
                                     )
                                     .await
@@ -9913,7 +10190,8 @@ impl Agent {
                                 }
 
                                 if access_guard_enabled {
-                                    app_message_lines.push("- Access guard: enabled.".to_string());
+                                    app_message_lines
+                                        .push("- Local App Guard: enabled.".to_string());
                                     if !access_key.trim().is_empty() {
                                         app_message_lines.push(format!(
                                             "- Access password: `{}`",
@@ -9926,7 +10204,17 @@ impl Agent {
                                     }
                                 } else {
                                     app_message_lines
-                                        .push("- Access guard: not enabled.".to_string());
+                                        .push("- Local App Guard: not enabled.".to_string());
+                                }
+                                if expose_public {
+                                    app_message_lines.push(format!(
+                                        "- Public App Guard: {}.",
+                                        if public_access_guard_enabled {
+                                            "enabled"
+                                        } else {
+                                            "not enabled"
+                                        }
+                                    ));
                                 }
 
                                 app_message_lines.push(format!(
@@ -9954,6 +10242,10 @@ impl Agent {
                                         verify_detail.trim()
                                     ));
                                 }
+                                app_message_lines.push(format!(
+                                    "- Apps page: {}",
+                                    crate::actions::app::APP_DEPLOY_CONTROL_HINT
+                                ));
 
                                 if let Some(preview) = preview_url {
                                     app_message_lines.push(format!("![App Preview]({})", preview));
@@ -10007,6 +10299,10 @@ impl Agent {
                                     "url": canonical_relative_url,
                                     "access_url": url_with_key,
                                     "local_url": local_open_url,
+                                    "access_guard_enabled": access_guard_enabled,
+                                    "public_access_guard_enabled": public_access_guard_enabled,
+                                    "expose_public": expose_public,
+                                    "apps_page_hint": crate::actions::app::APP_DEPLOY_CONTROL_HINT,
                                     "verified": verified,
                                     "quality_report_status": if quality_check_queued { "pending" } else { "skipped" },
                                     "deploy_attempted": true,
@@ -10476,9 +10772,9 @@ impl Agent {
                         }
 
                         // Format the final result (after retries or on first success)
-                        let formatted = if let Ok(parsed) =
-                            serde_json::from_str::<serde_json::Value>(&current_result)
-                        {
+                        let parsed_final_result =
+                            serde_json::from_str::<serde_json::Value>(&current_result).ok();
+                        let formatted = if let Some(parsed) = parsed_final_result.as_ref() {
                             let output =
                                 parsed.get("output").and_then(|v| v.as_str()).unwrap_or("");
                             let error = parsed.get("error").and_then(|v| v.as_str());
@@ -10638,7 +10934,36 @@ impl Agent {
                             )
                         };
 
-                        results.push(formatted);
+                        let final_exit_code = parsed_final_result
+                            .as_ref()
+                            .and_then(|parsed| parsed.get("exit_code"))
+                            .and_then(|value| value.as_i64());
+                        let completed_successfully = final_exit_code
+                            .map(|exit_code| exit_code == 0)
+                            .unwrap_or_else(|| {
+                                parsed_final_result.is_none()
+                                    && total_retries == 0
+                                    && self_heal_stop_reason.is_none()
+                            });
+                        let completion_status = if completed_successfully {
+                            "completed"
+                        } else {
+                            "failed"
+                        };
+                        let completion_data = serde_json::json!({
+                            "success": completed_successfully,
+                            "retryable": false,
+                            "exit_code": final_exit_code,
+                            "self_heal_attempts": total_retries,
+                            "self_heal_stop_reason": self_heal_stop_reason,
+                            "observed_failure_signatures": self_heal_error_signatures,
+                        });
+                        results.push(render_tool_completion_marker_with_data(
+                            "code_execute",
+                            completion_status,
+                            &formatted,
+                            completion_data,
+                        ));
                         continue;
                     }
 
@@ -11474,11 +11799,13 @@ mod tests {
             capability_context_id: None,
         };
 
-        assert!(
-            Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, Some(&direct_chat))
-                .await
-                .expect("legacy safety check should succeed")
-        );
+        assert!(Agent::legacy_tool_call_allowed_by_safety(
+            &safety,
+            &deploy_call,
+            Some(&direct_chat)
+        )
+        .await
+        .expect("legacy safety check should succeed"));
         assert!(
             !Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, None)
                 .await
@@ -11524,15 +11851,13 @@ mod tests {
             capability_context_id: None,
         };
 
-        assert!(
-            Agent::legacy_tool_call_allowed_by_safety(
-                &safety,
-                &file_write_call,
-                Some(&direct_chat),
-            )
-            .await
-            .expect("legacy safety check should succeed")
-        );
+        assert!(Agent::legacy_tool_call_allowed_by_safety(
+            &safety,
+            &file_write_call,
+            Some(&direct_chat),
+        )
+        .await
+        .expect("legacy safety check should succeed"));
         assert!(
             !Agent::legacy_tool_call_allowed_by_safety(&safety, &file_write_call, None)
                 .await
@@ -11594,11 +11919,9 @@ mod tests {
             "   ",
         );
 
-        assert!(
-            result
-                .expect_err("empty body should fail")
-                .contains("empty body")
-        );
+        assert!(result
+            .expect_err("empty body should fail")
+            .contains("empty body"));
     }
 
     #[test]
@@ -11610,11 +11933,9 @@ mod tests {
             r#"{"ok":true}"#,
         );
 
-        assert!(
-            result
-                .expect_err("static app should return html")
-                .contains("did not receive HTML")
-        );
+        assert!(result
+            .expect_err("static app should return html")
+            .contains("did not receive HTML"));
     }
 
     #[test]
@@ -11626,11 +11947,9 @@ mod tests {
             "<html><body><script>const x = 1;</body></html>",
         );
 
-        assert!(
-            result
-                .expect_err("unclosed script should fail")
-                .contains("unclosed <script>")
-        );
+        assert!(result
+            .expect_err("unclosed script should fail")
+            .contains("unclosed <script>"));
     }
 
     #[test]

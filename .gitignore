@@ -26,6 +26,7 @@ config/safety.toml
 config/gmail.json
 data/
 uploads/
+backups/
 
 # Environment
 .env
@@ -57,3 +58,8 @@ docs/
 
 # Local cargo build config
 .cargo/config.toml
+
+
+security_best_practices_report.md
+frontend/vite-mission.err.log
+frontend/vite-mission.log

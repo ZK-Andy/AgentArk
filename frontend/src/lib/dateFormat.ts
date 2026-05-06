@@ -13,6 +13,157 @@ type FormatUiDateOptions = {
   timeZoneName?: boolean;
 };
 
+const UI_TIMEZONE_OVERRIDE_STORAGE_KEY = "agentark.ui.timezoneOverride";
+
+const FALLBACK_TIMEZONE_OPTIONS = [
+  "UTC",
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "America/Phoenix",
+  "America/Toronto",
+  "America/Vancouver",
+  "Europe/London",
+  "Europe/Paris",
+  "Europe/Berlin",
+  "Asia/Dubai",
+  "Asia/Calcutta",
+  "Asia/Kolkata",
+  "Asia/Singapore",
+  "Asia/Tokyo",
+  "Australia/Sydney"
+] as const;
+
+type IntlWithSupportedValues = typeof Intl & {
+  supportedValuesOf?: (key: "timeZone") => string[];
+};
+
+let cachedTimeZoneOverride: string | null | undefined;
+
+export function detectLocalTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    return "";
+  }
+}
+
+export function isValidUiTimeZone(value: string): boolean {
+  const timezone = value.trim();
+  if (!timezone) return false;
+  try {
+    new Intl.DateTimeFormat(undefined, { timeZone: timezone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function getSupportedUiTimeZones(): string[] {
+  const zones = new Set<string>();
+  try {
+    const supported = (Intl as IntlWithSupportedValues).supportedValuesOf?.("timeZone") || [];
+    for (const zone of supported) {
+      if (typeof zone === "string" && zone.trim()) zones.add(zone.trim());
+    }
+  } catch {
+    // Older browsers may not expose Intl.supportedValuesOf.
+  }
+  for (const zone of FALLBACK_TIMEZONE_OPTIONS) {
+    if (isValidUiTimeZone(zone)) zones.add(zone);
+  }
+  const detected = detectLocalTimeZone();
+  if (detected && isValidUiTimeZone(detected)) zones.add(detected);
+  return Array.from(zones).sort((left, right) => {
+    if (left === "UTC") return -1;
+    if (right === "UTC") return 1;
+    return left.localeCompare(right);
+  });
+}
+
+export function getUiTimeZoneOverride(): string | null {
+  if (cachedTimeZoneOverride !== undefined) return cachedTimeZoneOverride;
+  if (typeof window === "undefined") {
+    cachedTimeZoneOverride = null;
+    return cachedTimeZoneOverride;
+  }
+  try {
+    const stored = window.localStorage
+      .getItem(UI_TIMEZONE_OVERRIDE_STORAGE_KEY)
+      ?.trim();
+    cachedTimeZoneOverride = stored && isValidUiTimeZone(stored) ? stored : null;
+    if (stored && !cachedTimeZoneOverride) {
+      window.localStorage.removeItem(UI_TIMEZONE_OVERRIDE_STORAGE_KEY);
+    }
+  } catch {
+    cachedTimeZoneOverride = null;
+  }
+  return cachedTimeZoneOverride;
+}
+
+export function setUiTimeZoneOverride(value: string | null | undefined): string | null {
+  const timezone = (value || "").trim();
+  const next = timezone && isValidUiTimeZone(timezone) ? timezone : null;
+  cachedTimeZoneOverride = next;
+  if (typeof window !== "undefined") {
+    try {
+      if (next) {
+        window.localStorage.setItem(UI_TIMEZONE_OVERRIDE_STORAGE_KEY, next);
+      } else {
+        window.localStorage.removeItem(UI_TIMEZONE_OVERRIDE_STORAGE_KEY);
+      }
+      window.dispatchEvent(
+        new CustomEvent("agentark:timezone-override-change", {
+          detail: { timezone: next }
+        })
+      );
+    } catch {
+      // Ignore storage/event failures; formatting still falls back to browser local time.
+    }
+  }
+  return next;
+}
+
+export function getEffectiveUiTimeZone(): string | undefined {
+  return getUiTimeZoneOverride() || undefined;
+}
+
+function withUiTimeZone<T extends Intl.DateTimeFormatOptions>(options: T): T {
+  const timezone = getEffectiveUiTimeZone();
+  return timezone ? ({ ...options, timeZone: timezone } as T) : options;
+}
+
+function datePartsForUiTimeZone(date: Date): {
+  year: number;
+  month: string;
+  day: number;
+} {
+  try {
+    const parts = new Intl.DateTimeFormat(
+      undefined,
+      withUiTimeZone({
+        year: "numeric",
+        month: "short",
+        day: "numeric"
+      })
+    ).formatToParts(date);
+    const year = Number(parts.find((part) => part.type === "year")?.value);
+    const month = parts.find((part) => part.type === "month")?.value || "";
+    const day = Number(parts.find((part) => part.type === "day")?.value);
+    if (Number.isFinite(year) && month && Number.isFinite(day)) {
+      return { year, month, day };
+    }
+  } catch {
+    // Fall through to the browser-local Date accessors.
+  }
+  return {
+    year: date.getFullYear(),
+    month: date.toLocaleDateString([], { month: "short" }),
+    day: date.getDate()
+  };
+}
+
 function ordinalDay(day: number): string {
   const remainder = day % 10;
   const teen = day % 100;
@@ -81,22 +232,58 @@ export function formatUiDateTime(value: DateInput, options: FormatUiDateOptions 
   if (!parsed.date) return parsed.raw || fallback;
 
   const date = parsed.date;
+  const dateParts = datePartsForUiTimeZone(date);
+  const currentDateParts = datePartsForUiTimeZone(new Date());
   const includeYearResolved =
-    includeYear === "auto" ? date.getFullYear() !== new Date().getFullYear() : includeYear;
-  const month = date.toLocaleDateString([], { month: "short" });
-  const day = ordinalDay(date.getDate());
-  const yearPart = includeYearResolved ? ` ${date.getFullYear()}` : "";
-  if (!includeTime) return `${day} ${month}${yearPart}`;
+    includeYear === "auto" ? dateParts.year !== currentDateParts.year : includeYear;
+  const day = ordinalDay(dateParts.day);
+  const yearPart = includeYearResolved ? ` ${dateParts.year}` : "";
+  if (!includeTime) return `${day} ${dateParts.month}${yearPart}`;
 
   const time = uppercaseMeridiem(
-    date.toLocaleTimeString([], {
-      hour: "numeric",
-      minute: "2-digit",
-      ...(includeSeconds ? { second: "2-digit" as const } : {}),
-      ...(timeZoneName ? { timeZoneName: "short" as const } : {})
-    })
+    date.toLocaleTimeString(
+      [],
+      withUiTimeZone({
+        hour: "numeric",
+        minute: "2-digit",
+        ...(includeSeconds ? { second: "2-digit" as const } : {}),
+        ...(timeZoneName ? { timeZoneName: "short" as const } : {})
+      })
+    )
   );
-  return `${day} ${month}${yearPart} ${time}`;
+  return `${day} ${dateParts.month}${yearPart} ${time}`;
+}
+
+export function formatUiTime(
+  value: DateInput,
+  options: {
+    fallback?: string;
+    includeSeconds?: boolean;
+    timeZoneName?: boolean;
+    hour12?: boolean;
+  } = {}
+): string {
+  const {
+    fallback = "-",
+    includeSeconds = false,
+    timeZoneName = false,
+    hour12 = true
+  } = options;
+  const parsed = parseDateInput(value);
+  if (!parsed.raw && !parsed.date) return fallback;
+  if (!parsed.date) return parsed.raw || fallback;
+  return uppercaseMeridiem(
+    parsed.date.toLocaleTimeString(
+      [],
+      withUiTimeZone({
+        hour: "numeric",
+        minute: "2-digit",
+        ...(includeSeconds ? { second: "2-digit" as const } : {}),
+        ...(timeZoneName ? { timeZoneName: "short" as const } : {}),
+        hour12
+      })
+    )
+  );
 }
 
 export function formatUiDateTimeMeta(

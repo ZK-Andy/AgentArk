@@ -99,7 +99,8 @@
           "type": "string"
         },
         "arguments": {
-          "type": ["object", "array", "string", "number", "boolean", "null"]
+          "type": ["object", "array", "string", "number", "boolean", "null"],
+          "description": "Command-specific arguments. For notifications and approval_prompt commands, object arguments may include optional string fields: title and body."
         },
         "requested_scopes": {
           "type": "array",

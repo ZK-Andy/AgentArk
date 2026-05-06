@@ -10,6 +10,7 @@ pub mod matrix;
 pub mod messaging_dispatch;
 pub mod messaging_registry;
 pub(crate) mod outbound_rate_limit;
+pub(crate) mod outbound_split;
 pub mod qq;
 pub mod signal;
 pub mod slack;

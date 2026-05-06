@@ -5,11 +5,16 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use crate::core::llm::LlmClient;
+
+use super::promotion_gate::{
+    promotion_gate_report, render_legacy_promotion_gate, PromotionGateCheck,
+    PromotionGateCheckResult, PromotionGateReason, PromotionGateReport,
+};
 
 pub const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";
 const LINEAGE_ARCHIVE_REL_PATH: &str = ".agentark/self_evolve/routing_policy_lineage.jsonl";
@@ -100,6 +105,8 @@ pub struct PolicyEvolutionResult {
     pub p_value: f64,
     pub candidate_source: Option<String>,
     pub promotion_gate: String,
+    pub promotion_gate_summary: String,
+    pub promotion_gate_report: PromotionGateReport,
     pub promoted_policy: Option<serde_json::Value>,
     pub lineage_entry_id: String,
     pub lineage_archive_path: String,
@@ -193,6 +200,14 @@ impl PolicyEvolutionEngine {
                 p_value: 1.0,
                 candidate_source: None,
                 promotion_gate: "rejected: no valid policy mutations".to_string(),
+                promotion_gate_summary:
+                    "Not promoted: no distinct policy changes were available to test.".to_string(),
+                promotion_gate_report: PromotionGateReport::rejected(vec![
+                    PromotionGateReason::new(
+                        "no_valid_policy_mutations",
+                        "no distinct policy changes were available to test",
+                    ),
+                ]),
                 promoted_policy: None,
                 lineage_entry_id: entry_id,
                 lineage_archive_path: self.archive_path().display().to_string(),
@@ -228,8 +243,10 @@ impl PolicyEvolutionEngine {
             best_eval.accuracy,
             &best_stats,
         );
-        let promoted = promotion_checks.values().all(|passed| *passed);
+        let promoted = promotion_checks.iter().all(|check| check.passed);
         let promotion_gate = render_promotion_gate(&promotion_checks);
+        let promotion_gate_report = promotion_gate_report(&promotion_checks);
+        let promotion_gate_summary = promotion_gate_report.summary.clone();
         let notes = build_notes(
             &baseline_eval,
             &best_eval,
@@ -273,6 +290,8 @@ impl PolicyEvolutionEngine {
             p_value: round4(best_stats.p_value),
             candidate_source: Some(best_candidate.source),
             promotion_gate,
+            promotion_gate_summary,
+            promotion_gate_report,
             promoted_policy: if promoted {
                 Some(serde_json::to_value(best_candidate.policy)?)
             } else {
@@ -767,48 +786,71 @@ fn combination(n: usize, k: usize) -> f64 {
     result
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PolicyPromotionCheck {
+    AccuracyNotWorse,
+    MinAccuracyGain,
+    WinsGtLosses,
+    SignTest,
+    MinAbsoluteAccuracy,
+}
+
+impl PromotionGateCheck for PolicyPromotionCheck {
+    fn code(self) -> &'static str {
+        match self {
+            Self::AccuracyNotWorse => "accuracy_not_worse",
+            Self::MinAccuracyGain => "min_accuracy_gain",
+            Self::WinsGtLosses => "wins_gt_losses",
+            Self::SignTest => "sign_test",
+            Self::MinAbsoluteAccuracy => "min_absolute_accuracy",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AccuracyNotWorse => "candidate accuracy was below the stable policy",
+            Self::MinAccuracyGain => "accuracy improvement was below the promotion threshold",
+            Self::WinsGtLosses => "candidate did not win more benchmark cases than it lost",
+            Self::SignTest => "statistical confidence is not high enough yet",
+            Self::MinAbsoluteAccuracy => {
+                "candidate did not meet the minimum absolute accuracy guardrail"
+            }
+        }
+    }
+}
+
 fn promotion_checks(
     config: &PolicyEvolutionConfig,
     baseline_accuracy: f64,
     candidate_accuracy: f64,
     stats: &PairedStats,
-) -> HashMap<&'static str, bool> {
-    let mut checks = HashMap::new();
-    checks.insert(
-        "accuracy_not_worse",
-        candidate_accuracy >= baseline_accuracy,
-    );
-    checks.insert(
-        "min_accuracy_gain",
-        stats.accuracy_gain >= config.min_accuracy_gain,
-    );
-    checks.insert("wins_gt_losses", stats.wins > stats.losses);
-    checks.insert("sign_test", stats.p_value <= config.max_sign_test_p_value);
-    checks.insert(
-        "min_absolute_accuracy",
-        candidate_accuracy >= config.min_benchmark_accuracy,
-    );
-    checks
+) -> Vec<PromotionGateCheckResult<PolicyPromotionCheck>> {
+    vec![
+        PromotionGateCheckResult {
+            check: PolicyPromotionCheck::AccuracyNotWorse,
+            passed: candidate_accuracy >= baseline_accuracy,
+        },
+        PromotionGateCheckResult {
+            check: PolicyPromotionCheck::MinAccuracyGain,
+            passed: stats.accuracy_gain >= config.min_accuracy_gain,
+        },
+        PromotionGateCheckResult {
+            check: PolicyPromotionCheck::WinsGtLosses,
+            passed: stats.wins > stats.losses,
+        },
+        PromotionGateCheckResult {
+            check: PolicyPromotionCheck::SignTest,
+            passed: stats.p_value <= config.max_sign_test_p_value,
+        },
+        PromotionGateCheckResult {
+            check: PolicyPromotionCheck::MinAbsoluteAccuracy,
+            passed: candidate_accuracy >= config.min_benchmark_accuracy,
+        },
+    ]
 }
 
-fn render_promotion_gate(checks: &HashMap<&str, bool>) -> String {
-    let ordered = [
-        "accuracy_not_worse",
-        "min_accuracy_gain",
-        "wins_gt_losses",
-        "sign_test",
-        "min_absolute_accuracy",
-    ];
-    let failed: Vec<&str> = ordered
-        .iter()
-        .copied()
-        .filter(|key| !checks.get(key).copied().unwrap_or(false))
-        .collect();
-    if failed.is_empty() {
-        "passed".to_string()
-    } else {
-        format!("rejected: {}", failed.join(", "))
-    }
+fn render_promotion_gate(checks: &[PromotionGateCheckResult<PolicyPromotionCheck>]) -> String {
+    render_legacy_promotion_gate(checks)
 }
 
 fn apply_override(policy: &mut RoutingComplexityPolicy, raw: &serde_json::Value) {

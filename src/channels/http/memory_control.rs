@@ -115,18 +115,20 @@ pub(super) async fn list_facts(
         .await
     {
         Ok(facts) => {
-            let items: Vec<serde_json::Value> = facts
-                .iter()
-                .map(|f| {
-                    serde_json::json!({
-                        "id": f.id,
-                        "fact": f.fact,
-                        "confidence": f.confidence,
-                        "sources": f.sources,
-                        "created_at": f.created_at,
-                    })
-                })
-                .collect();
+            let mut items: Vec<serde_json::Value> = Vec::with_capacity(facts.len());
+            for f in &facts {
+                let sources =
+                    memory_fact_evidence_sources(&agent.storage, f, project_id, 100).await;
+                let evidence_count = sources.len();
+                items.push(serde_json::json!({
+                    "id": f.id,
+                    "fact": f.fact,
+                    "confidence": f.confidence,
+                    "sources": sources,
+                    "evidence_count": evidence_count,
+                    "created_at": f.created_at,
+                }));
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -146,6 +148,171 @@ pub(super) async fn list_facts(
         )
             .into_response(),
     }
+}
+
+fn parse_fact_source_refs(value: &str) -> Vec<String> {
+    fn push_json_source(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(raw) => {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    push_json_source(item, out);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                for key in [
+                    "source",
+                    "sources",
+                    "source_ref",
+                    "source_refs",
+                    "evidence_refs",
+                ] {
+                    if let Some(inner) = object.get(key) {
+                        push_json_source(inner, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut sources = Vec::new();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(parsed) => push_json_source(&parsed, &mut sources),
+        Err(_) => sources.push(trimmed.to_string()),
+    }
+    sources
+        .into_iter()
+        .map(|source| source.trim().to_string())
+        .filter(|source| !source.is_empty())
+        .collect()
+}
+
+fn memory_operation_evidence_source_refs(
+    operation: &crate::storage::memory_operation::Model,
+) -> Vec<String> {
+    operation
+        .evidence_refs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| {
+            value.starts_with("message:")
+                || value.starts_with("capture_event:")
+                || value.starts_with("source:")
+                || value.starts_with("source_ref:")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod memory_control_tests {
+    use super::*;
+
+    #[test]
+    fn fact_source_refs_parse_legacy_and_structured_sources() {
+        assert_eq!(
+            parse_fact_source_refs(r#"["message:m1","capture_event:c1"]"#),
+            vec!["message:m1".to_string(), "capture_event:c1".to_string()]
+        );
+        assert_eq!(
+            parse_fact_source_refs(
+                r#"{"source":"manual","evidence_refs":["message:m2","capture_event:c2"]}"#
+            ),
+            vec![
+                "manual".to_string(),
+                "message:m2".to_string(),
+                "capture_event:c2".to_string()
+            ]
+        );
+        assert_eq!(
+            parse_fact_source_refs("message:plain"),
+            vec!["message:plain".to_string()]
+        );
+    }
+
+    #[test]
+    fn memory_operation_evidence_refs_keep_source_refs_not_channel_metadata() {
+        let now = "2026-05-03T00:00:00Z".to_string();
+        let operation = crate::storage::memory_operation::Model {
+            id: "operation-1".to_string(),
+            capture_event_id: Some("capture-1".to_string()),
+            operation_type: "add".to_string(),
+            status: "applied".to_string(),
+            target_memory_id: None,
+            applied_memory_id: Some("memory-1".to_string()),
+            key: Some("memory_key".to_string()),
+            value: Some("Memory value".to_string()),
+            memory_kind: "identity".to_string(),
+            durability: "permanent".to_string(),
+            scope: "global".to_string(),
+            project_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            confidence: 0.95,
+            looks_sensitive: false,
+            sensitive_reason: None,
+            valid_from: None,
+            expires_at: None,
+            review_at: None,
+            rationale: None,
+            evidence_refs: serde_json::json!(["message:m1", "capture_event:c1", "channel:chat"]),
+            model_metadata: serde_json::json!({}),
+            apply_metadata: serde_json::json!({}),
+            applied_at: Some(now.clone()),
+            reviewed_at: Some(now.clone()),
+            review_notes: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        assert_eq!(
+            memory_operation_evidence_source_refs(&operation),
+            vec!["message:m1".to_string(), "capture_event:c1".to_string()]
+        );
+    }
+}
+
+async fn memory_fact_evidence_sources(
+    storage: &crate::storage::Storage,
+    fact: &crate::storage::LearnedFactRecord,
+    project_id: Option<&str>,
+    limit: u64,
+) -> Vec<String> {
+    let mut sources = parse_fact_source_refs(&fact.sources);
+    if let Ok(links) = storage
+        .list_memory_evidence_links_for_memory(&fact.id, project_id, limit)
+        .await
+    {
+        sources.extend(
+            links
+                .into_iter()
+                .map(|link| format!("{}:{}", link.evidence_kind, link.evidence_ref)),
+        );
+    }
+    if let Ok(operations) = storage
+        .list_memory_operations_for_memory(&fact.id, project_id, limit)
+        .await
+    {
+        for operation in &operations {
+            sources.extend(memory_operation_evidence_source_refs(operation));
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    sources
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,11 +708,335 @@ pub(super) const ARKMEMORY_PENDING_CAPTURE_STATUSES: &[&str] =
     &["pending_consolidation", "processing_deferred", "processing"];
 pub(super) const ARKMEMORY_FAILED_CAPTURE_STATUSES: &[&str] =
     &["failed", "failed_deferred", "rejected_sensitive_input"];
+pub(super) const ARKMEMORY_REVIEWED_CAPTURE_STATUSES: &[&str] = &[
+    "reviewed_failed_capture",
+    "reviewed_false_positive_capture",
+    "reviewed_sensitive_input",
+];
 pub(super) const ARKMEMORY_APPLYING_LEASE_TIMEOUT_SECS: i64 = 10 * 60;
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ArkMemoryHealthReviewRequest {
+    outcome: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ArkMemoryCaptureReviewPattern {
+    similar_review_count: usize,
+    expected_sensitive_skip_count: usize,
+    false_positive_safe_memory_count: usize,
+    acknowledged_count: usize,
+}
 
 pub(super) fn arkmemory_project_param(params: &HashMap<String, String>) -> Option<&str> {
     let _ = params;
     None
+}
+
+fn arkmemory_capture_event_visible_for_project(
+    event: &crate::storage::memory_capture_event::Model,
+    project_id: Option<&str>,
+) -> bool {
+    let event_project = event.project_id.as_deref().map(str::trim).unwrap_or("");
+    match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(active_project) => event_project.is_empty() || event_project == active_project,
+        None => event_project.is_empty(),
+    }
+}
+
+fn arkmemory_capture_event_reviewed_status(
+    event: &crate::storage::memory_capture_event::Model,
+    outcome: &str,
+) -> &'static str {
+    if outcome == "false_positive_safe_memory" {
+        return "reviewed_false_positive_capture";
+    }
+    let status = event.status.trim();
+    if status == "rejected_sensitive_input" {
+        "reviewed_sensitive_input"
+    } else {
+        "reviewed_failed_capture"
+    }
+}
+
+fn arkmemory_truncate_chars(raw: &str, max_chars: usize) -> String {
+    let mut chars = raw.trim().chars();
+    let mut value = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        value.push_str("...");
+    }
+    value
+}
+
+fn arkmemory_capture_event_error_summary(
+    event: &crate::storage::memory_capture_event::Model,
+) -> (Option<String>, Option<String>) {
+    let Some(last_error) = event
+        .error_history
+        .as_array()
+        .and_then(|items| items.last())
+        .and_then(|value| value.as_object())
+    else {
+        return (None, None);
+    };
+    let code = last_error
+        .get("code")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let detail = last_error
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .map(|value| crate::security::redact_secret_input(value).text)
+        .map(|value| arkmemory_truncate_chars(&value, 240))
+        .filter(|value| !value.is_empty());
+    (code, detail)
+}
+
+fn arkmemory_capture_review_outcome_label(outcome: &str) -> &'static str {
+    match outcome {
+        "expected_sensitive_skip" => "Correct secret-like skip",
+        "false_positive_safe_memory" => "False positive",
+        _ => "Reviewed",
+    }
+}
+
+fn arkmemory_default_capture_review_outcome(
+    event: &crate::storage::memory_capture_event::Model,
+) -> &'static str {
+    if event.status.trim() == "rejected_sensitive_input" {
+        "expected_sensitive_skip"
+    } else {
+        "acknowledged"
+    }
+}
+
+fn arkmemory_normalize_capture_review_outcome(
+    raw: Option<&str>,
+    event: &crate::storage::memory_capture_event::Model,
+) -> &'static str {
+    match raw.map(str::trim) {
+        Some("expected_sensitive_skip") => "expected_sensitive_skip",
+        Some("false_positive_safe_memory") => "false_positive_safe_memory",
+        Some("acknowledged") => "acknowledged",
+        _ => arkmemory_default_capture_review_outcome(event),
+    }
+}
+
+fn arkmemory_capture_failure_signature(
+    event: &crate::storage::memory_capture_event::Model,
+) -> serde_json::Value {
+    let (last_error_code, _) = arkmemory_capture_event_error_summary(event);
+    serde_json::json!({
+        "status": event.status.trim(),
+        "capture_kind": event.capture_kind.trim(),
+        "channel": event.channel.trim(),
+        "last_error_code": last_error_code,
+    })
+}
+
+fn arkmemory_capture_failure_signature_key(
+    status: &str,
+    capture_kind: &str,
+    channel: &str,
+    last_error_code: Option<&str>,
+) -> String {
+    arkmemory_stable_event_id(&[
+        "capture_review_pattern",
+        status.trim(),
+        capture_kind.trim(),
+        channel.trim(),
+        last_error_code.unwrap_or("").trim(),
+    ])
+}
+
+fn arkmemory_capture_event_failure_signature_key(
+    event: &crate::storage::memory_capture_event::Model,
+) -> String {
+    let (last_error_code, _) = arkmemory_capture_event_error_summary(event);
+    arkmemory_capture_failure_signature_key(
+        event.status.as_str(),
+        event.capture_kind.as_str(),
+        event.channel.as_str(),
+        last_error_code.as_deref(),
+    )
+}
+
+fn arkmemory_reviewed_capture_failure_signature_key(
+    event: &crate::storage::memory_capture_event::Model,
+) -> Option<String> {
+    let metadata = event.attempt_metadata.as_object()?;
+    let review = metadata.get("user_review")?.as_object()?;
+    let signature = review.get("failure_signature")?.as_object()?;
+    let status = signature.get("status")?.as_str()?;
+    let capture_kind = signature.get("capture_kind")?.as_str()?;
+    let channel = signature.get("channel")?.as_str().unwrap_or("");
+    let last_error_code = signature
+        .get("last_error_code")
+        .and_then(|value| value.as_str());
+    Some(arkmemory_capture_failure_signature_key(
+        status,
+        capture_kind,
+        channel,
+        last_error_code,
+    ))
+}
+
+fn arkmemory_capture_review_pattern_summary(
+    reviewed_events: &[crate::storage::memory_capture_event::Model],
+) -> std::collections::HashMap<String, ArkMemoryCaptureReviewPattern> {
+    let mut patterns = std::collections::HashMap::<String, ArkMemoryCaptureReviewPattern>::new();
+    for event in reviewed_events {
+        let Some(key) = arkmemory_reviewed_capture_failure_signature_key(event) else {
+            continue;
+        };
+        let outcome = event
+            .attempt_metadata
+            .get("user_review")
+            .and_then(|value| value.get("outcome"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("acknowledged");
+        let pattern = patterns.entry(key).or_default();
+        pattern.similar_review_count += 1;
+        match outcome {
+            "expected_sensitive_skip" => pattern.expected_sensitive_skip_count += 1,
+            "false_positive_safe_memory" => pattern.false_positive_safe_memory_count += 1,
+            _ => pattern.acknowledged_count += 1,
+        }
+    }
+    patterns
+}
+
+fn arkmemory_capture_review_pattern_payload(
+    pattern: Option<&ArkMemoryCaptureReviewPattern>,
+) -> serde_json::Value {
+    let Some(pattern) = pattern else {
+        return serde_json::Value::Null;
+    };
+    let suggested_outcome = [
+        (
+            "expected_sensitive_skip",
+            pattern.expected_sensitive_skip_count,
+        ),
+        (
+            "false_positive_safe_memory",
+            pattern.false_positive_safe_memory_count,
+        ),
+        ("acknowledged", pattern.acknowledged_count),
+    ]
+    .into_iter()
+    .max_by_key(|(_, count)| *count)
+    .filter(|(_, count)| *count > 0)
+    .map(|(outcome, _)| outcome);
+    serde_json::json!({
+        "similar_review_count": pattern.similar_review_count,
+        "expected_sensitive_skip_count": pattern.expected_sensitive_skip_count,
+        "false_positive_safe_memory_count": pattern.false_positive_safe_memory_count,
+        "acknowledged_count": pattern.acknowledged_count,
+        "suggested_outcome": suggested_outcome,
+    })
+}
+
+fn arkmemory_safe_source_message_preview(message: &crate::storage::message::Model) -> String {
+    let redacted = crate::security::redact_secret_input(&message.content);
+    if redacted.is_mostly_secret_payload() {
+        return "Message preview hidden because the source appears to be mostly credential-like material.".to_string();
+    }
+    let preview = arkmemory_truncate_chars(&redacted.text, 180);
+    if preview.trim().is_empty() {
+        "Message preview unavailable.".to_string()
+    } else {
+        preview
+    }
+}
+
+async fn arkmemory_capture_source_context(
+    storage: &crate::storage::Storage,
+    event: &crate::storage::memory_capture_event::Model,
+) -> serde_json::Value {
+    let source_message = match event.source_message_id.as_deref() {
+        Some(message_id) if !message_id.trim().is_empty() => {
+            storage.get_message(message_id.trim()).await.ok().flatten()
+        }
+        _ => None,
+    };
+    let conversation = match event.conversation_id.as_deref() {
+        Some(conversation_id) if !conversation_id.trim().is_empty() => storage
+            .get_conversation(conversation_id.trim())
+            .await
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+    let message_chars = source_message
+        .as_ref()
+        .map(|message| message.content.chars().count())
+        .or_else(|| {
+            event
+                .attempt_metadata
+                .get("message_chars")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+        });
+    serde_json::json!({
+        "conversation_id": event.conversation_id.clone(),
+        "conversation_title": conversation
+            .as_ref()
+            .map(|conversation| conversation.title.trim())
+            .filter(|title| !title.is_empty()),
+        "conversation_channel": conversation
+            .as_ref()
+            .map(|conversation| conversation.channel.trim())
+            .filter(|channel| !channel.is_empty())
+            .or_else(|| Some(event.channel.trim()).filter(|channel| !channel.is_empty())),
+        "source_message_id": event.source_message_id.clone(),
+        "source_message_at": source_message.as_ref().map(|message| message.timestamp.as_str()),
+        "source_message_role": source_message.as_ref().map(|message| message.role.as_str()),
+        "source_message_chars": message_chars,
+        "source_message_preview": source_message
+            .as_ref()
+            .map(arkmemory_safe_source_message_preview),
+    })
+}
+
+fn arkmemory_capture_event_finding(
+    event: crate::storage::memory_capture_event::Model,
+    review_pattern: Option<&ArkMemoryCaptureReviewPattern>,
+    source_context: serde_json::Value,
+) -> serde_json::Value {
+    let capture_event_id = event.id.clone();
+    let (last_error_code, last_error_detail) = arkmemory_capture_event_error_summary(&event);
+    let is_sensitive_rejection = event.status.trim() == "rejected_sensitive_input";
+    let title = if is_sensitive_rejection {
+        "Memory capture skipped for secret-like input"
+    } else {
+        "Memory capture failed"
+    };
+    let detail = if is_sensitive_rejection {
+        "AgentArk did not turn this chat message into memory because the source looked like credential or token material. No memory was stored from that message."
+    } else {
+        "A user-memory capture event ended before it could produce an auditable operation. Review model/provider health and the recorded error before marking it reviewed."
+    };
+    serde_json::json!({
+        "id": format!("capture_failed:{}", capture_event_id),
+        "kind": "capture_failed",
+        "severity": "warning",
+        "capture_event_id": capture_event_id,
+        "status": event.status,
+        "capture_kind": event.capture_kind,
+        "conversation_id": event.conversation_id,
+        "source_message_id": event.source_message_id,
+        "replay_count": event.replay_count,
+        "last_error_code": last_error_code,
+        "last_error_detail": last_error_detail,
+        "review_pattern": arkmemory_capture_review_pattern_payload(review_pattern),
+        "source_context": source_context,
+        "title": title,
+        "detail": detail,
+        "action": "review_capture_pipeline",
+        "created_at": event.updated_at,
+    })
 }
 
 pub(super) fn arkmemory_limit(params: &HashMap<String, String>, default_limit: u64) -> u64 {
@@ -805,10 +1296,39 @@ pub(super) async fn arkmemory_build_health_findings(
     project_id: Option<&str>,
     limit: u64,
 ) -> Result<Vec<serde_json::Value>> {
+    let mut findings = Vec::new();
+    let reviewed_capture_patterns = storage
+        .list_memory_capture_events_by_statuses(
+            ARKMEMORY_REVIEWED_CAPTURE_STATUSES,
+            project_id,
+            200,
+        )
+        .await
+        .map(|events| arkmemory_capture_review_pattern_summary(&events))
+        .unwrap_or_default();
+    for event in storage
+        .list_memory_capture_events_by_statuses(
+            ARKMEMORY_FAILED_CAPTURE_STATUSES,
+            project_id,
+            limit,
+        )
+        .await?
+    {
+        let pattern_key = arkmemory_capture_event_failure_signature_key(&event);
+        let source_context = arkmemory_capture_source_context(storage, &event).await;
+        findings.push(arkmemory_capture_event_finding(
+            event,
+            reviewed_capture_patterns.get(&pattern_key),
+            source_context,
+        ));
+        if findings.len() >= limit as usize {
+            return Ok(findings);
+        }
+    }
+
     let memory_items = storage
         .list_active_experience_items(&["personal_fact", "constraint"], project_id, None, limit)
         .await?;
-    let mut findings = Vec::new();
     for item in memory_items {
         if item.embedding.is_none() {
             findings.push(serde_json::json!({
@@ -838,7 +1358,17 @@ pub(super) async fn arkmemory_build_health_findings(
             .list_memory_evidence_links_for_memory(&item.id, project_id, 16)
             .await
             .unwrap_or_default();
-        if arkmemory_memory_sources(&item).is_empty() && evidence_links.is_empty() {
+        let operation_evidence_refs = storage
+            .list_memory_operations_for_memory(&item.id, project_id, 16)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|operation| memory_operation_evidence_source_refs(&operation))
+            .collect::<Vec<_>>();
+        if arkmemory_memory_sources(&item).is_empty()
+            && evidence_links.is_empty()
+            && operation_evidence_refs.is_empty()
+        {
             findings.push(serde_json::json!({
                 "id": format!("source:{}", item.id),
                 "kind": "missing_source",
@@ -852,27 +1382,6 @@ pub(super) async fn arkmemory_build_health_findings(
         }
         if findings.len() >= limit as usize {
             break;
-        }
-    }
-    if findings.len() < limit as usize {
-        for event in storage
-            .list_memory_capture_events_by_statuses(&["failed"], project_id, limit)
-            .await?
-        {
-            let capture_event_id = event.id.clone();
-            findings.push(serde_json::json!({
-                "id": format!("capture_failed:{}", capture_event_id),
-                "kind": "capture_failed",
-                "severity": "warning",
-                "capture_event_id": capture_event_id,
-                "title": "Memory capture failed",
-                "detail": "A user-memory capture event failed before it could produce an auditable operation.",
-                "action": "review_capture_pipeline",
-                "created_at": event.updated_at,
-            }));
-            if findings.len() >= limit as usize {
-                break;
-            }
         }
     }
     if findings.len() < limit as usize {
@@ -1566,6 +2075,7 @@ pub(super) async fn arkmemory_apply_health(
     State(state): State<AppState>,
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    payload: Option<Json<ArkMemoryHealthReviewRequest>>,
 ) -> Response {
     let project_id = arkmemory_project_param(&params);
     let agent = state.agent.read().await;
@@ -1576,6 +2086,12 @@ pub(super) async fn arkmemory_apply_health(
             .iter()
             .find(|finding| finding.get("id").and_then(|value| value.as_str()) == Some(id.as_str()))
             .ok_or_else(|| anyhow::anyhow!("Memory health finding is no longer active."))?;
+        let capture_event_id = finding
+            .get("capture_event_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let memory_id = finding
             .get("memory_id")
             .and_then(|value| value.as_str())
@@ -1597,6 +2113,77 @@ pub(super) async fn arkmemory_apply_health(
         } else {
             ArkMemoryEventContext::default()
         };
+        let capture_resolution = if let Some(capture_event_id) = capture_event_id.as_deref() {
+            let mut event = agent
+                .storage
+                .get_memory_capture_event(capture_event_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Memory capture event not found."))?;
+            if !arkmemory_capture_event_visible_for_project(&event, project_id) {
+                anyhow::bail!("Memory capture event is outside the active memory scope.");
+            }
+            let review_outcome = arkmemory_normalize_capture_review_outcome(
+                payload
+                    .as_ref()
+                    .and_then(|payload| payload.0.outcome.as_deref()),
+                &event,
+            );
+            let previous_status = event.status.trim().to_string();
+            let reviewed_status =
+                arkmemory_capture_event_reviewed_status(&event, review_outcome).to_string();
+            let mut final_status = previous_status.clone();
+            if ARKMEMORY_FAILED_CAPTURE_STATUSES.contains(&previous_status.as_str()) {
+                let now = chrono::Utc::now().to_rfc3339();
+                let failure_signature = arkmemory_capture_failure_signature(&event);
+                let previous_metadata = std::mem::take(&mut event.attempt_metadata);
+                let mut metadata = match previous_metadata {
+                    serde_json::Value::Object(map) => map,
+                    serde_json::Value::Null => serde_json::Map::new(),
+                    value => {
+                        let mut map = serde_json::Map::new();
+                        map.insert("previous_metadata".to_string(), value);
+                        map
+                    }
+                };
+                metadata.insert(
+                    "reviewed_at".to_string(),
+                    serde_json::Value::String(now.clone()),
+                );
+                metadata.insert(
+                    "reviewed_from".to_string(),
+                    serde_json::Value::String("arkmemory_health".to_string()),
+                );
+                metadata.insert(
+                    "previous_status".to_string(),
+                    serde_json::Value::String(previous_status.clone()),
+                );
+                metadata.insert(
+                    "user_review".to_string(),
+                    serde_json::json!({
+                        "outcome": review_outcome,
+                        "outcome_label": arkmemory_capture_review_outcome_label(review_outcome),
+                        "reviewed_at": now.clone(),
+                        "failure_signature": failure_signature,
+                    }),
+                );
+                event.status = reviewed_status.clone();
+                final_status = reviewed_status;
+                event.attempt_metadata = serde_json::Value::Object(metadata);
+                if event.completed_at.is_none() {
+                    event.completed_at = Some(now.clone());
+                }
+                event.updated_at = now;
+                agent.storage.upsert_memory_capture_event(&event).await?;
+            }
+            Some(serde_json::json!({
+                "capture_event_id": capture_event_id,
+                "previous_status": previous_status,
+                "status": final_status,
+                "outcome": review_outcome,
+            }))
+        } else {
+            None
+        };
         let project_part = project_id.unwrap_or("global");
         let event_id =
             arkmemory_stable_event_id(&["health_finding_acknowledged", project_part, id.as_str()]);
@@ -1607,7 +2194,10 @@ pub(super) async fn arkmemory_apply_health(
             memory_id,
             None,
             format!("Acknowledged memory health finding {}", id),
-            serde_json::json!({ "finding_id": id }),
+            serde_json::json!({
+                "finding_id": id,
+                "capture_resolution": capture_resolution,
+            }),
             context,
         )
         .await
@@ -1682,6 +2272,9 @@ pub(super) async fn arkmemory_sources(
         let mut sources = arkmemory_memory_sources(&memory);
         for link in &evidence_links {
             sources.push(format!("{}:{}", link.evidence_kind, link.evidence_ref));
+        }
+        for operation in &operations {
+            sources.extend(memory_operation_evidence_source_refs(operation));
         }
         sources.sort();
         sources.dedup();

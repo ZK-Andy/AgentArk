@@ -5,6 +5,7 @@ import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import { SettingsOverviewTab } from "./SettingsOverviewTab";
 import {
   getSettingsPageMeta,
+  getSettingsTabLoadingMessage,
   normalizeSettingsTab,
   resolveInitialSettingsTab,
   type SettingsPageProps,
@@ -14,15 +15,16 @@ import {
   SettingsNavigation,
 } from "./settingsNavigation";
 import { prefetchSettingsTabData } from "./settingsData";
-import { preloadSettingsTab } from "./workspacePreload";
+import { preloadSettingsFull, preloadSettingsTab } from "./workspacePreload";
 
 const SettingsPageFull = lazy(() => import("./SettingsPageFull"));
 
-function SettingsFallback() {
+function SettingsFallback({ tab }: { tab: number }) {
+  const message = getSettingsTabLoadingMessage(tab);
   return (
     <Box className="list-shell" sx={{ minHeight: 180, p: 1.5 }}>
       <Typography variant="body2" sx={{ color: "text.secondary" }}>
-        Loading settings...
+        {message}
       </Typography>
     </Box>
   );
@@ -55,6 +57,7 @@ export default function SettingsPage({
   }, [queryClient, standaloneSurface, tab]);
 
   const openFullEditor = () => {
+    preloadSettingsFull();
     preloadSettingsTab(tab);
     prefetchSettingsTabData(queryClient, tab);
     setFullEditorOpen(true);
@@ -70,7 +73,7 @@ export default function SettingsPage({
 
   if (standaloneSurface || fullEditorOpen || tab !== 0) {
     return (
-      <Suspense fallback={<SettingsFallback />}>
+      <Suspense fallback={<SettingsFallback tab={tab} />}>
         <SettingsPageFull
           autoRefresh={autoRefresh}
           initialTab={tab}

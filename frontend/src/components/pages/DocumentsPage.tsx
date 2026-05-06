@@ -23,6 +23,8 @@ import { errMessage, pickRecords, str } from "./pageHelpers";
 import { formatBytes, humanTs, RowOpsMenu } from "./workspaceUiBits";
 
 const REFRESH_MS = 8000;
+const INTERNAL_AGENTARK_DOCUMENT_ID_PREFIX = "agentark_knowledge:";
+const INTERNAL_AGENTARK_DOCUMENT_CONTENT_TYPE_PREFIX = "application/x-agentark-";
 
 type DocumentsPageProps = {
   autoRefresh: boolean;
@@ -65,7 +67,14 @@ export default function DocumentsPage({
     },
   });
 
-  const docs = pickRecords(docsQ.data, "documents");
+  const docs = pickRecords(docsQ.data, "documents").filter((doc) => {
+    const id = str(doc.id, "").trim();
+    const contentType = str(doc.content_type, "").trim().toLowerCase();
+    return (
+      !id.startsWith(INTERNAL_AGENTARK_DOCUMENT_ID_PREFIX) &&
+      !contentType.startsWith(INTERNAL_AGENTARK_DOCUMENT_CONTENT_TYPE_PREFIX)
+    );
+  });
 
   const handleFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];

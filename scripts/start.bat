@@ -10,6 +10,7 @@ REM   scripts\start.bat restart      - Restart AgentArk
 REM   scripts\start.bat logs         - View logs
 REM   scripts\start.bat update       - Pull latest image and restart (preserves data)
 REM   scripts\start.bat build        - Build from this checkout and restart
+REM   scripts\start.bat backup       - Backup Docker volumes
 REM   scripts\start.bat status       - Show running containers
 
 setlocal enabledelayedexpansion
@@ -22,6 +23,7 @@ if "%1"=="restart" goto restart
 if "%1"=="logs" goto logs
 if "%1"=="update" goto update
 if "%1"=="build" goto build
+if "%1"=="backup" goto backup
 if "%1"=="status" goto status
 if "%1"=="lowmem" goto lowmem
 if "%1"=="verify-lightpanda" goto verify_lightpanda
@@ -131,6 +133,27 @@ call :verify_gepa_async
 echo Local build complete! Your data is intact.
 goto end
 
+:backup
+for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set BACKUP_STAMP=%%I
+set "BACKUP_DIR=backups\%BACKUP_STAMP%"
+mkdir "%BACKUP_DIR%" >nul 2>&1
+echo Backing up AgentArk volumes to %BACKUP_DIR%...
+call :backup_volume agentark-data agentark-data.tar.gz
+if errorlevel 1 goto backup_failed
+call :backup_volume agentark-config agentark-config.tar.gz
+if errorlevel 1 goto backup_failed
+call :backup_volume agentark-postgres-data agentark-postgres-data.tar.gz
+if errorlevel 1 goto backup_failed
+call :backup_volume agentark-secrets agentark-secrets.tar.gz
+if errorlevel 1 goto backup_failed
+echo Backup complete!
+echo Keep agentark-secrets.tar.gz with the Postgres/config backups; it is required to unlock install-managed encrypted data.
+goto end
+
+:backup_failed
+echo Backup failed.
+goto end
+
 :status
 echo AgentArk Status:
 docker compose ps
@@ -205,8 +228,13 @@ goto verify_gepa_loop
 start "" /b /d "%CD%" "%ComSpec%" /c call "%~f0" verify-gepa ^>nul 2^>^&1
 exit /b 0
 
+:backup_volume
+echo   %1 -^> %2
+docker run --rm -v %1:/data:ro -v "%CD%\%BACKUP_DIR%":/backup alpine tar czf /backup/%2 -C /data .
+exit /b %ERRORLEVEL%
+
 :usage
-echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|build^|status^|lowmem]
+echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|build^|backup^|status^|lowmem]
 echo.
 echo   start          Start AgentArk (local access only)
 echo   tunnel         Start with remote access (auto-starts Cloudflare tunnel)
@@ -216,6 +244,7 @@ echo   restart        Restart AgentArk
 echo   logs           View logs
 echo   update         Pull latest image and restart (preserves data)
 echo   build          Build from this checkout and restart
+echo   backup         Backup Docker volumes
 echo   status         Show running containers
 echo   lowmem         Install low-memory config (2GB RAM / 2 CPUs) for Docker
 goto end

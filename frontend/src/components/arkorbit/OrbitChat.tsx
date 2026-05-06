@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type FormEvent,
@@ -9,6 +10,8 @@ import {
 import { Box, Divider, IconButton, Stack, Tooltip, Typography } from "@mui/material";
 import AddCommentRoundedIcon from "@mui/icons-material/AddCommentRounded";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
+import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
+import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 import HistoryRoundedIcon from "@mui/icons-material/HistoryRounded";
 import PersonRoundedIcon from "@mui/icons-material/PersonRounded";
@@ -19,6 +22,7 @@ import { arkorbitApi } from "./api";
 import type {
   OrbitChatFileChip,
   OrbitChatHistoryMessage,
+  OrbitChatMessageStatus,
   OrbitChatTranscript,
   OrbitChatUsage,
   OrbitId,
@@ -35,17 +39,22 @@ type ChatMessage = {
   usage?: OrbitChatUsage;
   activity?: string;
   active?: boolean;
+  status?: OrbitChatMessageStatus;
 };
+
+type OrbitChatPanelState = "idle" | "loading" | "running" | "failed" | "stopped" | "archived";
 
 type Props = {
   orbitId: OrbitId;
+  runtimeNotices?: string[];
+  onRuntimeNoticesSubmitted?: (notices: string[]) => void;
   onFileWritten?: (path: string) => void;
   onClose?: () => void;
 };
 
 type StreamHandlers = {
   onToken: (content: string) => void;
-  onFileWritten: (path: string, operation: OrbitFileOperation) => void;
+  onFileWritten: (path: string, operation: OrbitFileOperation, bytes?: number) => void;
   onRead: (path: string) => void;
   onStatus: (message: string) => void;
   onUsage: (usage: OrbitChatUsage) => void;
@@ -61,16 +70,38 @@ type OrbitChatComposerProps = {
   onStop: () => void;
 };
 
+const HISTORY_PAGE_SIZE = 5;
+
 function newId(prefix = "m"): string {
   return `${prefix}_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
 }
 
-function fileUpdateSentence(operation: OrbitFileOperation, path: string): string {
-  return `I ${operation === "edited" ? "edited" : "wrote"} ${path}.`;
+function formatBytes(value: number | undefined): string {
+  if (!value || !Number.isFinite(value) || value <= 0) return "";
+  if (value < 1024) return `${Math.round(value)} ${Math.round(value) === 1 ? "byte" : "bytes"}`;
+  const kb = value / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
 }
 
-function fileActivityLabel(operation: OrbitFileOperation, path: string): string {
-  return `I ${operation === "edited" ? "edited" : "wrote"} ${path}`;
+function fileUpdateSentence(
+  operation: OrbitFileOperation,
+  path: string,
+  bytes?: number,
+): string {
+  const action = operation === "edited" ? "Edited" : "Wrote";
+  const size = formatBytes(bytes);
+  return size ? `${action} ${path} (${size}).` : `${action} ${path}.`;
+}
+
+function fileActivityLabel(
+  operation: OrbitFileOperation,
+  path: string,
+  bytes?: number,
+): string {
+  const action = operation === "edited" ? "Saved" : "Wrote";
+  const size = formatBytes(bytes);
+  return size ? `${action} ${path} (${size}).` : `${action} ${path}.`;
 }
 
 function normalizeOperation(value: string): OrbitFileOperation {
@@ -125,12 +156,11 @@ function orbitUsageMetricItems(usage?: OrbitChatUsage): Array<{
   const inputTokens = normalized.input_tokens ?? 0;
   const outputTokens = normalized.output_tokens ?? 0;
   const totalTokens = normalized.total_tokens ?? inputTokens + outputTokens;
-  if (totalTokens <= 0 && !normalized.time_to_first_token_ms) return [];
+  if (totalTokens <= 0) return [];
   return [
     { label: "Total tokens", value: Math.round(totalTokens).toLocaleString() },
     { label: "Input tokens", value: Math.round(inputTokens).toLocaleString() },
     { label: "Output tokens", value: Math.round(outputTokens).toLocaleString() },
-    { label: "TTFT", value: formatDurationMs(normalized.time_to_first_token_ms) },
   ];
 }
 
@@ -145,20 +175,74 @@ function orbitUsageTitle(usage?: OrbitChatUsage): string | undefined {
   return details.length > 0 ? details.join(" | ") : undefined;
 }
 
-function fileChip(path: string, operation: OrbitFileOperation): OrbitChatFileChip {
-  return { id: newId("f"), path, operation };
+function orbitStatusLabel(status?: OrbitChatMessageStatus): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "failed":
+      return "Failed";
+    case "stopped":
+      return "Stopped";
+    case "completed":
+      return "";
+    default:
+      return "";
+  }
+}
+
+function orbitStatusActivity(status?: OrbitChatMessageStatus): string {
+  switch (status) {
+    case "running":
+      return "Waiting for live Orbit progress.";
+    case "failed":
+      return "Failed before a response was completed.";
+    case "stopped":
+      return "Stopped in this browser.";
+    default:
+      return "";
+  }
+}
+
+function orbitPanelStateLabel(state: OrbitChatPanelState): string {
+  switch (state) {
+    case "loading":
+      return "Loading conversation";
+    case "running":
+      return "Running";
+    case "failed":
+      return "Failed";
+    case "stopped":
+      return "Stopped";
+    case "archived":
+      return "Archived conversation";
+    default:
+      return "Current conversation";
+  }
+}
+
+function fileChip(
+  path: string,
+  operation: OrbitFileOperation,
+  bytes?: number,
+): OrbitChatFileChip {
+  return { id: newId("f"), path, operation, bytes };
 }
 
 function addFileChip(
   files: OrbitChatFileChip[] | undefined,
   path: string,
   operation: OrbitFileOperation,
+  bytes?: number,
 ): OrbitChatFileChip[] {
   const current = files ?? [];
   if (current.some((file) => file.path === path && file.operation === operation)) {
-    return current;
+    return current.map((file) =>
+      file.path === path && file.operation === operation
+        ? { ...file, bytes: bytes ?? file.bytes }
+        : file,
+    );
   }
-  return [...current, fileChip(path, operation)];
+  return [...current, fileChip(path, operation, bytes)];
 }
 
 function extractFileUpdate(line: string):
@@ -206,10 +290,19 @@ function historyToChatMessage(message: OrbitChatHistoryMessage): ChatMessage | n
     message.role === "assistant"
       ? normalizeAssistantContent(message.content)
       : { text: message.content, files: [] };
+  const legacyEmptyAssistant =
+    message.role === "assistant" &&
+    !normalized.text.trim() &&
+    normalized.files.length === 0 &&
+    !message.status &&
+    !message.activity;
   if (
     message.role === "assistant" &&
     !normalized.text.trim() &&
-    normalized.files.length === 0
+    normalized.files.length === 0 &&
+    (!message.status || message.status === "completed") &&
+    !message.activity &&
+    !legacyEmptyAssistant
   ) {
     return null;
   }
@@ -218,6 +311,11 @@ function historyToChatMessage(message: OrbitChatHistoryMessage): ChatMessage | n
     role: message.role,
     text: normalized.text,
     files: normalized.files,
+    status: legacyEmptyAssistant ? "failed" : message.status,
+    activity: legacyEmptyAssistant
+      ? "No response was recorded for this turn."
+      : message.activity,
+    active: message.status === "running",
     usage: message.role === "assistant" ? normalizeUsage(message) : undefined,
   };
 }
@@ -231,6 +329,8 @@ function sameChatMessages(left: ChatMessage[], right: ChatMessage[]): boolean {
       message.id === other.id &&
       message.role === other.role &&
       message.text === other.text &&
+      message.status === other.status &&
+      message.activity === other.activity &&
       (message.files?.length ?? 0) === (other.files?.length ?? 0) &&
       JSON.stringify(normalizeUsage(message.usage ?? {})) ===
         JSON.stringify(normalizeUsage(other.usage ?? {}))
@@ -322,7 +422,11 @@ function dispatchStreamEvent(
     const path = typeof payload.path === "string" ? payload.path : "";
     const operation =
       typeof payload.operation === "string" ? normalizeOperation(payload.operation) : "wrote";
-    if (path) handlers.onFileWritten(path, operation);
+    const bytes =
+      typeof payload.bytes === "number" && Number.isFinite(payload.bytes) && payload.bytes > 0
+        ? payload.bytes
+        : undefined;
+    if (path) handlers.onFileWritten(path, operation, bytes);
     return;
   }
   if (event.event === "read") {
@@ -369,6 +473,24 @@ const OrbitChatComposer = memo(function OrbitChatComposer({
   useEffect(() => {
     setDraft("");
   }, [resetSignal]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let stored: string | null = null;
+    try {
+      stored = window.sessionStorage.getItem("arkorbit.composerPrefill");
+    } catch {
+      stored = null;
+    }
+    if (!stored) return;
+    try {
+      window.sessionStorage.removeItem("arkorbit.composerPrefill");
+    } catch {
+      // best-effort cleanup
+    }
+    setDraft(stored);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const submit = useCallback(
     (event?: FormEvent<HTMLFormElement>) => {
@@ -421,10 +543,17 @@ const OrbitChatComposer = memo(function OrbitChatComposer({
   );
 });
 
-export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
+export function OrbitChat({
+  orbitId,
+  runtimeNotices = [],
+  onRuntimeNoticesSubmitted,
+  onFileWritten,
+  onClose,
+}: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [transcripts, setTranscripts] = useState<OrbitChatTranscript[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyPage, setHistoryPage] = useState(0);
   const [activeTranscriptId, setActiveTranscriptId] = useState("current");
   const [streaming, setStreaming] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -433,6 +562,35 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
   const activeAssistantRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const readOnly = activeTranscriptId !== "current";
+  const historyPageCount = Math.max(1, Math.ceil(transcripts.length / HISTORY_PAGE_SIZE));
+  const normalizedHistoryPage = Math.min(historyPage, historyPageCount - 1);
+  const visibleTranscripts = useMemo(
+    () =>
+      transcripts.slice(
+        normalizedHistoryPage * HISTORY_PAGE_SIZE,
+        normalizedHistoryPage * HISTORY_PAGE_SIZE + HISTORY_PAGE_SIZE,
+      ),
+    [normalizedHistoryPage, transcripts],
+  );
+  const visibleTurnState = useMemo<OrbitChatPanelState>(() => {
+    if (readOnly) return "archived";
+    if (loadingHistory) return "loading";
+    if (streaming) return "running";
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((message) => message.role === "assistant" && message.status);
+    if (lastAssistant?.status === "running") return "running";
+    if (lastAssistant?.status === "failed") return "failed";
+    if (lastAssistant?.status === "stopped") return "stopped";
+    return "idle";
+  }, [loadingHistory, messages, readOnly, streaming]);
+  const visibleTurnStatus = orbitPanelStateLabel(visibleTurnState);
+
+  useEffect(() => {
+    if (historyPage !== normalizedHistoryPage) {
+      setHistoryPage(normalizedHistoryPage);
+    }
+  }, [historyPage, normalizedHistoryPage]);
 
   const refreshTranscripts = useCallback(
     async (cancelled?: () => boolean) => {
@@ -465,6 +623,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
             id: newId("history_error"),
             role: "assistant",
             text: `Could not load orbit chat history: ${detail}`,
+            status: "failed",
           },
         ]);
         setActiveTranscriptId("current");
@@ -482,6 +641,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
     activeAssistantRef.current = null;
     setStreaming(false);
     setHistoryOpen(false);
+    setHistoryPage(0);
     setActiveTranscriptId("current");
     setMessages([]);
     setComposerResetSignal((value) => value + 1);
@@ -540,6 +700,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
     if (activeId) {
       updateAssistant(activeId, (message) => ({
         ...message,
+        status: "stopped",
         active: false,
         activity: message.text ? undefined : "Stopped.",
       }));
@@ -555,6 +716,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
       setMessages([]);
       setComposerResetSignal((value) => value + 1);
       setHistoryOpen(false);
+      setHistoryPage(0);
       setActiveTranscriptId("current");
       void refreshTranscripts();
     } catch (err) {
@@ -565,6 +727,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
           id: newId("new_chat_error"),
           role: "assistant",
           text: `Could not start a new chat: ${detail}`,
+          status: "failed",
         },
       ]);
     }
@@ -575,6 +738,8 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
       if (!trimmed || streaming || readOnly) return;
 
       const assistantId = newId();
+      const submittedRuntimeNotices = runtimeNotices.slice(0, 6);
+      onRuntimeNoticesSubmitted?.(submittedRuntimeNotices);
       setMessages((prev) => [
         ...prev,
         { id: newId(), role: "user", text: trimmed },
@@ -583,6 +748,9 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
           role: "assistant",
           text: "",
           files: [],
+          status: "running",
+          active: true,
+          activity: "Thinking...",
         },
       ]);
       setStreaming(true);
@@ -599,13 +767,17 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
             "Content-Type": "application/json",
             Accept: "text/event-stream",
           },
-          body: JSON.stringify({ message: trimmed }),
+          body: JSON.stringify({
+            message: trimmed,
+            runtime_notices: submittedRuntimeNotices,
+          }),
         });
         if (!response.ok) {
           const detail = extractFetchError(await response.text());
           updateAssistant(assistantId, (message) => ({
             ...message,
             text: detail || `Stream failed (HTTP ${response.status}).`,
+            status: "failed",
             active: false,
             activity: undefined,
           }));
@@ -616,27 +788,31 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
             updateAssistant(assistantId, (message) => ({
               ...message,
               text: message.text + content,
-              active: false,
+              status: "running",
+              active: true,
               activity: undefined,
             })),
-          onFileWritten: (path, operation) => {
+          onFileWritten: (path, operation, bytes) => {
             updateAssistant(assistantId, (message) => ({
               ...message,
-              files: addFileChip(message.files, path, operation),
-              activity: fileActivityLabel(operation, path),
+              files: addFileChip(message.files, path, operation, bytes),
+              status: "running",
+              activity: fileActivityLabel(operation, path, bytes),
               active: true,
             }));
             onFileWritten?.(path);
           },
-          onRead: (path) =>
+          onRead: (_path) =>
             updateAssistant(assistantId, (message) => ({
               ...message,
-              activity: `I'm reading this file: ${path}`,
+              status: "running",
+              activity: "Reading the canvas...",
               active: true,
             })),
           onStatus: (messageText) =>
             updateAssistant(assistantId, (message) => ({
               ...message,
+              status: "running",
               activity: messageText,
               active: true,
             })),
@@ -648,13 +824,20 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
           onError: (messageText) =>
             updateAssistant(assistantId, (message) => ({
               ...message,
-              text: messageText,
+              text: message.text.trim()
+                ? `${message.text.trimEnd()}\n\n${messageText}`
+                : messageText,
+              status: "failed",
               active: false,
               activity: undefined,
             })),
           onDone: () =>
             updateAssistant(assistantId, (message) => ({
               ...message,
+              status:
+                message.status === "failed" || message.status === "stopped"
+                  ? message.status
+                  : "completed",
               active: false,
               activity: undefined,
             })),
@@ -666,6 +849,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
           updateAssistant(assistantId, (message) => ({
             ...message,
             text: detail || "Stream failed.",
+            status: "failed",
             active: false,
             activity: undefined,
           }));
@@ -676,18 +860,31 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
         setStreaming(false);
       }
     },
-    [orbitId, onFileWritten, readOnly, refreshTranscripts, streaming, updateAssistant],
+    [
+      orbitId,
+      onFileWritten,
+      onRuntimeNoticesSubmitted,
+      readOnly,
+      refreshTranscripts,
+      runtimeNotices,
+      streaming,
+      updateAssistant,
+    ],
   );
 
   return (
-    <Box className="orbit-chat-shell">
+    <Box
+      className={`orbit-chat-shell orbit-chat-panel-${visibleTurnState}${
+        streaming ? " is-streaming" : ""
+      }`}
+    >
       <Box className="orbit-chat-header">
         <Stack sx={{ minWidth: 0 }}>
           <Typography variant="caption" className="orbit-chat-title">
             Orbit chat
           </Typography>
           <Typography variant="caption" className="orbit-chat-subtitle">
-            {readOnly ? "Archived conversation" : "Current conversation"}
+            {visibleTurnStatus}
           </Typography>
         </Stack>
         <Stack direction="row" spacing={0.5} sx={{ alignItems: "center" }}>
@@ -698,6 +895,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
                 className="orbit-chat-tool"
                 onClick={() => {
                   setHistoryOpen(false);
+                  setHistoryPage(0);
                   void loadTranscript("current");
                 }}
                 aria-label="Return to current chat"
@@ -711,7 +909,11 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
               size="small"
               className="orbit-chat-tool"
               onClick={() => {
-                setHistoryOpen((open) => !open);
+                setHistoryOpen((open) => {
+                  const next = !open;
+                  if (next) setHistoryPage(0);
+                  return next;
+                });
                 void refreshTranscripts();
               }}
               aria-label="Conversation history"
@@ -750,7 +952,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
               No previous conversations.
             </Typography>
           ) : (
-            transcripts.map((transcript) => (
+            visibleTranscripts.map((transcript) => (
               <button
                 key={transcript.id}
                 type="button"
@@ -759,6 +961,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
                 }`}
                 onClick={() => {
                   setHistoryOpen(false);
+                  setHistoryPage(0);
                   void loadTranscript(transcript.id);
                 }}
               >
@@ -769,6 +972,41 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
               </button>
             ))
           )}
+          {transcripts.length > HISTORY_PAGE_SIZE ? (
+            <Box className="orbit-chat-history-pager">
+              <Tooltip title="Previous conversations">
+                <span>
+                  <IconButton
+                    size="small"
+                    className="orbit-chat-history-page-button"
+                    disabled={normalizedHistoryPage === 0}
+                    onClick={() => setHistoryPage((page) => Math.max(0, page - 1))}
+                    aria-label="Previous conversation page"
+                  >
+                    <ChevronLeftRoundedIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <span className="orbit-chat-history-page-label">
+                {normalizedHistoryPage + 1} / {historyPageCount}
+              </span>
+              <Tooltip title="More conversations">
+                <span>
+                  <IconButton
+                    size="small"
+                    className="orbit-chat-history-page-button"
+                    disabled={normalizedHistoryPage >= historyPageCount - 1}
+                    onClick={() =>
+                      setHistoryPage((page) => Math.min(historyPageCount - 1, page + 1))
+                    }
+                    aria-label="Next conversation page"
+                  >
+                    <ChevronRightRoundedIcon fontSize="small" />
+                  </IconButton>
+                </span>
+              </Tooltip>
+            </Box>
+          ) : null}
           <Divider className="orbit-chat-history-divider" />
         </Box>
       ) : null}
@@ -786,17 +1024,26 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
             .filter(
               (msg) =>
                 msg.role !== "assistant" ||
-                Boolean(msg.text.trim() || msg.activity || msg.active || msg.files?.length),
+                Boolean(
+                  msg.text.trim() ||
+                    msg.activity ||
+                    (msg.status && msg.status !== "completed") ||
+                    msg.active ||
+                    msg.files?.length,
+                ),
             )
             .map((msg) => {
               const usageMetricItems =
                 msg.role === "assistant" ? orbitUsageMetricItems(msg.usage) : [];
+              const statusLabel = msg.role === "assistant" ? orbitStatusLabel(msg.status) : "";
+              const displayActivity =
+                msg.activity || (msg.role === "assistant" ? orbitStatusActivity(msg.status) : "");
               return (
                 <Box
                   key={msg.id}
                   className={`orbit-chat-msg orbit-chat-msg-${msg.role}${
-                    msg.active && msg.activity ? " orbit-chat-msg-active" : ""
-                  }`}
+                    msg.active && displayActivity ? " orbit-chat-msg-active" : ""
+                  }${msg.status ? ` orbit-chat-msg-status-${msg.status}` : ""}`}
                 >
                   <span className="orbit-chat-msg-role">
                     <span className="orbit-chat-role-avatar" aria-hidden="true">
@@ -810,23 +1057,26 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
                         />
                       )}
                     </span>
-                    <span>{msg.role === "user" ? "You" : "AgentArk"}</span>
+                    <span>{msg.role === "user" ? "You" : "Orbit"}</span>
+                    {statusLabel ? (
+                      <span className="orbit-chat-status-chip">{statusLabel}</span>
+                    ) : null}
                   </span>
                   {msg.text ? (
                     <span className="orbit-chat-msg-text">{msg.text}</span>
                   ) : null}
-                  {msg.role === "assistant" && msg.active && msg.activity ? (
+                  {msg.role === "assistant" && msg.active && displayActivity ? (
                     <span className="orbit-chat-activity" aria-live="polite">
                       <span className="orbit-chat-activity-pulse" aria-hidden="true" />
-                      <span className="orbit-chat-activity-label">{msg.activity}</span>
+                      <span className="orbit-chat-activity-label">{displayActivity}</span>
                       <span className="orbit-chat-activity-dots" aria-hidden="true">
                         <i />
                         <i />
                         <i />
                       </span>
                     </span>
-                  ) : !msg.text && msg.activity ? (
-                    <span className="orbit-chat-msg-text">{msg.activity}</span>
+                  ) : !msg.text && displayActivity ? (
+                    <span className="orbit-chat-msg-text">{displayActivity}</span>
                   ) : null}
                   {msg.files?.length ? (
                     <Stack direction="row" spacing={0.75} className="orbit-file-chip-row">
@@ -834,6 +1084,7 @@ export function OrbitChat({ orbitId, onFileWritten, onClose }: Props) {
                         <span key={file.id} className="orbit-file-chip">
                           {file.operation === "edited" ? "Edited " : "Wrote "}
                           {file.path}
+                          {file.bytes ? ` (${formatBytes(file.bytes)})` : ""}
                         </span>
                       ))}
                     </Stack>

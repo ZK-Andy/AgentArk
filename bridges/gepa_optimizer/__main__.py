@@ -7,7 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SUPPORTED_SURFACES = {"prompt_bundle", "specialist_prompt_bundle"}
+SUPPORTED_SURFACES = {
+    "prompt_bundle",
+    "specialist_prompt_bundle",
+    "prompt_fragment_bundle",
+}
 MAX_CANDIDATE_RECORDS = 64
 MAX_CANDIDATE_RECORD_BYTES = 768 * 1024
 MAX_EXPORT_BYTES = 12 * 1024 * 1024
@@ -135,6 +139,29 @@ def _surface_candidate_quality(record: dict) -> tuple[float, list[str]]:
                 score += 0.05
             else:
                 notes.append(f"{role} is incomplete")
+    elif surface == "prompt_fragment_bundle":
+        fragments = candidate.get("fragments")
+        if isinstance(fragments, list) and fragments:
+            complete = 0
+            enabled = 0
+            for fragment in fragments[:64]:
+                if not isinstance(fragment, dict):
+                    continue
+                if fragment.get("enabled", True):
+                    enabled += 1
+                if (
+                    isinstance(fragment.get("id"), str)
+                    and fragment.get("id", "").strip()
+                    and isinstance(fragment.get("surface"), str)
+                    and fragment.get("surface", "").strip()
+                    and isinstance(fragment.get("body"), str)
+                    and fragment.get("body", "").strip()
+                ):
+                    complete += 1
+            score += 0.50 * min(1.0, complete / max(1, min(len(fragments), 12)))
+            score += 0.10 if enabled else 0.0
+        else:
+            notes.append("fragments is empty or missing")
     if isinstance(candidate.get("version"), str) and candidate["version"].strip():
         score += 0.15
     if isinstance(record.get("feedback_summary"), str) and record["feedback_summary"].strip():
@@ -206,7 +233,8 @@ def _run_dspy_gepa(export: dict) -> str:
             desc=(
                 "JSONL records with fields run_id, surface, source, candidate, "
                 "objective_scores, feedback_summary, trace_refs, created_at. "
-                "Supported surfaces are prompt_bundle and specialist_prompt_bundle."
+                "Supported surfaces are prompt_bundle, specialist_prompt_bundle, "
+                "and prompt_fragment_bundle."
             )
         )
 
@@ -230,7 +258,7 @@ def _run_dspy_gepa(export: dict) -> str:
         score = min(1.0, schema_score + 0.60 * quality_score)
         notes = [note for _, surface_notes in quality for note in surface_notes][:6]
         feedback = (
-            "Candidates parsed. Preserve complete bundle schemas, explain the trace failure "
+            "Candidates parsed. Preserve complete profile schemas, explain the trace failure "
             "mode, include objective scores, and improve broad behavior instead of memorizing "
             "fixture text."
         )

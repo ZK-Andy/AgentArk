@@ -2266,7 +2266,7 @@ pub(super) async fn create_task(
     State(state): State<AppState>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Response {
-    use crate::core::{Task, TaskApproval, status_for_task_approval};
+    use crate::core::{status_for_task_approval, Task, TaskApproval};
 
     // Convert and validate cron expression if provided
     // Standard 5-field cron is converted to 6-field (with seconds) for Rust cron crate
@@ -2949,6 +2949,7 @@ pub(super) async fn resume_chat_task_stream(
             arkorbit_context: None,
             attachments: Vec::new(),
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
+            accepted_suggestion: None,
             task_mode: ChatStreamTaskMode::Existing(Box::new(StreamedChatTask {
                 task_id: resumed_task.id.to_string(),
                 description: resumed_task.description.clone(),
@@ -3687,6 +3688,171 @@ pub(super) async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) ->
     })
 }
 
+fn chat_suggestion_execution_focus(suggestion: &ChatAutomationSuggestion) -> String {
+    suggestion
+        .goal_detail
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!suggestion.detail.trim().is_empty()).then_some(suggestion.detail.as_str()))
+        .or_else(|| {
+            (!suggestion.source_snippet.trim().is_empty())
+                .then_some(suggestion.source_snippet.as_str())
+        })
+        .unwrap_or(suggestion.title.as_str())
+        .trim()
+        .to_string()
+}
+
+async fn choose_watch_poll_action_for_suggestion(
+    agent: &Agent,
+    focus: &str,
+) -> std::result::Result<String, String> {
+    let actions = agent
+        .runtime
+        .list_enabled_actions()
+        .await
+        .map_err(|error| format!("Failed to load action catalog: {}", error))?;
+    actions
+        .into_iter()
+        .filter(|action| {
+            matches!(
+                crate::actions::planner_metadata_for_action(action).role,
+                crate::actions::PlannerActionRole::DataSource
+            )
+        })
+        .map(|action| {
+            let score = crate::core::intent::action_intent_score(focus, &action);
+            (score, action)
+        })
+        .max_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, action)| action.name)
+        .ok_or_else(|| "No data-source action is available for watcher polling".to_string())
+}
+
+fn watch_payload_from_chat_suggestion(
+    suggestion: &ChatAutomationSuggestion,
+    poll_action: &str,
+    focus: &str,
+) -> serde_json::Value {
+    let description = if suggestion.goal_title.trim().is_empty() {
+        suggestion.title.trim()
+    } else {
+        suggestion.goal_title.trim()
+    };
+    let source_context = serde_json::json!({
+        "suggestion_id": suggestion.id,
+        "suggestion_kind": suggestion.kind,
+        "conversation_id": suggestion.conversation_id,
+        "source_message_id": suggestion.source_message_id,
+    });
+    serde_json::json!({
+        "description": description,
+        "poll_action": poll_action,
+        "poll_arguments": {
+            "query": focus,
+            "_chat_suggestion": source_context,
+        },
+        "condition": {
+            "description": "Trigger when the poll result contains a meaningful new or actionable update for the accepted monitoring goal.",
+            "type": "llm",
+        },
+        "on_trigger": format!("Notify the user with the relevant update and source context for: {}", focus),
+        "interval_secs": 3600,
+        "timeout_days": 7,
+        "notify_channel": "preferred",
+        "channel": "autonomy",
+        "conversation_id": suggestion.conversation_id,
+        "_chat_suggestion": source_context,
+    })
+}
+
+async fn append_suggestion_trace_step(
+    trace_ref: &Arc<RwLock<ExecutionTrace>>,
+    icon: &str,
+    title: &str,
+    detail: &str,
+    step_type: &str,
+    data: Option<serde_json::Value>,
+) {
+    trace_ref
+        .write()
+        .await
+        .steps
+        .push(crate::core::ExecutionStep {
+            icon: icon.to_string(),
+            title: title.to_string(),
+            detail: detail.to_string(),
+            step_type: step_type.to_string(),
+            data: data
+                .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                .map(|text| crate::security::redact_pii(&text)),
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(0),
+        });
+}
+
+pub(super) async fn execute_accepted_watcher_suggestion(
+    agent: &Agent,
+    suggestion: &ChatAutomationSuggestion,
+    trace_ref: &Arc<RwLock<ExecutionTrace>>,
+) -> std::result::Result<(), String> {
+    let focus = chat_suggestion_execution_focus(suggestion);
+    let poll_action = choose_watch_poll_action_for_suggestion(agent, &focus).await?;
+    let payload = watch_payload_from_chat_suggestion(suggestion, &poll_action, &focus);
+    let action = RecommendedAction {
+        id: format!("chat-suggestion-watch:{}", suggestion.id),
+        title: suggestion.title.clone(),
+        description: suggestion.detail.clone(),
+        action_kind: "watch".to_string(),
+        payload: payload.clone(),
+        trust: RiskEnvelope::default(),
+        readiness: None,
+    };
+
+    append_suggestion_trace_step(
+        trace_ref,
+        "[plan]",
+        "Prepared watcher launch",
+        "Mapped the accepted suggestion to a durable watcher action.",
+        "info",
+        Some(serde_json::json!({
+            "suggestion_id": suggestion.id,
+            "poll_action": poll_action,
+            "focus": focus,
+        })),
+    )
+    .await;
+
+    let mut settings = load_autonomy_settings(agent).await;
+    let result = agent
+        .execute_autonomy_action_payload(&mut settings, &action.action_kind, &action.payload)
+        .await?;
+    let _ = save_autonomy_settings(agent, &settings).await;
+    let summary = summarize_autonomy_action_result(&action, &result);
+    append_suggestion_trace_step(
+        trace_ref,
+        "[ok]",
+        "Watcher saved",
+        &summary,
+        "success",
+        Some(serde_json::json!({
+            "action": action,
+            "result": result,
+        })),
+    )
+    .await;
+    let mut trace = trace_ref.write().await;
+    trace.completed_at = Some(chrono::Utc::now());
+    trace.response = Some(summary);
+    trace.model = Some("internal:accepted-suggestion".to_string());
+    trace.complexity = Some("watcher".to_string());
+    Ok(())
+}
+
 pub(super) async fn accept_chat_suggestion(
     state: &AppState,
     suggestion_id: &str,
@@ -3716,6 +3882,9 @@ pub(super) async fn accept_chat_suggestion(
     {
         let mut trace = trace_ref.write().await;
         trace.id = trace_id.clone();
+        trace.message = prompt.clone();
+        trace.channel = "autonomy".to_string();
+        trace.started_at = Some(started_at);
     }
 
     suggestions[idx].status = "accepted".to_string();
@@ -3738,17 +3907,24 @@ pub(super) async fn accept_chat_suggestion(
         let trace_ref_for_run = trace_ref.clone();
         let storage_for_run = storage.clone();
         let prompt_for_run = prompt.clone();
+        let suggestion_for_run = suggestion.clone();
         let suggestion_id_for_run = suggestion_record_id.clone();
         let trace_id_for_run = trace_id.clone();
         let suggestion_kind_for_run = suggestion.kind.clone();
         let run_snapshot_for_run = run_snapshot;
         crate::spawn_logged!("src/channels/http.rs:19428", async move {
-            let (token_tx, mut token_rx) =
-                tokio::sync::mpsc::channel::<crate::core::StreamEvent>(256);
-            let drain = tokio::spawn(async move { while token_rx.recv().await.is_some() {} });
-            let run_result = {
+            let run_result: std::result::Result<(), String> = if suggestion_kind_for_run
+                == "watcher"
+            {
                 let agent = state_for_run.agent.read().await;
-                agent
+                execute_accepted_watcher_suggestion(&agent, &suggestion_for_run, &trace_ref_for_run)
+                    .await
+            } else {
+                let (token_tx, mut token_rx) =
+                    tokio::sync::mpsc::channel::<crate::core::StreamEvent>(256);
+                let drain = tokio::spawn(async move { while token_rx.recv().await.is_some() {} });
+                let agent = state_for_run.agent.read().await;
+                let result = agent
                     .process_message_stream_with_meta(
                         &prompt_for_run,
                         "autonomy",
@@ -3758,8 +3934,11 @@ pub(super) async fn accept_chat_suggestion(
                         token_tx,
                     )
                     .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = drain.await;
+                result
             };
-            let _ = drain.await;
             let snapshot = trace::persist_live_trace_snapshot(
                 &state_for_run.trace_history,
                 &trace_ref_for_run,
@@ -3793,6 +3972,25 @@ pub(super) async fn accept_chat_suggestion(
                 }
                 Err(error) => {
                     let err_text = error.to_string();
+                    {
+                        let mut trace = trace_ref_for_run.write().await;
+                        trace.completed_at = Some(chrono::Utc::now());
+                        trace.response = Some(err_text.clone());
+                        trace.steps.push(crate::core::ExecutionStep {
+                            icon: "[err]".to_string(),
+                            title: "Suggestion run failed".to_string(),
+                            detail: err_text.clone(),
+                            step_type: "error".to_string(),
+                            data: None,
+                            timestamp: chrono::Utc::now(),
+                            duration_ms: Some(0),
+                        });
+                    }
+                    let _ = trace::persist_live_trace_snapshot(
+                        &state_for_run.trace_history,
+                        &trace_ref_for_run,
+                    )
+                    .await;
                     suggestions::update_chat_suggestion_after_run(
                         &storage_for_run,
                         &suggestion_id_for_run,

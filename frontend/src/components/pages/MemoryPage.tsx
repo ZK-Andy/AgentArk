@@ -16,6 +16,7 @@ import {
   TableCell,
   TableContainer,
   TableHead,
+  TablePagination,
   TableRow,
   Tabs,
   TextField,
@@ -23,7 +24,7 @@ import {
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
@@ -41,6 +42,9 @@ import {
 } from "./workspaceUiBits";
 
 const REFRESH_MS = 8000;
+const MEMORY_PAGE_SIZE = 20;
+
+type MemoryCategoryKey = "facts" | "preferences" | "userData" | "knowledge";
 
 type RuntimeActionCatalogEntry = {
   actionId: string;
@@ -176,6 +180,12 @@ export default function MemoryPage({
     null,
   );
   const [memoryTab, setMemoryTab] = useState(0);
+  const [memoryPages, setMemoryPages] = useState<Record<MemoryCategoryKey, number>>({
+    facts: 0,
+    preferences: 0,
+    userData: 0,
+    knowledge: 0,
+  });
   const [prefKey, setPrefKey] = useState("");
   const [prefValue, setPrefValue] = useState("");
   const [prefConfidence, setPrefConfidence] = useState("0.85");
@@ -205,23 +215,43 @@ export default function MemoryPage({
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const factsQ = useQuery({
-    queryKey: ["memory-facts"],
-    queryFn: () => api.rawGet("/memory/facts?limit=50"),
+    queryKey: ["memory-facts", memoryPages.facts, MEMORY_PAGE_SIZE],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/facts?limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.facts * MEMORY_PAGE_SIZE
+        }`,
+      ),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const preferencesQ = useQuery({
-    queryKey: ["memory-preferences"],
-    queryFn: () => api.rawGet("/memory/preferences?limit=100"),
+    queryKey: ["memory-preferences", memoryPages.preferences, MEMORY_PAGE_SIZE],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/preferences?limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.preferences * MEMORY_PAGE_SIZE
+        }`,
+      ),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const userDataQ = useQuery({
-    queryKey: ["memory-user-data"],
-    queryFn: () => api.rawGet("/memory/user-data?limit=100"),
+    queryKey: ["memory-user-data", memoryPages.userData, MEMORY_PAGE_SIZE],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/user-data?limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.userData * MEMORY_PAGE_SIZE
+        }`,
+      ),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const knowledgeQ = useQuery({
-    queryKey: ["memory-knowledge"],
-    queryFn: () => api.rawGet("/memory/knowledge?limit=100"),
+    queryKey: ["memory-knowledge", memoryPages.knowledge, MEMORY_PAGE_SIZE],
+    queryFn: () =>
+      api.rawGet(
+        `/memory/knowledge?limit=${MEMORY_PAGE_SIZE}&offset=${
+          memoryPages.knowledge * MEMORY_PAGE_SIZE
+        }`,
+      ),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
 
@@ -272,6 +302,45 @@ export default function MemoryPage({
   const preferences = pickRecords(preferencesQ.data, "preferences");
   const userDataItems = pickRecords(userDataQ.data, "items");
   const knowledgeItems = pickRecords(knowledgeQ.data, "items");
+  const factsTotal = num(asRecord(factsQ.data).total, num(stats.facts, facts.length));
+  const preferencesTotal = num(
+    asRecord(preferencesQ.data).total,
+    num(stats.preferences, preferences.length),
+  );
+  const userDataTotal = num(
+    asRecord(userDataQ.data).total,
+    num(stats.user_data, userDataItems.length),
+  );
+  const knowledgeTotal = num(
+    asRecord(knowledgeQ.data).total,
+    num(stats.knowledge, knowledgeItems.length),
+  );
+  const setMemoryPage = (key: MemoryCategoryKey, page: number) => {
+    setMemoryPages((prev) => {
+      const nextPage = Math.max(0, page);
+      return prev[key] === nextPage ? prev : { ...prev, [key]: nextPage };
+    });
+  };
+
+  useEffect(() => {
+    setMemoryPages((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      ([
+        ["facts", factsTotal],
+        ["preferences", preferencesTotal],
+        ["userData", userDataTotal],
+        ["knowledge", knowledgeTotal],
+      ] as const).forEach(([key, total]) => {
+        const maxPage = Math.max(0, Math.ceil(total / MEMORY_PAGE_SIZE) - 1);
+        if (next[key] > maxPage) {
+          next[key] = maxPage;
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [factsTotal, knowledgeTotal, preferencesTotal, userDataTotal]);
 
   const parseSources = (value: unknown): string[] => {
     if (Array.isArray(value)) return value.map((v) => String(v));
@@ -388,10 +457,10 @@ export default function MemoryPage({
           "& .MuiTab-root": { minHeight: 0, py: 0.5, fontSize: "0.8rem" },
         }}
       >
-        <Tab label={`Facts (${facts.length})`} />
-        <Tab label={`Preferences (${preferences.length})`} />
-        <Tab label={`User Data (${userDataItems.length})`} />
-        <Tab label={`Knowledge (${knowledgeItems.length})`} />
+        <Tab label={`Facts (${factsTotal})`} />
+        <Tab label={`Preferences (${preferencesTotal})`} />
+        <Tab label={`User Data (${userDataTotal})`} />
+        <Tab label={`Knowledge (${knowledgeTotal})`} />
       </Tabs>
       {memoryTab === 0 ? (
         <Box className="list-shell">
@@ -416,61 +485,72 @@ export default function MemoryPage({
               No facts yet.
             </Typography>
           ) : (
-            <TableContainer className="table-shell">
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>Fact</TableCell>
-                    <TableCell>Confidence</TableCell>
-                    <TableCell>Created</TableCell>
-                    <TableCell>Evidence</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {facts.slice(0, 50).map((f, idx) => {
-                    const id = str(f.id, String(idx));
-                    const sources = parseSources(f.sources);
-                    const factText = str(f.fact, "-");
-                    return (
-                      <TableRow
-                        key={id}
-                        hover
-                        tabIndex={0}
-                        aria-label={`Open memory fact: ${factText}`}
-                        onClick={() => setSelectedFact(asRecord(f))}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.preventDefault();
-                            setSelectedFact(asRecord(f));
-                          }
-                        }}
-                        sx={{
-                          cursor: "pointer",
-                        }}
-                      >
-                        <TableCell sx={{ maxWidth: 640 }}>
-                          <Typography
-                            variant="body2"
-                            noWrap
-                            title={factText}
-                          >
-                            {factText}
-                          </Typography>
-                        </TableCell>
-                        <TableCell>{num(f.confidence, 0).toFixed(2)}</TableCell>
-                        <TableCell
-                          sx={{ whiteSpace: "nowrap" }}
-                          title={humanTs(str(f.created_at, "-")).tip}
+            <>
+              <TableContainer className="table-shell">
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Fact</TableCell>
+                      <TableCell>Confidence</TableCell>
+                      <TableCell>Created</TableCell>
+                      <TableCell>Evidence</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {facts.map((f, idx) => {
+                      const id = str(f.id, String(idx));
+                      const sources = parseSources(f.sources);
+                      const evidenceCount = num(f.evidence_count, sources.length);
+                      const factText = str(f.fact, "-");
+                      return (
+                        <TableRow
+                          key={id}
+                          hover
+                          tabIndex={0}
+                          aria-label={`Open memory fact: ${factText}`}
+                          onClick={() => setSelectedFact(asRecord(f))}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setSelectedFact(asRecord(f));
+                            }
+                          }}
+                          sx={{
+                            cursor: "pointer",
+                          }}
                         >
-                          {humanTs(str(f.created_at, "-")).label}
-                        </TableCell>
-                        <TableCell>{sources.length}</TableCell>
-                      </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
-            </TableContainer>
+                          <TableCell sx={{ maxWidth: 640 }}>
+                            <Typography
+                              variant="body2"
+                              noWrap
+                              title={factText}
+                            >
+                              {factText}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>{num(f.confidence, 0).toFixed(2)}</TableCell>
+                          <TableCell
+                            sx={{ whiteSpace: "nowrap" }}
+                            title={humanTs(str(f.created_at, "-")).tip}
+                          >
+                            {humanTs(str(f.created_at, "-")).label}
+                          </TableCell>
+                          <TableCell>{evidenceCount}</TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <TablePagination
+                component="div"
+                count={factsTotal}
+                page={memoryPages.facts}
+                onPageChange={(_event, nextPage) => setMemoryPage("facts", nextPage)}
+                rowsPerPage={MEMORY_PAGE_SIZE}
+                rowsPerPageOptions={[MEMORY_PAGE_SIZE]}
+              />
+            </>
           )}
         </Box>
       ) : null}
@@ -588,74 +668,86 @@ export default function MemoryPage({
                 No preferences yet.
               </Typography>
             ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Key</TableCell>
-                      <TableCell>Value</TableCell>
-                      <TableCell>Confidence</TableCell>
-                      <TableCell>Source</TableCell>
-                      <TableCell>Updated</TableCell>
-                      <TableCell align="right">Ops</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {preferences.map((pref, idx) => {
-                      const key = str(pref.key, String(idx));
-                      const endpoint = `/memory/preferences/${encodeURIComponent(key)}`;
-                      return (
-                        <TableRow key={`${key}-${idx}`}>
-                          <TableCell sx={{ whiteSpace: "nowrap" }}>
-                            {key}
-                          </TableCell>
-                          <TableCell sx={{ maxWidth: 480 }}>
-                            <Typography
-                              variant="body2"
-                              noWrap
-                              title={str(pref.value, "-")}
+              <>
+                <TableContainer className="table-shell">
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Key</TableCell>
+                        <TableCell>Value</TableCell>
+                        <TableCell>Confidence</TableCell>
+                        <TableCell>Source</TableCell>
+                        <TableCell>Updated</TableCell>
+                        <TableCell align="right">Ops</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {preferences.map((pref, idx) => {
+                        const key = str(pref.key, String(idx));
+                        const endpoint = `/memory/preferences/${encodeURIComponent(key)}`;
+                        return (
+                          <TableRow key={`${key}-${idx}`}>
+                            <TableCell sx={{ whiteSpace: "nowrap" }}>
+                              {key}
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 480 }}>
+                              <Typography
+                                variant="body2"
+                                noWrap
+                                title={str(pref.value, "-")}
+                              >
+                                {str(pref.value, "-")}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              {num(pref.confidence, 0).toFixed(2)}
+                            </TableCell>
+                            <TableCell>{str(pref.source, "-")}</TableCell>
+                            <TableCell
+                              sx={{ whiteSpace: "nowrap" }}
+                              title={humanTs(str(pref.updated_at, "-")).tip}
                             >
-                              {str(pref.value, "-")}
-                            </Typography>
-                          </TableCell>
-                          <TableCell>
-                            {num(pref.confidence, 0).toFixed(2)}
-                          </TableCell>
-                          <TableCell>{str(pref.source, "-")}</TableCell>
-                          <TableCell
-                            sx={{ whiteSpace: "nowrap" }}
-                            title={humanTs(str(pref.updated_at, "-")).tip}
-                          >
-                            {humanTs(str(pref.updated_at, "-")).label}
-                          </TableCell>
-                          <TableCell align="right">
-                            <RowOpsMenu
-                              actions={[
-                                {
-                                  label: "Delete",
-                                  tone: "error",
-                                  divider: true,
-                                  onClick: async () => {
-                                    setError(null);
-                                    try {
-                                      await deletePreferenceMutation.mutateAsync(
-                                        endpoint,
-                                      );
-                                    } catch (e) {
-                                      setError(errMessage(e));
-                                    }
+                              {humanTs(str(pref.updated_at, "-")).label}
+                            </TableCell>
+                            <TableCell align="right">
+                              <RowOpsMenu
+                                actions={[
+                                  {
+                                    label: "Delete",
+                                    tone: "error",
+                                    divider: true,
+                                    onClick: async () => {
+                                      setError(null);
+                                      try {
+                                        await deletePreferenceMutation.mutateAsync(
+                                          endpoint,
+                                        );
+                                      } catch (e) {
+                                        setError(errMessage(e));
+                                      }
+                                    },
                                   },
-                                },
-                              ]}
-                              ariaLabel="Preference options"
-                            />
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
+                                ]}
+                                ariaLabel="Preference options"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                <TablePagination
+                  component="div"
+                  count={preferencesTotal}
+                  page={memoryPages.preferences}
+                  onPageChange={(_event, nextPage) =>
+                    setMemoryPage("preferences", nextPage)
+                  }
+                  rowsPerPage={MEMORY_PAGE_SIZE}
+                  rowsPerPageOptions={[MEMORY_PAGE_SIZE]}
+                />
+              </>
             )}
           </Box>
         </Stack>
@@ -771,103 +863,115 @@ export default function MemoryPage({
                 No user data items yet.
               </Typography>
             ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Kind</TableCell>
-                      <TableCell>Title</TableCell>
-                      <TableCell>Content</TableCell>
-                      <TableCell>URL</TableCell>
-                      <TableCell>Updated</TableCell>
-                      <TableCell align="right">Ops</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {userDataItems.map((item, idx) => {
-                      const id = str(item.id, String(idx));
-                      const url = str(item.url, "");
-                      return (
-                        <TableRow key={id}>
-                          <TableCell>{str(item.kind, "-")}</TableCell>
-                          <TableCell sx={{ maxWidth: 220 }}>
-                            <Typography
-                              variant="body2"
-                              noWrap
-                              title={str(item.title, "-")}
-                            >
-                              {str(item.title, "-")}
-                            </Typography>
-                          </TableCell>
-                          <TableCell sx={{ maxWidth: 380 }}>
-                            <Typography
-                              variant="body2"
-                              noWrap
-                              title={str(item.content, "-")}
-                            >
-                              {str(item.content, "-")}
-                            </Typography>
-                          </TableCell>
-                          <TableCell sx={{ maxWidth: 260 }}>
-                            {url ? (
-                              <Typography
-                                component="a"
-                                href={url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                variant="body2"
-                                sx={{
-                                  color: "var(--mui-palette-info-main)",
-                                  textDecoration: "none",
-                                }}
-                              >
-                                Open
-                              </Typography>
-                            ) : (
+              <>
+                <TableContainer className="table-shell">
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Kind</TableCell>
+                        <TableCell>Title</TableCell>
+                        <TableCell>Content</TableCell>
+                        <TableCell>URL</TableCell>
+                        <TableCell>Updated</TableCell>
+                        <TableCell align="right">Ops</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {userDataItems.map((item, idx) => {
+                        const id = str(item.id, String(idx));
+                        const url = str(item.url, "");
+                        return (
+                          <TableRow key={id}>
+                            <TableCell>{str(item.kind, "-")}</TableCell>
+                            <TableCell sx={{ maxWidth: 220 }}>
                               <Typography
                                 variant="body2"
-                                sx={{
-                                  color: "text.secondary",
-                                }}
+                                noWrap
+                                title={str(item.title, "-")}
                               >
-                                -
+                                {str(item.title, "-")}
                               </Typography>
-                            )}
-                          </TableCell>
-                          <TableCell
-                            sx={{ whiteSpace: "nowrap" }}
-                            title={humanTs(str(item.updated_at, "-")).tip}
-                          >
-                            {humanTs(str(item.updated_at, "-")).label}
-                          </TableCell>
-                          <TableCell align="right">
-                            <RowOpsMenu
-                              actions={[
-                                {
-                                  label: "Delete",
-                                  tone: "error",
-                                  divider: true,
-                                  onClick: async () => {
-                                    setError(null);
-                                    try {
-                                      await deleteUserDataMutation.mutateAsync(
-                                        id,
-                                      );
-                                    } catch (e) {
-                                      setError(errMessage(e));
-                                    }
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 380 }}>
+                              <Typography
+                                variant="body2"
+                                noWrap
+                                title={str(item.content, "-")}
+                              >
+                                {str(item.content, "-")}
+                              </Typography>
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 260 }}>
+                              {url ? (
+                                <Typography
+                                  component="a"
+                                  href={url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  variant="body2"
+                                  sx={{
+                                    color: "var(--mui-palette-info-main)",
+                                    textDecoration: "none",
+                                  }}
+                                >
+                                  Open
+                                </Typography>
+                              ) : (
+                                <Typography
+                                  variant="body2"
+                                  sx={{
+                                    color: "text.secondary",
+                                  }}
+                                >
+                                  -
+                                </Typography>
+                              )}
+                            </TableCell>
+                            <TableCell
+                              sx={{ whiteSpace: "nowrap" }}
+                              title={humanTs(str(item.updated_at, "-")).tip}
+                            >
+                              {humanTs(str(item.updated_at, "-")).label}
+                            </TableCell>
+                            <TableCell align="right">
+                              <RowOpsMenu
+                                actions={[
+                                  {
+                                    label: "Delete",
+                                    tone: "error",
+                                    divider: true,
+                                    onClick: async () => {
+                                      setError(null);
+                                      try {
+                                        await deleteUserDataMutation.mutateAsync(
+                                          id,
+                                        );
+                                      } catch (e) {
+                                        setError(errMessage(e));
+                                      }
+                                    },
                                   },
-                                },
-                              ]}
-                              ariaLabel="User data options"
-                            />
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
+                                ]}
+                                ariaLabel="User data options"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                <TablePagination
+                  component="div"
+                  count={userDataTotal}
+                  page={memoryPages.userData}
+                  onPageChange={(_event, nextPage) =>
+                    setMemoryPage("userData", nextPage)
+                  }
+                  rowsPerPage={MEMORY_PAGE_SIZE}
+                  rowsPerPageOptions={[MEMORY_PAGE_SIZE]}
+                />
+              </>
             )}
           </Box>
         </Stack>
@@ -1000,142 +1104,154 @@ export default function MemoryPage({
                 No knowledge items yet.
               </Typography>
             ) : (
-              <TableContainer className="table-shell">
-                <Table size="small" sx={{ tableLayout: "fixed" }}>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell sx={{ width: "68%" }}>Item</TableCell>
-                      <TableCell sx={{ width: 140 }}>Updated</TableCell>
-                      <TableCell align="right" sx={{ width: 64 }}>
-                        Ops
-                      </TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {knowledgeItems.map((item, idx) => {
-                      const id = str(item.id, String(idx));
-                      const title = knowledgeDisplayTitle(item);
-                      const content = str(item.content, "-");
-                      const source = knowledgeSourceLabel(item);
-                      const isRuntimeCatalog =
-                        isRuntimeActionCatalogKnowledgeItem(item);
-                      const runtimeEntries = isRuntimeCatalog
-                        ? parseRuntimeActionCatalogEntries(content)
-                        : [];
-                      const runtimeSection = isRuntimeCatalog
-                        ? runtimeCatalogSectionLabel(item)
-                        : null;
-                      const tags = parseKnowledgeTags(item.tags);
-                      const preview = isRuntimeCatalog
-                        ? runtimeEntries.length
-                          ? `${runtimeEntries.length} available action${runtimeEntries.length === 1 ? "" : "s"} in this section. Open to see what each one does and when AgentArk uses it.`
-                          : "Open to review the actions this AgentArk instance can run directly."
-                        : content.replace(/\s+/g, " ").trim() || "-";
-                      const meta = [
-                        source || null,
-                        runtimeSection,
-                        isRuntimeCatalog
-                          ? null
-                          : tags.length
-                          ? `${tags.length} tag${tags.length === 1 ? "" : "s"}`
-                          : null,
-                      ]
-                        .filter(Boolean)
-                        .join(" | ");
-                      const updatedAt = humanTs(str(item.updated_at, "-"));
-                      return (
-                        <TableRow
-                          key={id}
-                          hover
-                          tabIndex={0}
-                          onClick={() => setSelectedKnowledge(item)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              setSelectedKnowledge(item);
-                            }
-                          }}
-                          sx={{
-                            cursor: "pointer",
-                            "& > td": {
-                              verticalAlign: "top",
-                            },
-                          }}
-                        >
-                          <TableCell sx={{ pr: 2 }}>
-                            <Stack spacing={0.45}>
-                              <Typography
-                                variant="body2"
-                                sx={{ fontWeight: 600 }}
-                                noWrap
-                                title={title}
-                              >
-                                {title}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "-webkit-box",
-                                  WebkitBoxOrient: "vertical",
-                                  WebkitLineClamp: 2,
-                                  overflow: "hidden",
-                                  whiteSpace: "normal",
-                                  lineHeight: 1.45,
-                                }}
-                              >
-                                {preview}
-                              </Typography>
-                              {meta ? (
+              <>
+                <TableContainer className="table-shell">
+                  <Table size="small" sx={{ tableLayout: "fixed" }}>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell sx={{ width: "68%" }}>Item</TableCell>
+                        <TableCell sx={{ width: 140 }}>Updated</TableCell>
+                        <TableCell align="right" sx={{ width: 64 }}>
+                          Ops
+                        </TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {knowledgeItems.map((item, idx) => {
+                        const id = str(item.id, String(idx));
+                        const title = knowledgeDisplayTitle(item);
+                        const content = str(item.content, "-");
+                        const source = knowledgeSourceLabel(item);
+                        const isRuntimeCatalog =
+                          isRuntimeActionCatalogKnowledgeItem(item);
+                        const runtimeEntries = isRuntimeCatalog
+                          ? parseRuntimeActionCatalogEntries(content)
+                          : [];
+                        const runtimeSection = isRuntimeCatalog
+                          ? runtimeCatalogSectionLabel(item)
+                          : null;
+                        const tags = parseKnowledgeTags(item.tags);
+                        const preview = isRuntimeCatalog
+                          ? runtimeEntries.length
+                            ? `${runtimeEntries.length} available action${runtimeEntries.length === 1 ? "" : "s"} in this section. Open to see what each one does and when AgentArk uses it.`
+                            : "Open to review the actions this AgentArk instance can run directly."
+                          : content.replace(/\s+/g, " ").trim() || "-";
+                        const meta = [
+                          source || null,
+                          runtimeSection,
+                          isRuntimeCatalog
+                            ? null
+                            : tags.length
+                            ? `${tags.length} tag${tags.length === 1 ? "" : "s"}`
+                            : null,
+                        ]
+                          .filter(Boolean)
+                          .join(" | ");
+                        const updatedAt = humanTs(str(item.updated_at, "-"));
+                        return (
+                          <TableRow
+                            key={id}
+                            hover
+                            tabIndex={0}
+                            onClick={() => setSelectedKnowledge(item)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                setSelectedKnowledge(item);
+                              }
+                            }}
+                            sx={{
+                              cursor: "pointer",
+                              "& > td": {
+                                verticalAlign: "top",
+                              },
+                            }}
+                          >
+                            <TableCell sx={{ pr: 2 }}>
+                              <Stack spacing={0.45}>
+                                <Typography
+                                  variant="body2"
+                                  sx={{ fontWeight: 600 }}
+                                  noWrap
+                                  title={title}
+                                >
+                                  {title}
+                                </Typography>
                                 <Typography
                                   variant="caption"
-                                  sx={{ color: "text.secondary" }}
-                                  noWrap
-                                  title={meta}
+                                  sx={{
+                                    color: "text.secondary",
+                                    display: "-webkit-box",
+                                    WebkitBoxOrient: "vertical",
+                                    WebkitLineClamp: 2,
+                                    overflow: "hidden",
+                                    whiteSpace: "normal",
+                                    lineHeight: 1.45,
+                                  }}
                                 >
-                                  {meta}
+                                  {preview}
                                 </Typography>
-                              ) : null}
-                            </Stack>
-                          </TableCell>
-                          <TableCell
-                            sx={{ whiteSpace: "nowrap" }}
-                            title={updatedAt.tip}
-                          >
-                            {updatedAt.label}
-                          </TableCell>
-                          <TableCell
-                            align="right"
-                            onClick={(e) => e.stopPropagation()}
-                            onKeyDown={(e) => e.stopPropagation()}
-                          >
-                            <RowOpsMenu
-                              actions={[
-                                {
-                                  label: "Delete",
-                                  tone: "error",
-                                  divider: true,
-                                  onClick: async () => {
-                                    setError(null);
-                                    try {
-                                      await deleteKnowledgeMutation.mutateAsync(
-                                        id,
-                                      );
-                                    } catch (e) {
-                                      setError(errMessage(e));
-                                    }
+                                {meta ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{ color: "text.secondary" }}
+                                    noWrap
+                                    title={meta}
+                                  >
+                                    {meta}
+                                  </Typography>
+                                ) : null}
+                              </Stack>
+                            </TableCell>
+                            <TableCell
+                              sx={{ whiteSpace: "nowrap" }}
+                              title={updatedAt.tip}
+                            >
+                              {updatedAt.label}
+                            </TableCell>
+                            <TableCell
+                              align="right"
+                              onClick={(e) => e.stopPropagation()}
+                              onKeyDown={(e) => e.stopPropagation()}
+                            >
+                              <RowOpsMenu
+                                actions={[
+                                  {
+                                    label: "Delete",
+                                    tone: "error",
+                                    divider: true,
+                                    onClick: async () => {
+                                      setError(null);
+                                      try {
+                                        await deleteKnowledgeMutation.mutateAsync(
+                                          id,
+                                        );
+                                      } catch (e) {
+                                        setError(errMessage(e));
+                                      }
+                                    },
                                   },
-                                },
-                              ]}
-                              ariaLabel="Knowledge options"
-                            />
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
+                                ]}
+                                ariaLabel="Knowledge options"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                <TablePagination
+                  component="div"
+                  count={knowledgeTotal}
+                  page={memoryPages.knowledge}
+                  onPageChange={(_event, nextPage) =>
+                    setMemoryPage("knowledge", nextPage)
+                  }
+                  rowsPerPage={MEMORY_PAGE_SIZE}
+                  rowsPerPageOptions={[MEMORY_PAGE_SIZE]}
+                />
+              </>
             )}
           </Box>
         </Stack>

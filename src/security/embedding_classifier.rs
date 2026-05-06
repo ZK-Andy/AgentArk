@@ -3,8 +3,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::core::EmbeddingClient;
 use crate::core::document_search::normalized_embedding_similarity;
+use crate::core::EmbeddingClient;
 
 use super::intent_classifier::{
     InboundClassificationDecision, InboundMemoryCaptureSignal, InboundRoutingSignal,
@@ -24,7 +24,8 @@ const FAST_MEMORY_CAPTURE_REJECT_MIN_SCORE: f32 = 0.74;
 const FAST_ROUTING_MIN_SCORE: f32 = 0.70;
 const FAST_ROUTING_MARGIN: f32 = 0.06;
 const FAST_UNCHECKED_ROUTE_MIN_SCORE: f32 = 0.58;
-const PRODUCT_HELP_ANSWER_CONCEPT: &str = "product_help_answer";
+const PRODUCT_IDENTITY_ANSWER_CONCEPT: &str = "product_identity_answer";
+const AGENTARK_CAPABILITIES_ANSWER_CONCEPT: &str = "agentark_capabilities_answer";
 const SCHEDULED_TASK_CONCEPT: &str = "scheduled_task";
 const WATCHER_MONITOR_CONCEPT: &str = "watcher_monitor";
 const INTEGRATION_SETUP_CONCEPT: &str = "integration_setup";
@@ -132,8 +133,13 @@ fn default_canonicals() -> Vec<SecurityCanonical> {
         ),
         canonical(
             SecurityCategory::DirectReply,
-            PRODUCT_HELP_ANSWER_CONCEPT,
-            "The user asks a question about how the running product behaves or what a visible product setting means, and the answer can be given as explanatory text rather than by inspecting logs or changing state.",
+            PRODUCT_IDENTITY_ANSWER_CONCEPT,
+            "The user asks for the assistant or running product identity, name, who it is, or what it should call itself, and the answer should come from the trusted product identity already supplied by the system.",
+        ),
+        canonical(
+            SecurityCategory::DirectReply,
+            AGENTARK_CAPABILITIES_ANSWER_CONCEPT,
+            "The user asks what AgentArk can do, how an AgentArk capability works, or where an AgentArk feature is configured; the answer should be grounded in the live AgentArk capability registry with curated manual context only as supplemental explanation, not in the assistant's trusted product identity and not in live logs or external web.",
         ),
         canonical(
             SecurityCategory::DirectReply,
@@ -278,23 +284,23 @@ fn category_margin(
     score - competing
 }
 
-fn product_help_routing_for_concept(_concept: &str) -> InboundRoutingSignal {
+fn agentark_capabilities_routing_for_concept(_concept: &str) -> InboundRoutingSignal {
     InboundRoutingSignal {
         should_execute: true,
         tool_use_expected: true,
         durable_work_expected: false,
         current_answer_expected: true,
         semantic_queries: Vec::new(),
-        required_capabilities: vec!["product documentation lookup".to_string()],
-        rationale: Some("high confidence product-help embedding route".to_string()),
-        product_help_expected: true,
+        required_capabilities: vec!["AgentArk capability lookup".to_string()],
+        rationale: Some("high confidence AgentArk capability embedding route".to_string()),
+        agentark_capabilities_expected: true,
         goals: vec![InboundTurnGoal {
             id: "g1".to_string(),
-            intent_summary: "Answer from product help".to_string(),
-            capability_query: "product documentation lookup".to_string(),
-            expected_outcome: "A grounded product-help answer".to_string(),
+            intent_summary: "Answer from AgentArk capabilities".to_string(),
+            capability_query: "AgentArk capability lookup".to_string(),
+            expected_outcome: "A grounded AgentArk capability answer".to_string(),
             durability: "none".to_string(),
-            groundings: vec!["product_help".to_string()],
+            groundings: vec!["agentark_capabilities".to_string()],
             side_effect: "none".to_string(),
             dependencies: Vec::new(),
         }],
@@ -334,8 +340,29 @@ fn durable_routing_shape(concept: &str) -> (&'static str, &'static str, &'static
 
 fn routing_for_category(category: SecurityCategory, concept: &str) -> InboundRoutingSignal {
     match category {
-        SecurityCategory::DirectReply if concept == PRODUCT_HELP_ANSWER_CONCEPT => {
-            product_help_routing_for_concept(concept)
+        SecurityCategory::DirectReply if concept == PRODUCT_IDENTITY_ANSWER_CONCEPT => {
+            InboundRoutingSignal {
+                should_execute: false,
+                tool_use_expected: false,
+                durable_work_expected: false,
+                current_answer_expected: true,
+                semantic_queries: vec!["Answer from trusted product identity".to_string()],
+                rationale: Some("high confidence product-identity embedding route".to_string()),
+                goals: vec![InboundTurnGoal {
+                    id: "g1".to_string(),
+                    intent_summary: "Answer the assistant identity question".to_string(),
+                    capability_query: "trusted product identity context".to_string(),
+                    expected_outcome: "A direct identity answer is returned".to_string(),
+                    durability: "none".to_string(),
+                    groundings: vec!["product_identity".to_string()],
+                    side_effect: "none".to_string(),
+                    dependencies: Vec::new(),
+                }],
+                ..InboundRoutingSignal::default()
+            }
+        }
+        SecurityCategory::DirectReply if concept == AGENTARK_CAPABILITIES_ANSWER_CONCEPT => {
+            agentark_capabilities_routing_for_concept(concept)
         }
         SecurityCategory::DirectReply => InboundRoutingSignal {
             should_execute: false,
@@ -417,11 +444,14 @@ fn block_decision(concept: &str) -> InboundClassificationDecision {
 }
 
 fn allow_decision(category: SecurityCategory, concept: &str) -> InboundClassificationDecision {
+    let direct_response = (category == SecurityCategory::DirectReply
+        && concept == PRODUCT_IDENTITY_ANSWER_CONCEPT)
+        .then(|| format!("I'm {}.", crate::branding::PRODUCT_NAME));
     InboundClassificationDecision {
         verdict: IntentVerdict::Allow,
         memory_capture: InboundMemoryCaptureSignal::default(),
         routing: routing_for_category(category, concept),
-        direct_response: None,
+        direct_response,
         model_response: None,
     }
 }
@@ -660,18 +690,42 @@ mod tests {
     }
 
     #[test]
-    fn routing_for_product_help_answer_uses_product_help_lookup() {
-        let routing =
-            routing_for_category(SecurityCategory::DirectReply, PRODUCT_HELP_ANSWER_CONCEPT);
+    fn routing_for_product_identity_answer_is_not_capability_lookup() {
+        let decision = allow_decision(
+            SecurityCategory::DirectReply,
+            PRODUCT_IDENTITY_ANSWER_CONCEPT,
+        );
+        let expected = format!("I'm {}.", crate::branding::PRODUCT_NAME);
+
+        assert_eq!(decision.direct_response.as_deref(), Some(expected.as_str()));
+        assert!(decision.routing.current_answer_expected);
+        assert!(!decision.routing.should_execute);
+        assert!(!decision.routing.tool_use_expected);
+        assert!(!decision.routing.agentark_capabilities_expected);
+        assert!(!decision.routing.agentark_manual_expected);
+        assert!(decision.routing.is_conversational_only());
+        assert_eq!(
+            decision.routing.goals[0].groundings,
+            vec!["product_identity".to_string()]
+        );
+    }
+
+    #[test]
+    fn routing_for_agentark_capabilities_answer_uses_capability_lookup() {
+        let routing = routing_for_category(
+            SecurityCategory::DirectReply,
+            AGENTARK_CAPABILITIES_ANSWER_CONCEPT,
+        );
         assert!(routing.current_answer_expected);
         assert!(routing.should_execute);
         assert!(routing.tool_use_expected);
         assert!(!routing.durable_work_expected);
-        assert!(routing.product_help_expected);
+        assert!(routing.agentark_capabilities_expected);
+        assert!(!routing.agentark_manual_expected);
         assert!(routing.has_transient_read_only_lookup());
         assert_eq!(
             routing.goals[0].groundings,
-            vec!["product_help".to_string()]
+            vec!["agentark_capabilities".to_string()]
         );
     }
 
