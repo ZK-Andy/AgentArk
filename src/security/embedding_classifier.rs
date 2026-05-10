@@ -169,12 +169,12 @@ fn default_canonicals() -> Vec<SecurityCanonical> {
         canonical(
             SecurityCategory::DurableWork,
             SCHEDULED_TASK_CONCEPT,
-            "The user wants a time-based future or recurring background task, reminder, report, follow-up, or notification that should run later and persist beyond the current answer.",
+            "The user wants a durable background task whose trigger is a known clock time, date, deadline, interval, calendar-like recurrence, reminder time, or timed follow-up. This is not for external-state change detection or polling a source until a condition appears.",
         ),
         canonical(
             SecurityCategory::DurableWork,
             WATCHER_MONITOR_CONCEPT,
-            "The user wants durable monitoring, watching, polling, tracking, or alerting based on changing external, local, message, feed, page, camera, news, pricing, app, or system conditions.",
+            "The user wants durable monitoring, watching, polling, tracking, or alerting based on a changing condition in an external, local, message, feed, page, camera, news, pricing, app, file, document, workspace, or system source. The trigger is new, changed, missing, threshold-crossing, or otherwise condition-based state, and notification is the delivery route after the condition is met.",
         ),
         canonical(
             SecurityCategory::DurableWork,
@@ -378,6 +378,7 @@ fn routing_for_category(category: SecurityCategory, concept: &str) -> InboundRou
             tool_use_expected: true,
             durable_work_expected: false,
             current_answer_expected: true,
+            live_state_expected: true,
             semantic_queries: vec![concept.to_string()],
             required_capabilities: vec![concept.to_string()],
             rationale: Some("high confidence embedding fast path".to_string()),
@@ -636,17 +637,18 @@ fn unaccepted_embedding_fallback(
     memory_capture: InboundMemoryCaptureSignal,
 ) -> Option<SecurityEmbeddingDecision> {
     if top.category == SecurityCategory::SecurityBlock && top.score >= FAST_BORDERLINE_BLOCK_SCORE {
-        return None;
+        return Some(SecurityEmbeddingDecision {
+            decision: block_decision(&top.concept),
+            category: top.category,
+            score: top.score,
+            margin,
+            concept: top.concept.to_string(),
+        });
     }
     if matches!(
         top.category,
         SecurityCategory::DurableWork | SecurityCategory::ManagedAppDelivery
     ) && top.score >= FAST_UNCHECKED_ROUTE_MIN_SCORE
-    {
-        return None;
-    }
-    if matches!(top.category, SecurityCategory::ToolUse)
-        && top.score >= FAST_UNCHECKED_ROUTE_MIN_SCORE
     {
         return Some(SecurityEmbeddingDecision {
             decision: unchecked_route_decision(top.category, &top.concept),
@@ -656,8 +658,21 @@ fn unaccepted_embedding_fallback(
             concept: top.concept.to_string(),
         });
     }
-    if top.category == SecurityCategory::DirectReply {
+    if matches!(top.category, SecurityCategory::ToolUse)
+        && top.score >= FAST_UNCHECKED_ROUTE_MIN_SCORE
+    {
+        let _ = memory_capture;
         return None;
+    }
+    if top.category == SecurityCategory::DirectReply && top.score >= FAST_UNCHECKED_ROUTE_MIN_SCORE
+    {
+        return Some(SecurityEmbeddingDecision {
+            decision: unchecked_route_decision(top.category, &top.concept),
+            category: top.category,
+            score: top.score,
+            margin,
+            concept: top.concept.to_string(),
+        });
     }
     let _ = (margin, memory_capture);
     None
@@ -834,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn unaccepted_direct_reply_escalates_to_structured_classifier_even_when_moderate() {
+    fn unaccepted_direct_reply_routes_without_slow_router_trust_when_moderate() {
         let fallback = unaccepted_embedding_fallback(
             &ScoredCanonical {
                 category: SecurityCategory::DirectReply,
@@ -847,16 +862,20 @@ mod tests {
                 confidence: Some(0.81),
                 reason: Some("durable_user_identity_profile".to_string()),
             },
-        );
+        )
+        .expect("moderate direct-reply traffic should keep a direct-answer route shape");
 
-        assert!(
-            fallback.is_none(),
-            "untrusted direct-reply embeddings must not bypass the structured router"
-        );
+        assert_eq!(fallback.category, SecurityCategory::DirectReply);
+        assert!(matches!(
+            fallback.decision.verdict,
+            IntentVerdict::AllowWithUncheckedTag { .. }
+        ));
+        assert!(fallback.decision.routing.current_answer_expected);
+        assert!(!fallback.decision.routing.should_execute);
     }
 
     #[test]
-    fn unaccepted_execution_shape_routes_without_direct_reply_trust() {
+    fn unaccepted_generic_tool_use_defers_to_structured_classifier() {
         let fallback = unaccepted_embedding_fallback(
             &ScoredCanonical {
                 category: SecurityCategory::ToolUse,
@@ -865,21 +884,13 @@ mod tests {
             },
             0.0,
             InboundMemoryCaptureSignal::default(),
-        )
-        .expect("execution-shaped traffic should keep its route shape");
+        );
 
-        assert_eq!(fallback.category, SecurityCategory::ToolUse);
-        assert!(matches!(
-            fallback.decision.verdict,
-            IntentVerdict::AllowWithUncheckedTag { .. }
-        ));
-        assert!(fallback.decision.routing.should_execute);
-        assert!(fallback.decision.routing.tool_use_expected);
-        assert!(fallback.decision.routing.current_answer_expected);
+        assert!(fallback.is_none());
     }
 
     #[test]
-    fn unaccepted_durable_shape_escalates_to_structured_classifier() {
+    fn unaccepted_durable_shape_routes_without_slow_router_trust() {
         for category in [
             SecurityCategory::DurableWork,
             SecurityCategory::ManagedAppDelivery,
@@ -892,17 +903,22 @@ mod tests {
                 },
                 0.0,
                 InboundMemoryCaptureSignal::default(),
-            );
+            )
+            .expect("durable execution-shaped traffic should keep its route shape");
 
-            assert!(
-                fallback.is_none(),
-                "weak durable embeddings must not force write/deploy routing"
-            );
+            assert_eq!(fallback.category, category);
+            assert!(matches!(
+                fallback.decision.verdict,
+                IntentVerdict::AllowWithUncheckedTag { .. }
+            ));
+            assert!(fallback.decision.routing.should_execute);
+            assert!(fallback.decision.routing.tool_use_expected);
+            assert!(fallback.decision.routing.durable_work_expected);
         }
     }
 
     #[test]
-    fn unaccepted_borderline_security_block_still_escalates() {
+    fn unaccepted_borderline_security_block_stays_in_security_layer() {
         let fallback = unaccepted_embedding_fallback(
             &ScoredCanonical {
                 category: SecurityCategory::SecurityBlock,
@@ -911,8 +927,12 @@ mod tests {
             },
             0.0,
             InboundMemoryCaptureSignal::default(),
-        );
+        )
+        .expect("borderline security risk should be handled by the security layer");
 
-        assert!(fallback.is_none());
+        assert!(matches!(
+            fallback.decision.verdict,
+            IntentVerdict::Block { .. }
+        ));
     }
 }

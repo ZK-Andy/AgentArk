@@ -742,6 +742,8 @@ impl Agent {
         use crate::core::integration_auth::{AuthMode, FieldInputType, RAW_KEY_MANIFEST_ID};
 
         let is_raw_key = manifest.integration_id == RAW_KEY_MANIFEST_ID;
+        let settings_path =
+            Self::integration_auth_settings_path(&manifest.integration_id, &manifest.display_name);
         let (fields, mode_kind) = match &manifest.mode {
             AuthMode::Secrets { fields } => (
                 fields.clone(),
@@ -801,7 +803,33 @@ impl Agent {
             integration_id: Some(manifest.integration_id.clone()),
             mode_kind: Some(mode_kind.to_string()),
             docs_url: manifest.docs_url.clone(),
+            settings_path,
         }
+    }
+
+    pub(super) fn extension_pack_settings_path(pack_name: &str) -> String {
+        format!(
+            "Settings > Integrations > Extension Pack Integrations > {}",
+            pack_name.trim()
+        )
+    }
+
+    pub(super) fn integration_auth_settings_path(
+        integration_id: &str,
+        display_name: &str,
+    ) -> Option<String> {
+        if integration_id == crate::core::integration_auth::RAW_KEY_MANIFEST_ID {
+            return None;
+        }
+        if crate::custom_messaging_channels::config_id_from_auth_integration_id(integration_id)
+            .is_some()
+        {
+            return Some(format!(
+                "Settings > Messaging Channels > Custom Messaging Channels > {}",
+                display_name.trim()
+            ));
+        }
+        Some(Self::extension_pack_settings_path(display_name))
     }
 
     pub(super) fn build_chat_credential_prompt(
@@ -825,6 +853,7 @@ impl Agent {
             integration_id: None,
             mode_kind: None,
             docs_url: None,
+            settings_path: None,
         })
     }
 
@@ -868,12 +897,17 @@ impl Agent {
                         return self.build_chat_credential_prompt(
                             format!("{} credentials required", pack_name),
                             format!(
-                                "AgentArk created the connection draft for {}. Provide the required credential values here and it will finish the connection without exposing them in chat.",
-                                pack_name
+                                "AgentArk created the connection draft for {}. Save the credential here, or open {}. The values are stored encrypted and are not exposed in chat.",
+                                pack_name,
+                                Self::extension_pack_settings_path(&pack_name)
                             ),
                             fields,
                             "extension_pack_connection",
-                        );
+                        ).map(|mut prompt| {
+                            prompt.settings_path =
+                                Some(Self::extension_pack_settings_path(&pack_name));
+                            prompt
+                        });
                     }
                     PendingChatCredentialPromptKind::IntegrationAuth { integration_id, .. } => {
                         if let Some(prompt) = self
@@ -1060,11 +1094,17 @@ impl Agent {
     pub(super) async fn sync_extension_pack_runtime_warning(&self) -> Option<String> {
         let registry = self.extension_packs.clone();
         let guard = registry.read().await;
-        guard
+        let warning = guard
             .sync_to_runtime(&self.runtime)
             .await
             .err()
-            .map(|e| e.to_string())
+            .map(|e| e.to_string());
+        drop(guard);
+        if warning.is_none() {
+            self.refresh_action_catalog_index("extension_pack_credential_sync")
+                .await;
+        }
+        warning
     }
 
     pub(super) async fn submit_pending_extension_pack_credentials(
@@ -1266,22 +1306,10 @@ impl Agent {
                     chrono::Duration::minutes(30),
                 ) {
                     match &pending.kind {
-                        PendingChatCredentialPromptKind::ExtensionPackConnection {
-                            required_keys,
-                            ..
-                        } => {
-                            let is_extension_pack_prompt = cleaned.keys().any(|key| {
-                                required_keys
-                                    .iter()
-                                    .any(|candidate| candidate.eq_ignore_ascii_case(key))
-                            });
-                            if is_extension_pack_prompt {
-                                return self
-                                    .submit_pending_extension_pack_credentials(
-                                        cid, pending, &cleaned,
-                                    )
-                                    .await;
-                            }
+                        PendingChatCredentialPromptKind::ExtensionPackConnection { .. } => {
+                            return self
+                                .submit_pending_extension_pack_credentials(cid, pending, &cleaned)
+                                .await;
                         }
                         PendingChatCredentialPromptKind::IntegrationAuth {
                             integration_id, ..

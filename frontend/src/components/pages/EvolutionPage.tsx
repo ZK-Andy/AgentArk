@@ -752,59 +752,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           : latestGepaCandidateCount > 0
             ? ("success" as const)
             : ("info" as const);
-  const backgroundImprovementSummary = backgroundImprovementPaused
-    ? backgroundImprovementPauseText
-    : gepaRunningJobs > 0
-      ? "Reviewing recent work and preparing safer prompt candidates."
-      : gepaPendingJobs > 0
-        ? "Queued. It will start after AgentArk has been quiet for a few minutes."
-        : !gepaReady
-          ? "Finish model setup in Models so background improvements can run."
-          : backgroundImprovementNeedsAttention
-            ? latestGepaError
-              ? `Last check stopped: ${latestGepaError}`
-              : backgroundImprovementReason(gepaAutoStatus || latestGepaStatus)
-            : latestGepaCandidateCount > 0
-              ? `${latestGepaCandidateCount} candidate${latestGepaCandidateCount === 1 ? "" : "s"} handed to safety checks.`
-              : backgroundImprovementReason(gepaAutoReason);
-  const backgroundImprovementNowText = backgroundImprovementPaused
-    ? `Paused: ${backgroundImprovementPauseText}`
-    : gepaRunningJobs > 0
-      ? "Running now: reviewing recent completed work and preparing candidates."
-      : gepaPendingJobs > 0
-        ? `${gepaPendingJobs} background check${gepaPendingJobs === 1 ? "" : "s"} queued until AgentArk is quiet.`
-        : !gepaReady
-          ? "Waiting for model setup: background improvement needs a working primary model."
-          : !gepaBudgetAllowed
-            ? "Paused for today: the daily background-improvement budget is used."
-            : backgroundImprovementNeedsAttention
-              ? backgroundImprovementSummary
-              : latestGepaCandidateCount > 0
-                ? backgroundImprovementSummary
-                : gepaEvidenceSamples > 0
-                  ? `${gepaEvidenceSamples} completed-work sample${gepaEvidenceSamples === 1 ? "" : "s"} ready for the next check.`
-                  : "Waiting for more data: ArkEvolve needs more completed work before another check can run.";
-  const backgroundImprovementSamplesText =
-    gepaEvidenceSamples > 0
-      ? `${gepaEvidenceSamples} completed-work sample${gepaEvidenceSamples === 1 ? "" : "s"} collected.`
-      : "No new completed-work samples are ready yet.";
-  const backgroundImprovementNextText = backgroundImprovementPaused
-    ? !selfEvolveEnabled
-      ? "Turn Self-evolve back on in Settings > Advanced when you want learning to resume."
-      : "Re-enable the GEPA optimizer config before background prompt optimization resumes."
-    : gepaRunningJobs > 0
-      ? "When it finishes, useful candidates move into safety checks or the review queue."
-      : gepaPendingJobs > 0
-        ? "It starts automatically after AgentArk has been quiet for a few minutes."
-        : !gepaReady
-          ? "Finish model setup in Settings > Models."
-          : !gepaBudgetAllowed
-            ? "It resumes after the daily budget resets."
-            : backgroundImprovementNeedsAttention
-              ? "Fix the readiness issue or let the queued retry run after AgentArk is quiet."
-              : latestGepaCandidateCount > 0
-                ? "Watch Live tests and Review queue for the safety-check result."
-                : "Keep using AgentArk; completed runs provide the samples ArkEvolve needs.";
   const promptInsights = asRecord(evolutionDev.prompt_insights);
   const classifierInsights = asRecord(
     evolutionDev.classifier_prompt_insights ?? evolutionDev.classifier_insights,
@@ -1576,7 +1523,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   return (
     <WorkspacePageShell className="evolution-page" spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Ark Core / ArkEvolve"
+        eyebrow="ARK CORE"
         title="ArkEvolve"
         description={
           <>
@@ -1809,38 +1756,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               </Typography>
             </Box>
           </Stack>
-
-          <Box
-            sx={{
-              pt: 1,
-              borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
-              display: "flex",
-              flexDirection: "column",
-              gap: 0.65,
-              fontVariantNumeric: "tabular-nums",
-            }}
-          >
-            <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
-              <strong style={{ color: "#e8f4ff" }}>Now:</strong>{" "}
-              {backgroundImprovementNowText}
-            </Typography>
-            <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
-              <strong style={{ color: "#e8f4ff" }}>Samples:</strong>{" "}
-              {backgroundImprovementSamplesText}
-            </Typography>
-            <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
-              <strong style={{ color: "#e8f4ff" }}>Next:</strong>{" "}
-              {backgroundImprovementNextText}
-            </Typography>
-            <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
-              <strong style={{ color: gepaBudgetAllowed ? "#8ee3b1" : "#ffd180" }}>
-                ${gepaRemainingBudgetUsd.toFixed(2)}
-              </strong>{" "}
-              of today&apos;s budget remaining ({num(gepaBudget.runs_today, 0)} of{" "}
-              {num(gepaBudget.max_runs_per_day, 1)} background check
-              {num(gepaBudget.max_runs_per_day, 1) === 1 ? "" : "s"} used).
-            </Typography>
-          </Box>
 
           {!gepaReady && !backgroundImprovementPaused ? (
             <Alert severity="info" sx={{ borderRadius: 1 }}>
@@ -3743,57 +3658,54 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                           ? "Suggested only"
                           : "Review recorded";
                         return (
-                          <Box
+                          <Accordion
+                            disableGutters
                             key={`prompt-proposal-${proposalId || idx}`}
                             sx={{
-                              p: 1.25,
                               border: "1px solid var(--ui-rgba-145-170-205-120)",
                               borderLeft: "3px solid rgba(20, 241, 149, 0.72)",
                               borderRadius: 1,
                               bgcolor: "rgba(8, 14, 24, 0.28)",
+                              "&::before": { display: "none" },
+                              "&.Mui-expanded": { my: 0 },
                             }}
                           >
-                            <Stack
-                              direction={{ xs: "column", md: "row" }}
-                              spacing={1}
+                            <AccordionSummary
+                              expandIcon={<ExpandMoreIcon sx={{ color: "text.secondary" }} />}
                               sx={{
-                                justifyContent: "space-between",
-                                alignItems: { xs: "flex-start", md: "center" },
+                                px: 1.5,
+                                minHeight: 48,
+                                "& .MuiAccordionSummary-content": {
+                                  alignItems: "center",
+                                  gap: 1,
+                                  my: 0.75,
+                                  minWidth: 0,
+                                },
                               }}
                             >
-                              <Box sx={{ minWidth: 0 }}>
-                                <Stack
-                                  direction="row"
-                                  spacing={0.75}
-                                  useFlexGap
-                                  sx={{
-                                    alignItems: "center",
-                                    flexWrap: "wrap",
-                                    mb: 0.45,
-                                  }}
-                                >
-                                  <Typography
-                                    variant="subtitle1"
-                                    sx={{ color: "#e8f4ff", fontWeight: 600 }}
-                                  >
-                                    {str(row.title, "Suggested improvement")}
-                                  </Typography>
-                                  <Chip
-                                    size="small"
-                                    color={promptProposalStatusColor(reviewStatus)}
-                                    label={
-                                      reviewStatus === "open"
-                                        ? "Needs decision"
-                                        : humanizeStatusLabel(reviewStatus)
-                                    }
-                                  />
-                                  <Chip
-                                    size="small"
-                                    variant="outlined"
-                                    color={promptProposalRiskColor(riskLevel)}
-                                    label={`${riskLevel || "unknown"} risk`}
-                                  />
-                                </Stack>
+                              <Typography
+                                variant="subtitle2"
+                                sx={{
+                                  color: "#e8f4ff",
+                                  fontWeight: 600,
+                                  flex: 1,
+                                  minWidth: 0,
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                {str(row.title, "Suggested improvement")}
+                              </Typography>
+                              <Chip
+                                size="small"
+                                variant="outlined"
+                                color={promptProposalRiskColor(riskLevel)}
+                                label={`${riskLevel || "unknown"} risk`}
+                              />
+                            </AccordionSummary>
+                            <AccordionDetails sx={{ pt: 0, px: 1.5, pb: 1.5 }}>
+                              <Stack spacing={1}>
                                 <Box
                                   sx={{
                                     display: "grid",
@@ -3802,204 +3714,117 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                       md: "minmax(0, 1fr) minmax(0, 1fr)",
                                     },
                                     gap: 1,
-                                    mb: 1,
                                   }}
                                 >
                                   <Box
                                     sx={{
                                       p: 1,
-                                      border:
-                                        "1px solid var(--ui-rgba-145-170-205-120)",
+                                      border: "1px solid var(--ui-rgba-145-170-205-120)",
                                       borderRadius: 1,
                                       bgcolor: "rgba(20, 241, 149, 0.08)",
                                     }}
                                   >
-                                    <Typography
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                      }}
-                                    >
+                                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
                                       Current state
                                     </Typography>
-                                    <Typography
-                                      variant="body2"
-                                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                                    >
+                                    <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 700 }}>
                                       {proposalStateLabel}
                                     </Typography>
-                                    <Typography
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                        lineHeight: 1.4,
-                                      }}
-                                    >
+                                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", lineHeight: 1.4 }}>
                                       AgentArk behavior has not changed.
                                     </Typography>
                                   </Box>
                                   <Box
                                     sx={{
                                       p: 1,
-                                      border:
-                                        "1px solid var(--ui-rgba-145-170-205-120)",
+                                      border: "1px solid var(--ui-rgba-145-170-205-120)",
                                       borderRadius: 1,
                                       bgcolor: "rgba(8, 14, 24, 0.34)",
                                     }}
                                   >
-                                    <Typography
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                      }}
-                                    >
+                                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
                                       Rollback
                                     </Typography>
-                                    <Typography
-                                      variant="body2"
-                                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                                    >
+                                    <Typography variant="body2" sx={{ color: "#e8f4ff", fontWeight: 700 }}>
                                       No rollback needed
                                     </Typography>
-                                    <Typography
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                        lineHeight: 1.4,
-                                      }}
-                                    >
-                                      Rollback appears only after a live test or
-                                      stable change exists.
+                                    <Typography variant="caption" sx={{ color: "text.secondary", display: "block", lineHeight: 1.4 }}>
+                                      Rollback appears only after a live test or stable change exists.
                                     </Typography>
                                   </Box>
                                 </Box>
-                                <Box sx={{ mb: 1 }}>
-                                  <EvolutionLifecycle
-                                    steps={reviewLifecycleSteps}
-                                    activeIndex={canApprove ? 0 : 1}
-                                  />
-                                </Box>
-                                <Typography variant="body1">
-                                  {str(
-                                    row.summary,
-                                    "ArkEvolve found a reviewable prompt improvement.",
-                                  )}
+                                <EvolutionLifecycle
+                                  steps={reviewLifecycleSteps}
+                                  activeIndex={canApprove ? 0 : 1}
+                                />
+                                <Typography variant="body2">
+                                  {str(row.summary, "ArkEvolve found a reviewable prompt improvement.")}
                                 </Typography>
                                 {expectedBenefit[0] ? (
-                                  <Typography
-                                    variant="body2"
-                                    sx={{
-                                      color: "text.secondary",
-                                      display: "block",
-                                      mt: 0.75,
-                                    }}
-                                  >
+                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
                                     Potential benefit: {expectedBenefit[0]}
                                   </Typography>
                                 ) : null}
-                                <Typography
-                                  variant="body2"
-                                  sx={{
-                                    color: "text.secondary",
-                                    display: "block",
-                                    mt: expectedBenefit[0] ? 0.45 : 0.75,
-                                  }}
-                                >
-                                  Saving this for follow-up records the idea. A
-                                  future safety check or live test is required
-                                  before behavior can change.
+                                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                                  Saving this for follow-up records the idea. A future safety check or live test is required before behavior can change.
                                 </Typography>
                                 {caveats[0] ? (
-                                  <Typography
-                                    variant="body2"
-                                    sx={{
-                                      color: "text.secondary",
-                                      display: "block",
-                                      mt: 0.45,
-                                    }}
-                                  >
+                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
                                     Watch out for: {caveats[0]}
                                   </Typography>
                                 ) : null}
                                 {reviewedAt ? (
-                                  <Typography
-                                    variant="body2"
-                                    sx={{
-                                      color: "text.secondary",
-                                      display: "block",
-                                      mt: 0.45,
-                                    }}
-                                  >
+                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
                                     Reviewed {formatTimestampForHumans(reviewedAt).label}
                                   </Typography>
                                 ) : null}
-                              </Box>
-                              <Stack
-                                direction="row"
-                                spacing={0.75}
-                                sx={{ flexShrink: 0 }}
-                              >
-                                <Button
-                                  size="small"
-                                  variant="contained"
-                                  disabled={
-                                    runEvolutionActionMutation.isPending || !canApprove
-                                  }
-                                  onClick={() =>
-                                    void runEvolutionAction(
-                                      {
-                                        action:
-                                          "approve_prompt_optimization_proposal",
-                                        candidate_id: proposalId,
-                                      },
-                                      "Saved for follow-up. AgentArk behavior has not changed, so no rollback is needed.",
-                                    )
-                                  }
+                                <Stack
+                                  direction="row"
+                                  spacing={0.75}
+                                  sx={{ justifyContent: "flex-end", flexWrap: "wrap", pt: 0.5 }}
                                 >
-                                  Save for follow-up
-                                </Button>
-                                <Button
-                                  size="small"
-                                  color="inherit"
-                                  disabled={
-                                    runEvolutionActionMutation.isPending || !canApprove
-                                  }
-                                  onClick={() =>
-                                    void runEvolutionAction(
-                                      {
-                                        action:
-                                          "reject_prompt_optimization_proposal",
-                                        candidate_id: proposalId,
-                                      },
-                                      "Suggestion dismissed. AgentArk behavior has not changed.",
-                                    )
-                                  }
-                                >
-                                  Dismiss
-                                </Button>
+                                  <Button
+                                    size="small"
+                                    variant="text"
+                                    onClick={() => setTechnicalDialogProposalId(proposalId)}
+                                  >
+                                    See technical details
+                                  </Button>
+                                  <Button
+                                    size="small"
+                                    color="inherit"
+                                    disabled={runEvolutionActionMutation.isPending || !canApprove}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "reject_prompt_optimization_proposal",
+                                          candidate_id: proposalId,
+                                        },
+                                        "Suggestion dismissed. AgentArk behavior has not changed.",
+                                      )
+                                    }
+                                  >
+                                    Dismiss
+                                  </Button>
+                                  <Button
+                                    size="small"
+                                    variant="contained"
+                                    disabled={runEvolutionActionMutation.isPending || !canApprove}
+                                    onClick={() =>
+                                      void runEvolutionAction(
+                                        {
+                                          action: "approve_prompt_optimization_proposal",
+                                          candidate_id: proposalId,
+                                        },
+                                        "Saved for follow-up. AgentArk behavior has not changed, so no rollback is needed.",
+                                      )
+                                    }
+                                  >
+                                    Save for follow-up
+                                  </Button>
+                                </Stack>
                               </Stack>
-                            </Stack>
-                            <Box
-                              sx={{
-                                display: "flex",
-                                justifyContent: "flex-end",
-                                mt: 1,
-                              }}
-                            >
-                              <Button
-                                size="small"
-                                variant="text"
-                                onClick={() =>
-                                  setTechnicalDialogProposalId(proposalId)
-                                }
-                              >
-                                See technical details
-                              </Button>
-                            </Box>
+                            </AccordionDetails>
                             <Dialog
                               open={technicalDialogProposalId === proposalId}
                               onClose={() => setTechnicalDialogProposalId(null)}
@@ -4093,7 +3918,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                 </Button>
                               </DialogActions>
                             </Dialog>
-                          </Box>
+                          </Accordion>
                         );
                       })}
                     </Stack>

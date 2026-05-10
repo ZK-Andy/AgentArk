@@ -262,11 +262,11 @@ pub(super) fn build_request_execution_hints_with_context(
         direct_user_intent,
         routing: None,
         routing_trusted: false,
-        intent_plan: None,
         force_agent_loop: false,
         secret_offered: None,
         attachments,
         saved_user_facts_context: None,
+        recorded_user_message_id: None,
         arkorbit_context,
         accepted_suggestion_context,
     }
@@ -285,6 +285,68 @@ pub(super) fn build_direct_action_auth_context(
         agent_name: None,
         agent_access_scope: None,
         capability_context_id: None,
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ChatToolApprovalDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ChatToolApprovalDecisionRequest {
+    pub decision: ChatToolApprovalDecision,
+}
+
+pub(super) async fn decide_chat_tool_approval(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ChatToolApprovalDecisionRequest>,
+) -> Response {
+    let agent = Agent::snapshot(&state.agent).await;
+    match request.decision {
+        ChatToolApprovalDecision::Approve => {
+            match agent.approve_direct_chat_any_approval(&id).await {
+                Ok((approval, response)) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "approved",
+                        "approval": approval,
+                        "response": response,
+                    })),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+        ChatToolApprovalDecision::Reject => {
+            match agent.reject_direct_chat_any_approval(&id).await {
+                Ok((approval, response)) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "rejected",
+                        "approval": approval,
+                        "response": response,
+                    })),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+                    .into_response(),
+            }
+        }
     }
 }
 
@@ -1631,9 +1693,19 @@ pub(super) fn normalize_stream_event_for_sse(
     }
 }
 
-pub(super) fn run_event_to_sse_event(run_event: crate::core::RunEvent) -> Event {
-    let event_kind = run_event.kind.clone();
-    let mut payload = match run_event.kind.as_str() {
+fn stream_payload_has_surface(payload: &serde_json::Map<String, serde_json::Value>) -> bool {
+    payload
+        .get("surface")
+        .and_then(|surface| surface.get("renderer"))
+        .and_then(|renderer| renderer.get("id"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub(super) fn run_event_to_sse_payload(run_event: &crate::core::RunEvent) -> serde_json::Value {
+    let event_kind = run_event.kind.as_str();
+    let incoming_payload = run_event.payload.as_object().cloned().unwrap_or_default();
+    let mut payload = match event_kind {
         "thinking" => {
             let mut merged = run_event.payload.as_object().cloned().unwrap_or_default();
             if !merged.contains_key("step_type") {
@@ -1651,107 +1723,122 @@ pub(super) fn run_event_to_sse_event(run_event: crate::core::RunEvent) -> Event 
             merged
         }
         "tool_start" => {
-            let name = run_event
-                .payload
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            if let Some(inner) = run_event
-                .payload
-                .get("payload")
-                .and_then(|value| value.as_object())
-            {
-                let mut merged = serde_json::Map::new();
-                merged.insert("name".to_string(), serde_json::json!(name));
-                for (key, value) in inner {
-                    merged.insert(key.clone(), value.clone());
-                }
-                merged
+            if stream_payload_has_surface(&incoming_payload) {
+                incoming_payload
             } else {
-                serde_json::json!({ "name": name })
-                    .as_object()
-                    .cloned()
+                let name = run_event
+                    .payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
                     .unwrap_or_default()
+                    .to_string();
+                if let Some(inner) = run_event
+                    .payload
+                    .get("payload")
+                    .and_then(|value| value.as_object())
+                {
+                    let mut merged = serde_json::Map::new();
+                    merged.insert("name".to_string(), serde_json::json!(name));
+                    for (key, value) in inner {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                    merged
+                } else {
+                    serde_json::json!({ "name": name })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default()
+                }
             }
         }
         "tool_progress" => {
-            let name = run_event
-                .payload
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let content = summarize_stream_tool_activity_content(
-                run_event
-                    .payload
-                    .get("content")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default(),
-            );
-            let mut merged = serde_json::Map::new();
-            merged.insert("name".to_string(), serde_json::json!(name));
-            merged.insert("content".to_string(), serde_json::json!(content));
-            if let Some(obj) = run_event.payload.as_object() {
-                for (key, value) in obj {
-                    if matches!(key.as_str(), "name" | "content" | "payload") {
-                        continue;
-                    }
-                    merged.insert(key.clone(), value.clone());
-                }
-            }
-            if let Some(inner) = run_event
-                .payload
-                .get("payload")
-                .and_then(|value| value.as_object())
-            {
-                for (key, value) in inner {
-                    if matches!(key.as_str(), "name" | "content") {
-                        continue;
-                    }
-                    merged.insert(key.clone(), value.clone());
-                }
-                merged
+            if stream_payload_has_surface(&incoming_payload) {
+                incoming_payload
             } else {
-                merged
+                let name = run_event
+                    .payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let content = summarize_stream_tool_activity_content(
+                    run_event
+                        .payload
+                        .get("content")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                );
+                let mut merged = serde_json::Map::new();
+                merged.insert("name".to_string(), serde_json::json!(name));
+                merged.insert("content".to_string(), serde_json::json!(content));
+                if let Some(obj) = run_event.payload.as_object() {
+                    for (key, value) in obj {
+                        if matches!(key.as_str(), "name" | "content" | "payload") {
+                            continue;
+                        }
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
+                if let Some(inner) = run_event
+                    .payload
+                    .get("payload")
+                    .and_then(|value| value.as_object())
+                {
+                    for (key, value) in inner {
+                        if matches!(key.as_str(), "name" | "content") {
+                            continue;
+                        }
+                        merged.insert(key.clone(), value.clone());
+                    }
+                    merged
+                } else {
+                    merged
+                }
             }
         }
         "tool_result" => {
-            let name = run_event
-                .payload
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let raw_content = run_event
-                .payload
-                .get("content")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let summarized = summarize_stream_tool_activity_content(&raw_content);
-            let trimmed = raw_content.trim();
-            let mut merged = serde_json::Map::new();
-            merged.insert("name".to_string(), serde_json::json!(name));
-            merged.insert("content".to_string(), serde_json::json!(summarized));
-            if !trimmed.is_empty() {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    if let Some(obj) = value.as_object() {
-                        for (key, value) in obj {
-                            if matches!(key.as_str(), "name" | "content" | "raw_content" | "result")
-                            {
-                                continue;
+            if stream_payload_has_surface(&incoming_payload) {
+                incoming_payload
+            } else {
+                let name = run_event
+                    .payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let raw_content = run_event
+                    .payload
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let summarized = summarize_stream_tool_activity_content(&raw_content);
+                let trimmed = raw_content.trim();
+                let mut merged = serde_json::Map::new();
+                merged.insert("name".to_string(), serde_json::json!(name));
+                merged.insert("content".to_string(), serde_json::json!(summarized));
+                if !trimmed.is_empty() {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        if let Some(obj) = value.as_object() {
+                            for (key, value) in obj {
+                                if matches!(
+                                    key.as_str(),
+                                    "name" | "content" | "raw_content" | "result"
+                                ) {
+                                    continue;
+                                }
+                                merged.insert(key.clone(), value.clone());
                             }
-                            merged.insert(key.clone(), value.clone());
+                        } else {
+                            merged
+                                .insert("raw_content".to_string(), serde_json::json!(raw_content));
                         }
                     } else {
                         merged.insert("raw_content".to_string(), serde_json::json!(raw_content));
                     }
-                } else {
-                    merged.insert("raw_content".to_string(), serde_json::json!(raw_content));
                 }
+                merged
             }
-            merged
         }
         "plan_generated" => {
             let plan = run_event.payload.get("plan").cloned().unwrap_or_default();
@@ -1848,13 +1935,12 @@ pub(super) fn run_event_to_sse_event(run_event: crate::core::RunEvent) -> Event 
         "priority".to_string(),
         serde_json::json!(run_event.priority),
     );
-    if let Some(stage) = run_event.stage {
+    if let Some(stage) = &run_event.stage {
         payload.insert("stage".to_string(), serde_json::json!(stage));
     }
-    if matches!(
-        event_kind.as_str(),
-        "tool_start" | "tool_progress" | "tool_result"
-    ) {
+    if matches!(event_kind, "tool_start" | "tool_progress" | "tool_result")
+        && !stream_payload_has_surface(&payload)
+    {
         if let Some(name) = payload
             .get("name")
             .and_then(|value| value.as_str())
@@ -1880,6 +1966,12 @@ pub(super) fn run_event_to_sse_event(run_event: crate::core::RunEvent) -> Event 
             attach_stream_surface(&mut payload, &name, status, content.as_deref());
         }
     }
+    serde_json::Value::Object(payload)
+}
+
+pub(super) fn run_event_to_sse_event(run_event: crate::core::RunEvent) -> Event {
+    let event_kind = run_event.kind.clone();
+    let payload = run_event_to_sse_payload(&run_event);
     Event::default()
         .event(event_kind)
         .data(serde_json::to_string(&payload).unwrap_or_default())
@@ -2499,6 +2591,7 @@ async fn prepare_deep_research_plan_confirmation(
     conversation_id: Option<&str>,
     _project_id: Option<&str>,
     attachments: &[crate::core::ChatAttachmentHint],
+    user_message_already_recorded: bool,
 ) -> anyhow::Result<()> {
     let task_id = uuid::Uuid::new_v4();
     let agent_snapshot = Agent::snapshot(&app_state.agent).await;
@@ -2534,15 +2627,17 @@ async fn prepare_deep_research_plan_confirmation(
     task.status = crate::core::TaskStatus::Paused;
     task.capabilities = vec!["network".to_string(), "research".to_string()];
 
-    persist_deep_research_chat_message(
-        &agent_snapshot,
-        conversation_id,
-        "user",
-        message,
-        None,
-        None,
-    )
-    .await;
+    if !user_message_already_recorded {
+        persist_deep_research_chat_message(
+            &agent_snapshot,
+            conversation_id,
+            "user",
+            message,
+            None,
+            None,
+        )
+        .await;
+    }
     agent_snapshot.add_task(task.clone()).await?;
 
     send_chat_stream_event(
@@ -3139,6 +3234,8 @@ pub(super) struct ChatStreamRunRequest {
     pub(super) message: String,
     pub(super) channel: String,
     pub(super) conversation_id: Option<String>,
+    pub(super) user_message_already_recorded: bool,
+    pub(super) recorded_user_message_id: Option<String>,
     pub(super) deep_research: bool,
     pub(super) plan_confirmation_mode: Option<String>,
     pub(super) attachments: Vec<crate::core::ChatAttachmentHint>,
@@ -3148,6 +3245,117 @@ pub(super) struct ChatStreamRunRequest {
     /// the agent loop can read it without changing model selection.
     pub(super) arkorbit_context: Option<serde_json::Value>,
     pub(super) accepted_suggestion: Option<AcceptedChatSuggestionRun>,
+}
+
+pub(super) struct PersistedChatStreamUserMessage {
+    pub(super) conversation_id: String,
+    pub(super) message_id: String,
+}
+
+pub(super) fn chat_stream_run_request_from_persisted_user_message(
+    mut request: ChatRequest,
+    persisted_user_message: PersistedChatStreamUserMessage,
+    caller_principal: Option<crate::actions::ActionCallerPrincipal>,
+    accepted_suggestion: Option<AcceptedChatSuggestionRun>,
+) -> ChatStreamRunRequest {
+    request.conversation_id = Some(persisted_user_message.conversation_id);
+    ChatStreamRunRequest {
+        message: request.message,
+        channel: request.channel,
+        conversation_id: request.conversation_id,
+        user_message_already_recorded: true,
+        recorded_user_message_id: Some(persisted_user_message.message_id),
+        deep_research: request.deep_research,
+        plan_confirmation_mode: request.plan_confirmation_mode,
+        attachments: request.attachments,
+        caller_principal,
+        task_mode: ChatStreamTaskMode::CreateIfNeeded,
+        arkorbit_context: request.arkorbit_context,
+        accepted_suggestion,
+    }
+}
+
+pub(super) async fn persist_chat_stream_user_message_before_run(
+    state: &AppState,
+    channel: &str,
+    conversation_id: Option<&str>,
+    message: &str,
+) -> std::result::Result<PersistedChatStreamUserMessage, Response> {
+    let agent = Agent::snapshot(&state.agent).await;
+    let safe_message = crate::security::redact_secret_input(message).text;
+    let conversation_id = match agent
+        .ensure_conversation_id_for_request(channel, conversation_id, None, &safe_message)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) if error.to_string() == "Conversation not found" => {
+            return Err(conversation_not_found_response());
+        }
+        Err(error) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to prepare conversation: {}", error),
+                }),
+            )
+                .into_response());
+        }
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let conversation = crate::storage::entities::conversation::Model {
+        id: conversation_id.clone(),
+        title: truncate_stream_task_text(&safe_message, 80),
+        channel: channel.to_string(),
+        project_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        message_count: 0,
+        archived: false,
+        starred: false,
+    };
+    if let Err(error) = agent
+        .storage
+        .create_conversation_if_absent(&conversation)
+        .await
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to prepare conversation: {}", error),
+            }),
+        )
+            .into_response());
+    }
+
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let user_message = crate::storage::entities::message::Model {
+        id: message_id.clone(),
+        conversation_id: conversation_id.clone(),
+        role: "user".to_string(),
+        content: safe_message,
+        timestamp: now,
+        model_used: None,
+        trace_id: None,
+    };
+    if let Err(error) = agent
+        .encrypted_storage
+        .insert_message_encrypted_if_absent(&user_message)
+        .await
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to save chat message: {}", error),
+            }),
+        )
+            .into_response());
+    }
+
+    Ok(PersistedChatStreamUserMessage {
+        conversation_id,
+        message_id,
+    })
 }
 
 fn accepted_chat_suggestion_context_value(
@@ -3444,6 +3652,8 @@ pub(super) fn spawn_chat_stream_response(
     let message = request.message.clone();
     let channel = request.channel.clone();
     let conversation_id = request.conversation_id.clone();
+    let request_user_message_already_recorded = request.user_message_already_recorded;
+    let request_recorded_user_message_id = request.recorded_user_message_id.clone();
     let project_id: Option<String> = None;
     let deep_research = request.deep_research;
     let plan_confirmation_mode = request.plan_confirmation_mode.clone();
@@ -3631,7 +3841,8 @@ pub(super) fn spawn_chat_stream_response(
                                 task_id: task_id.clone(),
                                 description: description.clone(),
                                 work_type: work_type.clone(),
-                                user_message_already_recorded: false,
+                                user_message_already_recorded:
+                                    request_user_message_already_recorded,
                                 plan_override: None,
                             });
                         }
@@ -3752,15 +3963,17 @@ pub(super) fn spawn_chat_stream_response(
                     trace.started_at = Some(chrono::Utc::now());
                 }
                 let agent_snapshot = Agent::snapshot(&agent_ref).await;
-                persist_deep_research_chat_message(
-                    &agent_snapshot,
-                    conversation_id.as_deref(),
-                    "user",
-                    &message,
-                    None,
-                    Some(&stream_request_id),
-                )
-                .await;
+                if !request_user_message_already_recorded {
+                    persist_deep_research_chat_message(
+                        &agent_snapshot,
+                        conversation_id.as_deref(),
+                        "user",
+                        &message,
+                        None,
+                        Some(&stream_request_id),
+                    )
+                    .await;
+                }
                 let run_result = automation_control::execute_accepted_watcher_suggestion(
                     &agent_snapshot,
                     &accepted.suggestion,
@@ -3979,6 +4192,7 @@ pub(super) fn spawn_chat_stream_response(
                 conversation_id.as_deref(),
                 project_id.as_deref(),
                 &attachments,
+                request_user_message_already_recorded,
             )
             .await;
             if let Err(error) = result {
@@ -4111,10 +4325,11 @@ pub(super) fn spawn_chat_stream_response(
         }
 
         let tracked_task_snapshot = tracked_task_ref.read().await.clone();
+        let resume_existing_chat_task = tracked_task_snapshot.is_some();
         let user_message_already_recorded = tracked_task_snapshot
             .as_ref()
             .map(|task| task.user_message_already_recorded)
-            .unwrap_or(false);
+            .unwrap_or(request_user_message_already_recorded);
         let mut process_handle = {
             let agent_ref = agent_ref.clone();
             let message = message.clone();
@@ -4126,9 +4341,10 @@ pub(super) fn spawn_chat_stream_response(
             let caller_principal = caller_principal.clone();
             let arkorbit_context = arkorbit_context.clone();
             let accepted_suggestion_context = accepted_suggestion_context.clone();
+            let recorded_user_message_id = request_recorded_user_message_id.clone();
             tokio::spawn(async move {
                 let agent_snapshot = Agent::snapshot(&agent_ref).await;
-                if user_message_already_recorded {
+                if resume_existing_chat_task {
                     agent_snapshot
                         .process_message_stream_resume_with_meta_and_hints(
                             &message,
@@ -4144,6 +4360,27 @@ pub(super) fn spawn_chat_stream_response(
                                 attachments.clone(),
                                 arkorbit_context.clone(),
                             ),
+                        )
+                        .await
+                } else if user_message_already_recorded {
+                    let mut hints = build_request_execution_hints_with_context(
+                        caller_principal.as_ref(),
+                        crate::actions::ActionExecutionSurface::Chat,
+                        true,
+                        attachments,
+                        arkorbit_context,
+                        accepted_suggestion_context,
+                    );
+                    hints.recorded_user_message_id = recorded_user_message_id;
+                    agent_snapshot
+                        .process_message_stream_prerecorded_with_meta_and_hints(
+                            &message,
+                            &channel,
+                            conversation_id.as_deref(),
+                            project_id.as_deref(),
+                            trace_ref,
+                            stream_tx,
+                            hints,
                         )
                         .await
                 } else {
@@ -5369,20 +5606,26 @@ pub(super) async fn chat_stream(
         .into_response();
     }
 
+    let persisted_user_message = match persist_chat_stream_user_message_before_run(
+        &state,
+        &request.channel,
+        request.conversation_id.as_deref(),
+        &request.message,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
     spawn_chat_stream_response(
         state,
-        ChatStreamRunRequest {
-            message: request.message,
-            channel: request.channel,
-            conversation_id: request.conversation_id,
-            deep_research: request.deep_research,
-            plan_confirmation_mode: request.plan_confirmation_mode,
-            attachments: request.attachments,
-            caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
-            task_mode: ChatStreamTaskMode::CreateIfNeeded,
-            arkorbit_context: request.arkorbit_context,
+        chat_stream_run_request_from_persisted_user_message(
+            request,
+            persisted_user_message,
+            maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             accepted_suggestion,
-        },
+        ),
     )
 }
 

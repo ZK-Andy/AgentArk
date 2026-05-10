@@ -482,6 +482,8 @@ fn summarize_watch_result_reports_saved_watcher() {
     assert_eq!(summary, "Created watcher watch-123.");
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn security_headers_include_hsts_for_internet_facing() {
     let (mut state, _config_dir, _data_dir) = build_test_state().await;
@@ -638,6 +640,8 @@ fn access_planner_does_not_infer_capability_acquire_from_generic_custom_agent_te
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn auth_middleware_does_not_bypass_when_legacy_flag_is_set() {
     let (mut state, _config_dir, _data_dir) = build_test_state().await;
@@ -664,6 +668,8 @@ async fn auth_middleware_does_not_bypass_when_legacy_flag_is_set() {
     assert_ne!(response.status(), StatusCode::OK);
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn chat_rejects_oversized_messages() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -699,6 +705,8 @@ async fn chat_rejects_oversized_messages() {
         .contains("100000"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn chat_fast_path_stores_secret_without_live_server() {
     let (state, config_dir, data_dir) = build_test_state().await;
@@ -745,6 +753,8 @@ async fn chat_fast_path_stores_secret_without_live_server() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn chat_fast_path_controls_notifications_without_live_server() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -785,6 +795,8 @@ async fn chat_fast_path_controls_notifications_without_live_server() {
     assert!(agent.push_notifications_muted_until_ts().await.is_some());
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn chat_stream_fast_path_stores_secret_without_live_server() {
     let (state, config_dir, data_dir) = build_test_state().await;
@@ -831,6 +843,8 @@ async fn chat_stream_fast_path_stores_secret_without_live_server() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn notifications_endpoints_work_hermetically() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -882,6 +896,8 @@ async fn notifications_endpoints_work_hermetically() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn swarm_endpoints_work_hermetically() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1259,6 +1275,87 @@ fn normalize_stream_event_for_sse_preserves_structured_tool_result_fields() {
 }
 
 #[test]
+fn run_event_to_sse_payload_preserves_prebuilt_tool_result_surface_output() {
+    let raw_content = serde_json::json!({
+        "status": "ok",
+        "surface": "integrations",
+        "id": "linear",
+        "query": "linear",
+        "matches": [{
+            "surface": "extension_packs",
+            "record": {
+                "manifest": {
+                    "id": "linear",
+                    "name": "Linear"
+                },
+                "connection": {
+                    "status": "connected"
+                }
+            },
+            "safe_check": {
+                "ran": true,
+                "kind": "connection_state"
+            }
+        }],
+        "diagnostics": [{
+            "run_check_requested": true,
+            "matches_returned": 1
+        }]
+    })
+    .to_string();
+    let (event, next_state) = normalize_stream_event_for_sse(
+        crate::core::StreamEvent::ToolResult {
+            name: "inspect_integration".to_string(),
+            content: raw_content.clone(),
+        },
+        "",
+    );
+    assert!(next_state.is_empty());
+    let Some((event_name, normalized_payload)) = event else {
+        panic!("expected tool_result event");
+    };
+    assert_eq!(event_name, "tool_result");
+
+    let run_event = crate::core::RunEvent {
+        run_id: "run-1".to_string(),
+        seq: 7,
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        flow_kind: "chat".to_string(),
+        origin: "web".to_string(),
+        kind: "tool_result".to_string(),
+        priority: crate::core::RunEventPriority::High,
+        stage: None,
+        payload: normalized_payload,
+    };
+    let replay_payload = run_event_to_sse_payload(&run_event);
+    let surface_text = replay_payload
+        .get("surface")
+        .and_then(|surface| surface.get("output"))
+        .and_then(|output| output.as_array())
+        .and_then(|output| output.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+
+    assert_eq!(surface_text, raw_content);
+    assert_ne!(
+        surface_text,
+        replay_payload
+            .get("content")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+    );
+    assert_eq!(
+        replay_payload
+            .get("surface")
+            .and_then(|surface| surface.get("tool"))
+            .and_then(|tool| tool.get("id"))
+            .and_then(|value| value.as_str()),
+        Some("inspect_integration")
+    );
+}
+
+#[test]
 fn summarize_stream_tool_activity_content_counts_structured_result_buckets() {
     let content = serde_json::json!({
         "query": "user first name",
@@ -1457,6 +1554,38 @@ fn backfill_chat_task_origin_metadata_sets_missing_conversation_id() {
     );
 }
 
+#[test]
+fn chat_stream_worker_request_marks_pre_persisted_user_message() {
+    let run_request = chat_stream_run_request_from_persisted_user_message(
+        ChatRequest {
+            message: "can you check my google drive?".to_string(),
+            channel: "web".to_string(),
+            conversation_id: None,
+            deep_research: false,
+            plan_confirmation_mode: None,
+            execution_mode: None,
+            attachments_present: false,
+            attachments: Vec::new(),
+            arkorbit_context: None,
+            accepted_suggestion_id: None,
+            sentinel_proposal_id: None,
+        },
+        PersistedChatStreamUserMessage {
+            conversation_id: "conv-1".to_string(),
+            message_id: "msg-1".to_string(),
+        },
+        None,
+        None,
+    );
+
+    assert_eq!(run_request.message, "can you check my google drive?");
+    assert_eq!(run_request.conversation_id.as_deref(), Some("conv-1"));
+    assert!(run_request.user_message_already_recorded);
+    assert_eq!(run_request.recorded_user_message_id.as_deref(), Some("msg-1"));
+}
+
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn resume_chat_stream_rejects_non_chat_and_paused_tasks() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1529,6 +1658,8 @@ async fn resume_chat_stream_rejects_non_chat_and_paused_tasks() {
         .contains("cancelled or failed"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn resume_chat_stream_allows_paused_plan_confirmation_tasks() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1638,6 +1769,8 @@ async fn resume_chat_stream_allows_paused_plan_confirmation_tasks() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn generic_resume_and_retry_reject_chat_request_tasks() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1714,6 +1847,8 @@ async fn generic_resume_and_retry_reject_chat_request_tasks() {
         .contains("resume-chat/stream"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn resume_chat_stream_reuses_task_and_does_not_duplicate_user_message() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1800,6 +1935,8 @@ async fn resume_chat_stream_reuses_task_and_does_not_duplicate_user_message() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn settings_endpoint_rejects_discord_without_bot_token() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1832,6 +1969,8 @@ async fn settings_endpoint_rejects_discord_without_bot_token() {
         .contains("Discord bot token is required"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn settings_endpoint_rejects_discord_without_scope() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1863,6 +2002,8 @@ async fn settings_endpoint_rejects_discord_without_scope() {
         .contains("guild, channel, or thread scope"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn settings_endpoint_requires_google_chat_verify_token() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1895,6 +2036,8 @@ async fn settings_endpoint_requires_google_chat_verify_token() {
         .contains("verification token"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn settings_endpoint_rejects_incomplete_matrix_config() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1926,6 +2069,8 @@ async fn settings_endpoint_rejects_incomplete_matrix_config() {
         .contains("Matrix homeserver URL and user ID are required"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn profile_onboarding_endpoint_persists_answers_and_marks_complete() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -1997,6 +2142,8 @@ async fn profile_onboarding_endpoint_persists_answers_and_marks_complete() {
     assert_eq!(focus_pref.value, "Inbox triage and daily brief follow-up");
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn profile_onboarding_dismiss_endpoint_hides_prompt_until_settings_are_used() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2037,6 +2184,8 @@ async fn profile_onboarding_dismiss_endpoint_hides_prompt_until_settings_are_use
     assert!(!profile.onboarding_complete);
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn profile_onboarding_endpoint_rejects_invalid_timezone() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2072,6 +2221,8 @@ async fn profile_onboarding_endpoint_rejects_invalid_timezone() {
         .contains("Invalid timezone"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn gateway_channels_endpoint_returns_transport_inventory() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2113,6 +2264,8 @@ async fn gateway_channels_endpoint_returns_transport_inventory() {
         .any(|channel| { channel.get("id").and_then(|value| value.as_str()) == Some("teams") }));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn slack_webhook_endpoint_rejects_unsigned_url_verification_when_secret_is_configured() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2147,6 +2300,8 @@ async fn slack_webhook_endpoint_rejects_unsigned_url_verification_when_secret_is
     assert!(text.to_ascii_lowercase().contains("signature"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn slack_webhook_endpoint_rejects_unsigned_event_callback_when_secret_is_configured() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2189,6 +2344,8 @@ async fn slack_webhook_endpoint_rejects_unsigned_event_callback_when_secret_is_c
     assert!(text.to_ascii_lowercase().contains("signature"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn whatsapp_webhook_endpoint_rejects_unsigned_cloud_api_requests() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2237,6 +2394,8 @@ async fn whatsapp_webhook_endpoint_rejects_unsigned_cloud_api_requests() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn whatsapp_webhook_endpoint_rejects_bridge_requests_without_bearer_auth() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2287,6 +2446,8 @@ async fn whatsapp_webhook_endpoint_rejects_bridge_requests_without_bearer_auth()
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn whatsapp_bridge_status_returns_disabled_when_whatsapp_is_off() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2317,6 +2478,8 @@ async fn whatsapp_bridge_status_returns_disabled_when_whatsapp_is_off() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn whatsapp_bridge_status_returns_disabled_for_cloud_api_mode() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2363,6 +2526,8 @@ async fn whatsapp_bridge_status_returns_disabled_for_cloud_api_mode() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn whatsapp_bridge_status_reports_embedded_bridge_missing_from_image() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2413,6 +2578,8 @@ async fn whatsapp_bridge_status_reports_embedded_bridge_missing_from_image() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn whatsapp_bridge_status_reports_external_warning_for_legacy_bridge() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2465,6 +2632,8 @@ async fn whatsapp_bridge_status_reports_external_warning_for_legacy_bridge() {
     assert!(body.get("installed").is_none());
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn update_settings_generates_whatsapp_bridge_token_for_embedded_baileys() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2518,6 +2687,8 @@ async fn update_settings_generates_whatsapp_bridge_token_for_embedded_baileys() 
     assert!(!config.bridge_token.trim().is_empty());
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn update_settings_rejects_new_external_whatsapp_bridge_without_token() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2563,6 +2734,8 @@ async fn update_settings_rejects_new_external_whatsapp_bridge_without_token() {
         .contains("external bridge token is required"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn teams_webhook_endpoint_rejects_requests_without_authorization() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2598,6 +2771,8 @@ async fn teams_webhook_endpoint_rejects_requests_without_authorization() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn arkpulse_fix_rejects_command_text_without_structured_remediation() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2628,6 +2803,8 @@ async fn arkpulse_fix_rejects_command_text_without_structured_remediation() {
         .contains("no executable ArkPulse auto-fix"));
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn arkpulse_fix_skips_missing_app_restart_and_cleans_stale_state() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -3485,6 +3662,8 @@ fn analytics_openrouter_estimate_skips_generic_openai_compatible_rows() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn verified_ui_session_request_accepts_same_origin_cookie() {
     let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -3528,6 +3707,8 @@ async fn verified_ui_session_request_accepts_same_origin_cookie() {
     );
 }
 
+
+#[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
 #[tokio::test]
 async fn verified_ui_session_request_rejects_app_referer() {
     let (state, _config_dir, _data_dir) = build_test_state().await;

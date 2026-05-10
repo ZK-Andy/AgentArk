@@ -45,16 +45,23 @@ async fn sync_extension_pack_runtime(
     state: &AppState,
     registry: &std::sync::Arc<tokio::sync::RwLock<crate::extension_packs::ExtensionPackRegistry>>,
 ) -> Option<String> {
-    let runtime = {
+    let (runtime, agent_for_catalog) = {
         let agent = state.agent.read().await;
-        agent.runtime.clone()
+        (agent.runtime.clone(), agent.clone())
     };
     let guard = registry.read().await;
-    guard
+    let warning = guard
         .sync_to_runtime(&runtime)
         .await
         .err()
-        .map(|e| e.to_string())
+        .map(|e| e.to_string());
+    drop(guard);
+    if warning.is_none() {
+        agent_for_catalog
+            .refresh_action_catalog_index("extension_pack_runtime_sync")
+            .await;
+    }
+    warning
 }
 
 fn header_snapshot(headers: &HeaderMap, names: &[&str]) -> serde_json::Value {

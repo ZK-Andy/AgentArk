@@ -229,11 +229,7 @@ impl Agent {
             let ready = model_pool_map
                 .get(&slot_id)
                 .is_some_and(|(slot, _)| Self::provider_has_runtime_credentials(&slot.provider));
-            if ready {
-                Some(slot_id)
-            } else {
-                None
-            }
+            if ready { Some(slot_id) } else { None }
         });
         if had_persisted_model_override && user_selected_model_slot.is_none() {
             let _ = storage.delete(USER_SELECTED_MODEL_SLOT_KEY).await;
@@ -913,6 +909,51 @@ impl Agent {
                 }
             }
         });
+    }
+
+    pub async fn refresh_action_catalog_index(&self, reason: &'static str) {
+        match self.load_action_catalog_actions().await {
+            Ok(actions) => {
+                self.spawn_action_catalog_index_sync(actions, reason);
+                self.spawn_agentark_knowledge_sync(reason);
+            }
+            Err(error) => tracing::warn!(
+                "Failed to load actions for catalog index refresh reason={}: {}",
+                reason,
+                error
+            ),
+        }
+    }
+
+    pub(super) fn spawn_agentark_knowledge_sync(&self, reason: &'static str) {
+        let agent = self.clone();
+        crate::spawn_logged!(
+            "src/core/agent/startup.rs:agentark_knowledge_refresh",
+            async move {
+                match agent.sync_agentark_knowledge().await {
+                    Ok(count) => tracing::info!(
+                        "AgentArk knowledge sync complete reason={} items={}",
+                        reason,
+                        count
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            "AgentArk knowledge sync failed reason={}: {}",
+                            reason,
+                            error
+                        );
+                        agent
+                            .push_startup_issue(StartupIssue::new(
+                                "agentark_knowledge",
+                                "warning",
+                                "AgentArk knowledge sync failed",
+                                error.to_string(),
+                            ))
+                            .await;
+                    }
+                }
+            }
+        );
     }
 
     pub(super) async fn sync_action_catalog_index(

@@ -1563,6 +1563,8 @@ mod tests {
         assert!(state.recent.len() <= MAX_RECENT_ACTIVITY_IDS);
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn record_activity_id_is_idempotent_for_retries() {
         let _dir = tempfile::tempdir().unwrap();

@@ -629,31 +629,16 @@ impl RaisedCredentialPromptKind {
 }
 
 impl Agent {
-    /// Validate a tool call's arguments against the action schema, repairing
-    /// missing required fields semantically when possible.
-    ///
-    /// Two repair stages run in order:
-    ///   1. Action-specific static repair (today: `code_execute` language
-    ///      detection from code syntax). Stays inline here per the project
-    ///      rule against action-name conditionals living in
-    ///      `argument_repair.rs`.
-    ///   2. Generic LLM-driven inference of any required field still missing,
-    ///      conditioned on the user's intent (user message + routing summary
-    ///      + turn-plan goals) supplied via `repair_context`. Memoized per
-    ///      `(action, missing-set, payload)` for the turn so identical
-    ///      attempts do not re-call the model.
-    ///
-    /// Returns `None` when the call is valid; otherwise an error string the
-    /// agent loop will feed back to the LLM. When LLM repair partially
-    /// succeeded, the error string includes a JSON `Inference context:` tail
-    /// so the next-turn LLM has actionable context, not just "missing X".
+    /// Validate a bound ExecutionDAG tool call's arguments against the action
+    /// schema. This executor no longer infers missing required fields or
+    /// changes intent; missing inputs are surfaced as a router/binding issue.
     async fn repair_and_validate_tool_call_arguments(
         &self,
         call: &mut crate::core::llm::ToolCall,
         action: Option<&crate::actions::ActionDef>,
-        repair_context: &super::argument_repair::ArgumentRepairContext,
-        repair_memo: &mut super::argument_repair::RepairMemo,
-        repair_iteration: usize,
+        _repair_context: &super::argument_repair::ArgumentRepairContext,
+        _repair_memo: &mut super::argument_repair::RepairMemo,
+        _repair_iteration: usize,
     ) -> Option<ToolArgumentValidationFailure> {
         let mut payload = call.arguments.as_object().cloned().unwrap_or_default();
 
@@ -680,39 +665,9 @@ impl Agent {
             return None;
         };
 
-        let initial_missing = super::argument_repair::missing_required_fields(action, &payload);
-
-        // Stage 2: generic, intent-driven LLM inference for any missing
-        // required field. Memoized for the turn.
-        let mut partial_inference: serde_json::Map<String, serde_json::Value> =
-            serde_json::Map::new();
-        let mut repaired_missing: Option<Vec<String>> = None;
-        if !initial_missing.is_empty() {
-            let memo_key =
-                super::argument_repair::repair_memo_key(&action.name, &initial_missing, &payload);
-            let budget_key = format!("{}::{}", action.name, repair_iteration);
-            if repair_memo.lookup(&memo_key).is_some()
-                || repair_memo.claim_attempt_scope(budget_key)
-            {
-                let outcome = self
-                    .fill_missing_required_fields_via_inference(
-                        action,
-                        &mut payload,
-                        repair_context,
-                        &initial_missing,
-                        repair_memo,
-                    )
-                    .await;
-                partial_inference = outcome.partial_inference;
-                payload = outcome.repaired_payload;
-                repaired_missing = Some(outcome.still_missing);
-            }
-        }
-
         call.arguments = serde_json::Value::Object(payload.clone());
 
-        let still_missing = repaired_missing
-            .unwrap_or_else(|| super::argument_repair::missing_required_fields(action, &payload));
+        let still_missing = super::argument_repair::missing_required_fields(action, &payload);
 
         if still_missing.is_empty() {
             if let Some(schema_error) =
@@ -720,7 +675,7 @@ impl Agent {
             {
                 return Some(ToolArgumentValidationFailure {
                     message: format!(
-                        "Tool '{}' could not run yet: {} Retry this tool with valid arguments, or use a better matching authorized action if one is available.",
+                        "Bound action '{}' could not run: {}. This is a Semantic DAG binding issue unless runtime state changed after binding.",
                         call.name, schema_error
                     ),
                     missing_fields: Vec::new(),
@@ -730,9 +685,6 @@ impl Agent {
             return None;
         }
 
-        // Surface an enriched error so the next-turn LLM sees what was
-        // partially inferred, not just "missing X". Keeps phrasing-agnostic:
-        // the payload contains the structured field set, not free-text hints.
         let mut error_payload = serde_json::Map::new();
         error_payload.insert(
             "tool".to_string(),
@@ -747,23 +699,17 @@ impl Agent {
                     .collect(),
             ),
         );
-        if !partial_inference.is_empty() {
-            error_payload.insert(
-                "partial_inference".to_string(),
-                serde_json::Value::Object(partial_inference.clone()),
-            );
-        }
         let payload_text = serde_json::Value::Object(error_payload).to_string();
 
         Some(ToolArgumentValidationFailure {
             message: format!(
-                "Tool '{}' could not run yet: missing required field(s): {}. Retry this tool with the required fields, or use a better matching authorized action if one is available. Inference context: {}",
+                "Bound action '{}' could not run: missing required field(s): {}. This is a Semantic DAG binding issue unless runtime state changed after binding. Missing-input context: {}",
                 call.name,
                 still_missing.join(", "),
                 payload_text
             ),
             missing_fields: still_missing,
-            partial_inference,
+            partial_inference: serde_json::Map::new(),
         })
     }
 
@@ -1282,11 +1228,7 @@ impl Agent {
                 serde_json::Value::String(content.to_string()),
             );
         }
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
+        if out.is_empty() { None } else { Some(out) }
     }
 
     fn safe_app_relative_file_key(key: &str) -> Option<String> {
@@ -1629,11 +1571,7 @@ impl Agent {
                 }
             }
         }
-        if files.is_empty() {
-            None
-        } else {
-            Some(files)
-        }
+        if files.is_empty() { None } else { Some(files) }
     }
 
     /// Recover files from a top-level object that has no `files` key and no nested wrapper.
@@ -1690,119 +1628,6 @@ impl Agent {
         } else {
             "index.html".to_string()
         }
-    }
-
-    async fn repair_app_deploy_arguments_after_validation_error(
-        &self,
-        current_args: &serde_json::Value,
-        error_text: &str,
-        repair_context: &super::argument_repair::ArgumentRepairContext,
-        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
-    ) -> Option<serde_json::Value> {
-        let Some(current_obj) = current_args.as_object() else {
-            return None;
-        };
-
-        if let Some(tx) = stream_tx {
-            queue_stream_event(
-                tx,
-                StreamEvent::ToolProgress {
-                    name: "app_deploy".to_string(),
-                    content: "Repairing app bundle from validator diagnostics.".to_string(),
-                    payload: Some(phase_status_payload(
-                        "app_deploy",
-                        "repairing",
-                        "Repairing",
-                        "Repairing app bundle from validator diagnostics.",
-                        0,
-                    )),
-                },
-            );
-        }
-
-        let prompt = serde_json::json!({
-            "request_context": repair_context.build_request_text(),
-            "validation_error": error_text,
-            "current_app_deploy_arguments": current_args,
-            "required_output": {
-                "type": "complete app_deploy arguments JSON object",
-                "rules": [
-                    "Preserve the user's requested product, content, visual direction, interactions, and delivery intent.",
-                    "If the current arguments are empty or omit a deployable source, synthesize the deployable source from the request context instead of asking the user to provide tool payload fields.",
-                    "Do not use generic placeholder or fallback asset contents.",
-                    "For generated app bundles, return a complete files object for the intended stack. Every local reference from HTML, CSS, scripts, package metadata, or runtime config must either have matching bundled file content or be removed/inlined consistently.",
-                    "If markup is malformed, return a complete replacement document and all referenced assets.",
-                    "Return JSON only. Do not include markdown or explanatory prose."
-                ]
-            }
-        });
-
-        let response = self
-            .supervised_internal_chat(
-                "automation",
-                "app_deploy_bundle_repair",
-                "app_deploy_bundle_repair",
-                &ModelRole::Primary,
-                self.llm_candidates_for_role(&ModelRole::Primary),
-                "You repair app deployment arguments after a structural bundle validator failure. Return only strict JSON containing complete corrected app_deploy arguments. Base the repair on the validator error, current file graph, and user intent context.",
-                &prompt.to_string(),
-                &[],
-                &[],
-                120_000,
-                2,
-            )
-            .await?;
-
-        let parsed = extract_json_object_from_text(&response.content)?;
-        let candidate = parsed
-            .get("arguments")
-            .and_then(|value| value.as_object())
-            .map(|obj| serde_json::Value::Object(obj.clone()))
-            .unwrap_or(parsed);
-        let Some(candidate_obj) = candidate.as_object() else {
-            return None;
-        };
-
-        let mut merged = current_obj.clone();
-        for (key, value) in candidate_obj {
-            merged.insert(key.clone(), value.clone());
-        }
-        let normalized = Self::normalize_app_deploy_arguments(&serde_json::Value::Object(merged));
-        let normalized_obj = normalized.as_object()?;
-        let has_repo = normalized_obj
-            .get("repo_url")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        let has_valid_files = normalized_obj
-            .get("files")
-            .and_then(|value| value.as_object())
-            .map(|files| !files.is_empty() && files.values().all(|value| value.is_string()))
-            .unwrap_or(false);
-        let has_valid_staged_source = normalized_obj
-            .get("source_dir")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-            && normalized_obj
-                .get("source_paths")
-                .and_then(|value| value.as_array())
-                .map(|paths| {
-                    !paths.is_empty()
-                        && paths.iter().all(|path| {
-                            path.as_str()
-                                .map(str::trim)
-                                .is_some_and(|value| !value.is_empty())
-                        })
-                })
-                .unwrap_or(false);
-        if !has_repo && !has_valid_files && !has_valid_staged_source {
-            return None;
-        }
-        if serde_json::to_string(&normalized).ok()? == serde_json::to_string(current_args).ok()? {
-            return None;
-        }
-        Some(normalized)
     }
 
     fn summarize_app_deploy_stream_payload(arguments: &serde_json::Value) -> serde_json::Value {
@@ -2787,9 +2612,9 @@ impl Agent {
                         obj.insert("running".to_string(), serde_json::json!(status.running));
                         obj.insert(
                             "runtime_mode".to_string(),
-                            serde_json::json!(status
-                                .runtime_mode
-                                .unwrap_or_else(|| "stopped".to_string())),
+                            serde_json::json!(
+                                status.runtime_mode.unwrap_or_else(|| "stopped".to_string())
+                            ),
                         );
                         obj.insert(
                             "port".to_string(),
@@ -4263,6 +4088,39 @@ impl Agent {
         }))?)
     }
 
+    async fn execute_direct_watcher_delete_tool(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let watcher_id = arguments
+            .get("watcher_id")
+            .or_else(|| arguments.get("id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing watcher_id"))?;
+        let uuid = uuid::Uuid::parse_str(watcher_id)
+            .with_context(|| format!("Invalid watcher_id `{watcher_id}`"))?;
+        let deleted_live = self.watcher_manager.delete(uuid).await;
+        let deleted_history = self.clear_watcher_supervisor_state(watcher_id).await;
+        self.background_sessions
+            .remove_child_references(&[], &[watcher_id.to_string()], Some("agent"))
+            .await;
+        let deleted_reflect_units = self
+            .storage
+            .delete_semantic_work_units_for_source("watcher", watcher_id)
+            .await
+            .unwrap_or(0);
+        let deleted = deleted_live || deleted_history || deleted_reflect_units > 0;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "watcher_id": watcher_id,
+            "deleted": deleted,
+            "deleted_live": deleted_live,
+            "deleted_history": deleted_history,
+            "deleted_reflect_units": deleted_reflect_units,
+        }))?)
+    }
+
     pub(crate) async fn execute_action_with_hooks(
         &self,
         action_name: &str,
@@ -4282,12 +4140,15 @@ impl Agent {
         )
         .await;
 
+        let action_catalog_before = self.runtime_action_catalog_fingerprint().await;
         let execution = if action_name.eq_ignore_ascii_case("notify_user")
             && notification_tool_should_dispatch_for_surface(channel, authorization)
         {
             self.execute_direct_notify_user_tool(arguments).await
         } else if action_name.eq_ignore_ascii_case("list_watchers") {
             self.execute_direct_list_watchers_tool(arguments).await
+        } else if action_name.eq_ignore_ascii_case("watcher_delete") {
+            self.execute_direct_watcher_delete_tool(arguments).await
         } else if let Some(auth_context) = authorization {
             self.runtime
                 .execute_action_with_context(action_name, arguments, auth_context)
@@ -4307,6 +4168,8 @@ impl Agent {
                     &event_id,
                 )
                 .await;
+                self.refresh_action_catalog_after_runtime_change(action_catalog_before)
+                    .await;
                 Ok(result)
             }
             Err(e) => {
@@ -4346,6 +4209,41 @@ impl Agent {
                     ))
                 }
             }
+        }
+    }
+
+    async fn runtime_action_catalog_fingerprint(&self) -> Option<String> {
+        let mut actions = self.runtime.list_actions().await.ok()?;
+        actions.sort_by(|left, right| left.name.cmp(&right.name));
+        Some(
+            actions
+                .into_iter()
+                .map(|action| {
+                    let mut capabilities = action.capabilities;
+                    capabilities.sort();
+                    format!(
+                        "{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
+                        action.name,
+                        action.version,
+                        action.source,
+                        capabilities.join("\u{1e}")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\u{1d}"),
+        )
+    }
+
+    async fn refresh_action_catalog_after_runtime_change(&self, before: Option<String>) {
+        let Some(before) = before else {
+            return;
+        };
+        let Some(after) = self.runtime_action_catalog_fingerprint().await else {
+            return;
+        };
+        if before != after {
+            self.refresh_action_catalog_index("runtime_action_catalog_changed")
+                .await;
         }
     }
 
@@ -8696,6 +8594,75 @@ impl Agent {
             .map(|action| (action.name.clone(), action))
             .collect::<HashMap<_, _>>();
 
+        if let Some(auth_context) = authorization {
+            if matches!(
+                auth_context.surface,
+                crate::actions::ActionExecutionSurface::Chat
+            ) && auth_context.direct_user_intent
+                && !auth_context.current_turn_is_explicit_approval
+                && unique_calls.len() > 1
+            {
+                let calls_ready_for_grouped_approval = unique_calls.iter().all(|call| {
+                    let Some(action) = enabled_action_map.get(&call.name) else {
+                        return false;
+                    };
+                    let Some(payload) = call.arguments.as_object() else {
+                        return false;
+                    };
+                    super::argument_repair::missing_required_fields(action, payload).is_empty()
+                        && super::argument_repair::shallow_schema_violation(action, &call.arguments)
+                            .is_none()
+                });
+                let approval_required = unique_calls.iter().any(|call| {
+                    enabled_action_map
+                        .get(&call.name)
+                        .is_some_and(|action| action.authorization.human_approval.required)
+                });
+                if approval_required && calls_ready_for_grouped_approval {
+                    let calls = unique_calls
+                        .iter()
+                        .map(|call| DirectChatChainApprovalCall {
+                            action_name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let approval = self
+                        .remember_direct_chat_chain_approval(
+                            conversation_id,
+                            request_channel,
+                            &calls,
+                            auth_context,
+                            "This planned action chain includes at least one action that requires explicit user approval before the chain can run.",
+                        )
+                        .await?;
+                    let detail = format!(
+                        "Approval required before running this {} action chain.",
+                        calls.len()
+                    );
+                    let formatted = render_tool_completion_marker_with_data(
+                        "action_chain",
+                        "approval_required",
+                        &detail,
+                        serde_json::json!({
+                            "success": false,
+                            "approval_required": true,
+                            "direct_chat_approval": approval,
+                        }),
+                    );
+                    if let Some(ref tx) = stream_tx {
+                        queue_stream_event(
+                            tx,
+                            StreamEvent::ToolResult {
+                                name: "action_chain".to_string(),
+                                content: detail,
+                            },
+                        );
+                    }
+                    return Ok(formatted);
+                }
+            }
+        }
+
         for call in unique_calls {
             let mut call = call.clone();
             let action_for_call = enabled_action_map.get(&call.name).cloned();
@@ -8797,6 +8764,64 @@ impl Agent {
                 }
                 results.push(blocked);
                 continue;
+            }
+
+            if let (Some(auth_context), Some(action_def)) =
+                (authorization, action_for_call.as_ref())
+            {
+                if matches!(
+                    auth_context.surface,
+                    crate::actions::ActionExecutionSurface::Chat
+                ) && auth_context.direct_user_intent
+                    && !auth_context.current_turn_is_explicit_approval
+                {
+                    let decision = self
+                        .runtime
+                        .authorize_action_invocation(
+                            &call.name,
+                            Some(action_def),
+                            &call.arguments,
+                            auth_context,
+                        )
+                        .await?;
+                    if !decision.allowed && decision.requires_explicit_approval {
+                        let approval_call = DirectChatChainApprovalCall {
+                            action_name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        };
+                        let approval = self
+                            .remember_direct_chat_chain_approval(
+                                conversation_id,
+                                request_channel,
+                                &[approval_call],
+                                auth_context,
+                                &decision.reason,
+                            )
+                            .await?;
+                        let detail = format!("Approval required before running `{}`.", call.name);
+                        let formatted = render_tool_completion_marker_with_data(
+                            &call.name,
+                            "approval_required",
+                            &detail,
+                            serde_json::json!({
+                                "success": false,
+                                "approval_required": true,
+                                "direct_chat_approval": approval,
+                            }),
+                        );
+                        if let Some(ref tx) = stream_tx {
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: detail,
+                                },
+                            );
+                        }
+                        results.push(formatted);
+                        break;
+                    }
+                }
             }
 
             // Handle generate_image via integrations (not runtime)
@@ -9692,53 +9717,7 @@ impl Agent {
                 )
                 .await;
                 let llm_env = self.app_model_env_vars();
-                let mut deploy_args_for_result = resolved_args.clone();
-                let mut app_deploy_repair_signatures = std::collections::HashSet::new();
-                for _ in 0..3 {
-                    let preflight_started = std::time::Instant::now();
-                    let preflight_result = crate::actions::app::app_deploy_preflight(
-                        &self.data_dir,
-                        &deploy_args_for_result,
-                        &self.app_registry,
-                    )
-                    .await;
-                    tracing::debug!(
-                        target: "agentark.turn_timing",
-                        stage = "app_deploy_preflight",
-                        duration_ms = preflight_started.elapsed().as_millis() as u64,
-                        success = preflight_result.is_ok(),
-                        "app deploy preflight timing"
-                    );
-                    let Err(error) = preflight_result else {
-                        break;
-                    };
-                    let error_text = error.to_string();
-                    let signature = serde_json::json!({
-                        "error": error_text,
-                        "arguments": deploy_args_for_result.clone(),
-                    })
-                    .to_string();
-                    if !app_deploy_repair_signatures.insert(signature) {
-                        break;
-                    }
-                    let Some(repaired_args) = self
-                        .repair_app_deploy_arguments_after_validation_error(
-                            &deploy_args_for_result,
-                            &error_text,
-                            repair_context,
-                            stream_tx.as_ref(),
-                        )
-                        .await
-                    else {
-                        break;
-                    };
-                    if serde_json::to_string(&repaired_args).ok()
-                        == serde_json::to_string(&deploy_args_for_result).ok()
-                    {
-                        break;
-                    }
-                    deploy_args_for_result = repaired_args;
-                }
+                let deploy_args_for_result = resolved_args.clone();
                 let preflight_started = std::time::Instant::now();
                 if let Err(error) = crate::actions::app::app_deploy_preflight(
                     &self.data_dir,
@@ -10748,7 +10727,7 @@ impl Agent {
                     if call.name == "schedule_task"
                         && crate::runtime::parse_schedule_task_completion(&result).is_some()
                     {
-                        if let Some(schedule_result) = self
+                        let schedule_result = self
                             .handle_schedule_task(
                                 &call.arguments,
                                 request_channel,
@@ -10756,27 +10735,31 @@ impl Agent {
                                 project_id,
                                 authorization,
                             )
-                            .await
-                        {
-                            if let Some(ref tx) = stream_tx {
-                                queue_stream_event(
-                                    tx,
-                                    StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: sanitize_stream(&schedule_result),
-                                    },
-                                );
-                            }
-                            results.push(schedule_result);
-                            continue;
+                            .await;
+                        let schedule_result = durable_orchestration_action_result(
+                            "schedule_task",
+                            "Scheduled task",
+                            schedule_result,
+                            |value| crate::runtime::parse_schedule_task_completion(value).is_some(),
+                        );
+                        if let Some(ref tx) = stream_tx {
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: sanitize_stream(&schedule_result),
+                                },
+                            );
                         }
+                        results.push(schedule_result);
+                        continue;
                     }
 
                     // Special handling for watch - spawn background watcher
                     if call.name == "watch"
                         && crate::runtime::parse_watch_completion(&result).is_some()
                     {
-                        if let Some(watch_result) = self
+                        let watch_result = self
                             .handle_watch(
                                 &call.arguments,
                                 request_channel,
@@ -10784,20 +10767,24 @@ impl Agent {
                                 project_id,
                                 authorization,
                             )
-                            .await
-                        {
-                            if let Some(ref tx) = stream_tx {
-                                queue_stream_event(
-                                    tx,
-                                    StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: sanitize_stream(&watch_result),
-                                    },
-                                );
-                            }
-                            results.push(watch_result);
-                            continue;
+                            .await;
+                        let watch_result = durable_orchestration_action_result(
+                            "watch",
+                            "Watcher",
+                            watch_result,
+                            |value| crate::runtime::parse_watch_completion(value).is_some(),
+                        );
+                        if let Some(ref tx) = stream_tx {
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: sanitize_stream(&watch_result),
+                                },
+                            );
                         }
+                        results.push(watch_result);
+                        continue;
                     }
 
                     if call.name == "background_session_manage" {
@@ -11439,22 +11426,34 @@ impl Agent {
                                     )
                                     .await;
                                 }
-                                let display_name = self
+                                let (display_name, settings_path) = self
                                     .lookup_integration_auth_manifest(integration_id)
                                     .await
-                                    .map(|manifest| manifest.display_name)
+                                    .map(|manifest| {
+                                        let path = Self::integration_auth_settings_path(
+                                            &manifest.integration_id,
+                                            &manifest.display_name,
+                                        );
+                                        (manifest.display_name, path)
+                                    })
                                     .or_else(|| {
-                                        parsed
+                                        let display_name = parsed
                                             .get("custom_messaging_channel")
                                             .and_then(|value| value.get("name"))
                                             .and_then(|value| value.as_str())
-                                            .map(str::to_string)
+                                            .map(str::to_string)?;
+                                        Some((display_name, None))
                                     })
-                                    .unwrap_or_else(|| "This connection".to_string());
-                                let prompt = format!(
-                                    "{} needs credentials before I can use it.\n\nUse the secure credential form that just appeared in this chat. The values are stored encrypted and are not sent to the assistant.",
+                                    .unwrap_or_else(|| ("This connection".to_string(), None));
+                                let mut prompt = format!(
+                                    "{} needs credentials before I can use it.\n\nUse the secure credential form below in this chat. The values are stored encrypted and are not sent to the assistant.",
                                     display_name
                                 );
+                                if let Some(path) = settings_path {
+                                    prompt.push_str("\n\nYou can also open ");
+                                    prompt.push_str(&path);
+                                    prompt.push('.');
+                                }
                                 if let Some(ref tx) = stream_tx {
                                     queue_stream_event(
                                         tx,
@@ -11520,9 +11519,13 @@ impl Agent {
                                     )
                                     .await;
                                 }
-                                let mut prompt = format!(
-                                    "{} is installed, but it still needs credentials before I can use it.\n\nUse the secure credential form that just appeared in this chat. Never paste secrets/API Keys/Password/Sensitive Data into normal chat.",
+                                let settings_path = format!(
+                                    "Settings > Integrations > Extension Pack Integrations > {}",
                                     pack_name
+                                );
+                                let mut prompt = format!(
+                                    "{} is installed, but it still needs credentials before I can use it.\n\nUse the secure credential form below in this chat, or open {}. Never paste secrets, API keys, passwords, or sensitive data into normal chat.",
+                                    pack_name, settings_path
                                 );
                                 if !required_secrets.is_empty() {
                                     prompt.push_str("\n\nRequired values:");
@@ -11731,12 +11734,55 @@ impl Agent {
             }
         }
 
-        // If there's content plus tool results, combine them
-        if response.content.is_empty() {
-            Ok(results.join("\n"))
-        } else {
-            Ok(format!("{}\n\n{}", response.content, results.join("\n")))
+        // A model response that contains tool calls is not a final assistant
+        // answer. Any sibling content is pre-call narration or scratch text,
+        // so the user-facing result must come from the executed tools.
+        Ok(tool_call_results_response(results))
+    }
+}
+
+fn tool_call_results_response(results: Vec<String>) -> String {
+    results.join("\n")
+}
+
+fn durable_orchestration_action_result(
+    action_name: &str,
+    durable_object_label: &str,
+    handler_result: Option<String>,
+    is_structured_completion: impl Fn(&str) -> bool,
+) -> String {
+    match handler_result {
+        Some(result) if is_structured_completion(result.trim_start()) => result,
+        Some(result) => {
+            let detail = result.trim();
+            render_tool_completion_marker_with_data(
+                action_name,
+                "needs_input",
+                if detail.is_empty() {
+                    "The durable action handler did not return a committed durable result. No durable object was created."
+                } else {
+                    detail
+                },
+                serde_json::json!({
+                    "durable_commit": false,
+                    "durable_object": durable_object_label,
+                    "reason": "durable_handler_returned_non_commit_result",
+                }),
+            )
         }
+        None => render_tool_completion_marker_with_data(
+            action_name,
+            "failed",
+            &format!(
+                "{} runtime validation passed, but AgentArk did not return a durable commit result. No durable object was created.",
+                durable_object_label
+            ),
+            serde_json::json!({
+                "durable_commit": false,
+                "durable_object": durable_object_label,
+                "reason": "missing_durable_handler_commit",
+            }),
+        ),
     }
 }
 
@@ -11752,6 +11798,76 @@ mod tests {
             name: name.to_string(),
             arguments,
         }
+    }
+
+    #[test]
+    fn tool_call_results_response_omits_pre_call_model_content() {
+        let response = tool_call_results_response(vec!["structured tool result".to_string()]);
+
+        assert_eq!(response, "structured tool result");
+        assert!(!response.contains("Let me"));
+    }
+
+    #[test]
+    fn durable_orchestration_result_fails_when_handler_does_not_commit() {
+        let result = durable_orchestration_action_result("watch", "Watcher", None, |value| {
+            crate::runtime::parse_watch_completion(value).is_some()
+        });
+        let completion =
+            crate::runtime::parse_watch_completion(&result).expect("watch marker should parse");
+
+        assert_eq!(completion.status, "failed");
+        assert!(
+            completion
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No durable object was created")
+        );
+        assert_eq!(
+            super::super::agent_loop::tool_result_completion_success(&result),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn durable_orchestration_plain_handler_message_is_not_success() {
+        let result = durable_orchestration_action_result(
+            "schedule_task",
+            "Scheduled task",
+            Some("Need a schedule before I can create this task.".to_string()),
+            |value| crate::runtime::parse_schedule_task_completion(value).is_some(),
+        );
+        let completion = crate::runtime::parse_schedule_task_completion(&result)
+            .expect("schedule marker should parse");
+
+        assert_eq!(completion.status, "needs_input");
+        assert_eq!(
+            super::super::agent_loop::tool_result_completion_success(&result),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn durable_orchestration_structured_commit_result_is_preserved() {
+        let committed = render_tool_completion_marker_with_data(
+            "watch",
+            "completed",
+            "Watcher created.",
+            json!({"watcher_id": "w1"}),
+        );
+        let result = durable_orchestration_action_result(
+            "watch",
+            "Watcher",
+            Some(committed.clone()),
+            |value| crate::runtime::parse_watch_completion(value).is_some(),
+        );
+
+        assert_eq!(result, committed);
+        assert_eq!(
+            super::super::agent_loop::tool_result_completion_success(&result),
+            Some(true)
+        );
     }
 
     fn safety_engine_with_require_approval_rule(
@@ -12131,13 +12247,11 @@ mod tests {
             capability_context_id: None,
         };
 
-        assert!(Agent::legacy_tool_call_allowed_by_safety(
-            &safety,
-            &deploy_call,
-            Some(&direct_chat)
-        )
-        .await
-        .expect("legacy safety check should succeed"));
+        assert!(
+            Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, Some(&direct_chat))
+                .await
+                .expect("legacy safety check should succeed")
+        );
         assert!(
             !Agent::legacy_tool_call_allowed_by_safety(&safety, &deploy_call, None)
                 .await
@@ -12183,13 +12297,15 @@ mod tests {
             capability_context_id: None,
         };
 
-        assert!(Agent::legacy_tool_call_allowed_by_safety(
-            &safety,
-            &file_write_call,
-            Some(&direct_chat),
-        )
-        .await
-        .expect("legacy safety check should succeed"));
+        assert!(
+            Agent::legacy_tool_call_allowed_by_safety(
+                &safety,
+                &file_write_call,
+                Some(&direct_chat),
+            )
+            .await
+            .expect("legacy safety check should succeed")
+        );
         assert!(
             !Agent::legacy_tool_call_allowed_by_safety(&safety, &file_write_call, None)
                 .await
@@ -12251,9 +12367,11 @@ mod tests {
             "   ",
         );
 
-        assert!(result
-            .expect_err("empty body should fail")
-            .contains("empty body"));
+        assert!(
+            result
+                .expect_err("empty body should fail")
+                .contains("empty body")
+        );
     }
 
     #[test]
@@ -12265,9 +12383,11 @@ mod tests {
             r#"{"ok":true}"#,
         );
 
-        assert!(result
-            .expect_err("static app should return html")
-            .contains("did not receive HTML"));
+        assert!(
+            result
+                .expect_err("static app should return html")
+                .contains("did not receive HTML")
+        );
     }
 
     #[test]
@@ -12279,9 +12399,11 @@ mod tests {
             "<html><body><script>const x = 1;</body></html>",
         );
 
-        assert!(result
-            .expect_err("unclosed script should fail")
-            .contains("unclosed <script>"));
+        assert!(
+            result
+                .expect_err("unclosed script should fail")
+                .contains("unclosed <script>")
+        );
     }
 
     #[test]

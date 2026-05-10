@@ -263,11 +263,34 @@ type BulkImportDiscoveredSkill = {
   error?: string;
 };
 
+type SkillMarketplaceForm = {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+};
+
+type SkillMarketplaceInstallerRow = JsonRecord & {
+  marketplace_id: string;
+  marketplace_name: string;
+  marketplace_enabled: boolean;
+  _key: string;
+};
+
+const EMPTY_SKILL_MARKETPLACE_FORM: SkillMarketplaceForm = {
+  id: "",
+  name: "",
+  url: "",
+  enabled: true,
+};
+
 function BulkImportDialog({
   open,
   onClose,
   onImported,
   onAfterImport,
+  initialUrls = [],
+  sourceLabel,
 }: {
   open: boolean;
   onClose: () => void;
@@ -276,6 +299,8 @@ function BulkImportDialog({
     name: string,
     importResult: SkillImportResponse,
   ) => Promise<void>;
+  initialUrls?: string[];
+  sourceLabel?: string;
 }) {
   const [urlsText, setUrlsText] = useState("");
   const [items, setItems] = useState<BulkImportItem[]>([]);
@@ -308,6 +333,14 @@ function BulkImportDialog({
     }
     return uniq;
   };
+
+  const buildItemsFromUrls = (urls: string[]): BulkImportItem[] =>
+    urls.map((url) => ({
+      url,
+      selected: true,
+      analyzed: false,
+      discovered: [],
+    }));
 
   const requiresForceForResult = (
     result: SkillImportResponse | undefined,
@@ -366,13 +399,8 @@ function BulkImportDialog({
     ];
   };
 
-  const buildItemsFromText = (): BulkImportItem[] =>
-    parseUrlsFromText(urlsText).map((url) => ({
-      url,
-      selected: true,
-      analyzed: false,
-      discovered: [],
-    }));
+  const buildItemsFromText = (text = urlsText): BulkImportItem[] =>
+    buildItemsFromUrls(parseUrlsFromText(text));
 
   const selectedDiscoveredSkills: BulkImportDiscoveredSkill[] = items.flatMap(
     (item) =>
@@ -383,6 +411,11 @@ function BulkImportDialog({
     requiresForceForResult(skill.preview),
   ).length;
 
+  const initialUrlsKey = useMemo(
+    () => initialUrls.map((url) => url.trim()).filter(Boolean).join("\n"),
+    [initialUrls],
+  );
+
   useEffect(() => {
     if (!open) {
       setError(null);
@@ -391,15 +424,15 @@ function BulkImportDialog({
       setAnalysisDone(false);
       return;
     }
-    setUrlsText("");
-    setItems([]);
+    setUrlsText(initialUrlsKey);
+    setItems(initialUrlsKey ? buildItemsFromText(initialUrlsKey) : []);
     setAnalyzing(false);
     setImporting(false);
     setAnalysisDone(false);
     setError(null);
     setForce(false);
     setModel("");
-  }, [open]);
+  }, [open, initialUrlsKey]);
 
   const updateDiscoveredSkill = (
     parentUrl: string,
@@ -695,8 +728,9 @@ function BulkImportDialog({
               color: "text.secondary",
             }}
           >
-            Paste one or more skill URLs (one per line). Then run Analyze to
-            review discovered skills and security before any import.
+            {sourceLabel
+              ? `Reviewing installer URLs from ${sourceLabel}. Run Analyze to review discovered skills and security before any import.`
+              : "Paste one or more skill URLs (one per line). Then run Analyze to review discovered skills and security before any import."}
           </Typography>
           <Alert
             severity="info"
@@ -2402,6 +2436,20 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
   } | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkInitialUrls, setBulkInitialUrls] = useState<string[]>([]);
+  const [bulkSourceLabel, setBulkSourceLabel] = useState<string | undefined>(
+    undefined,
+  );
+  const [marketplaceDialogOpen, setMarketplaceDialogOpen] = useState(false);
+  const [marketplaceEditingId, setMarketplaceEditingId] = useState<
+    string | null
+  >(null);
+  const [marketplaceForm, setMarketplaceForm] =
+    useState<SkillMarketplaceForm>(EMPTY_SKILL_MARKETPLACE_FORM);
+  const [marketplaceError, setMarketplaceError] = useState<string | null>(null);
+  const [marketplaceSearch, setMarketplaceSearch] = useState("");
+  const [selectedMarketplaceInstallerKeys, setSelectedMarketplaceInstallerKeys] =
+    useState<string[]>([]);
   const [editOpen, setEditOpen] = useState(false);
   const [editTargetName, setEditTargetName] = useState<string | null>(null);
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(
@@ -2465,6 +2513,11 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
     queryFn: () => api.rawGet("/skills"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
+  const marketplacesQ = useQuery({
+    queryKey: ["skills-marketplaces"],
+    queryFn: () => api.rawGet("/skills/marketplaces"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
   const hooksQ = useQuery({
     queryKey: ["skills-hooks"],
     queryFn: () => api.rawGet("/hooks"),
@@ -2476,6 +2529,10 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const skills = dedupeSkillRecords(pickRecords(skillsQ.data, "skills"));
+  const marketplaces = useMemo(
+    () => asRecords(asRecord(marketplacesQ.data).marketplaces),
+    [marketplacesQ.data],
+  );
   const hooks = asRecords(hooksQ.data);
   const hookRuns = asRecords(hookRunsQ.data);
   const activeTestName =
@@ -2522,6 +2579,176 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
   };
   const afterImport = async () => {
     await queryClient.invalidateQueries({ queryKey: ["skills-manager"] });
+  };
+
+  const marketplaceInstallers = useMemo<SkillMarketplaceInstallerRow[]>(() => {
+    return marketplaces.flatMap((marketplace) => {
+      const marketplaceId = str(marketplace.id, "").trim();
+      const marketplaceName = str(marketplace.name, marketplaceId).trim();
+      return asRecords(marketplace.installers).map((installer, idx) => {
+        const installUrl = str(installer.install_url, "").trim();
+        const installerId = str(installer.id, "").trim() || `installer-${idx}`;
+        return {
+          ...installer,
+          marketplace_id: marketplaceId,
+          marketplace_name: marketplaceName,
+          marketplace_enabled: marketplace.enabled !== false,
+          _key: `${marketplaceId}::${installerId}::${installUrl}`,
+        } as SkillMarketplaceInstallerRow;
+      });
+    });
+  }, [marketplaces]);
+  const marketplaceInstallerKeySet = useMemo(
+    () => new Set(selectedMarketplaceInstallerKeys),
+    [selectedMarketplaceInstallerKeys],
+  );
+  const filteredMarketplaceInstallers = useMemo(() => {
+    const query = marketplaceSearch.trim().toLowerCase();
+    if (!query) return marketplaceInstallers;
+    return marketplaceInstallers.filter((installer) => {
+      const haystack = [
+        str(installer.name),
+        str(installer.description),
+        str(installer.category),
+        str(installer.marketplace_name),
+        str(installer.install_url),
+      ]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [marketplaceInstallers, marketplaceSearch]);
+  const selectedMarketplaceInstallerUrls = marketplaceInstallers
+    .filter(
+      (installer) =>
+        installer.marketplace_enabled !== false &&
+        marketplaceInstallerKeySet.has(str(installer._key)),
+    )
+    .map((installer) => str(installer.install_url, "").trim())
+    .filter(Boolean);
+
+  useEffect(() => {
+    const availableKeys = new Set(
+      marketplaceInstallers
+        .filter(
+          (installer) =>
+            installer.marketplace_enabled !== false &&
+            str(installer.install_url, "").trim(),
+        )
+        .map((installer) => str(installer._key, "")),
+    );
+    setSelectedMarketplaceInstallerKeys((prev) =>
+      {
+        const next = prev.filter((key) => availableKeys.has(key));
+        if (
+          next.length === prev.length &&
+          next.every((key, idx) => key === prev[idx])
+        ) {
+          return prev;
+        }
+        return next;
+      },
+    );
+  }, [marketplaceInstallers]);
+
+  const openBulkImportWithUrls = (urls: string[], label?: string) => {
+    const uniqueUrls = dedupeStrings(
+      urls.map((url) => url.trim()).filter(Boolean),
+    );
+    if (!uniqueUrls.length) {
+      setLastImport({
+        result: {
+          status: "error",
+          name: "marketplace",
+          message: "No installable marketplace URLs selected.",
+        },
+        message: "No installable marketplace URLs selected.",
+      });
+      return;
+    }
+    setBulkInitialUrls(uniqueUrls);
+    setBulkSourceLabel(label);
+    setBulkOpen(true);
+  };
+
+  const openMarketplaceDialog = (marketplace?: JsonRecord) => {
+    setMarketplaceError(null);
+    if (marketplace) {
+      setMarketplaceEditingId(str(marketplace.id, "").trim());
+      setMarketplaceForm({
+        id: str(marketplace.id, ""),
+        name: str(marketplace.name, ""),
+        url: str(marketplace.url, ""),
+        enabled: marketplace.enabled !== false,
+      });
+    } else {
+      setMarketplaceEditingId(null);
+      setMarketplaceForm(EMPTY_SKILL_MARKETPLACE_FORM);
+    }
+    setMarketplaceDialogOpen(true);
+  };
+
+  const closeMarketplaceDialog = () => {
+    setMarketplaceDialogOpen(false);
+    setMarketplaceEditingId(null);
+    setMarketplaceForm(EMPTY_SKILL_MARKETPLACE_FORM);
+    setMarketplaceError(null);
+  };
+
+  const createMarketplaceMutation = useMutation({
+    mutationFn: (payload: SkillMarketplaceForm) =>
+      api.rawPost("/skills/marketplaces", payload),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["skills-marketplaces"] });
+    },
+  });
+  const updateMarketplaceMutation = useMutation({
+    mutationFn: (payload: SkillMarketplaceForm) =>
+      api.rawPut(
+        `/skills/marketplaces/${encodeURIComponent(marketplaceEditingId || payload.id)}`,
+        payload,
+      ),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["skills-marketplaces"] });
+    },
+  });
+  const deleteMarketplaceMutation = useMutation({
+    mutationFn: (id: string) =>
+      api.rawDelete(`/skills/marketplaces/${encodeURIComponent(id)}`),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["skills-marketplaces"] });
+    },
+  });
+  const refreshMarketplaceMutation = useMutation({
+    mutationFn: (id: string) =>
+      api.rawPost(`/skills/marketplaces/${encodeURIComponent(id)}/refresh`, {}),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["skills-marketplaces"] });
+    },
+  });
+
+  const saveMarketplace = async () => {
+    setMarketplaceError(null);
+    const payload = {
+      ...marketplaceForm,
+      id: marketplaceForm.id.trim(),
+      name: marketplaceForm.name.trim(),
+      url: marketplaceForm.url.trim(),
+    };
+    if (!payload.url) {
+      setMarketplaceError("Marketplace URL is required.");
+      return;
+    }
+    try {
+      if (marketplaceEditingId) {
+        await updateMarketplaceMutation.mutateAsync(payload);
+      } else {
+        await createMarketplaceMutation.mutateAsync(payload);
+      }
+      closeMarketplaceDialog();
+    } catch (err) {
+      setMarketplaceError(errMessage(err));
+    }
   };
 
   const setEnabledMutation = useMutation({
@@ -3496,7 +3723,19 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
                 size="small"
                 variant="contained"
                 sx={WORKSPACE_HEADER_PRIMARY_BUTTON_SX}
-                onClick={() => setBulkOpen(true)}
+                onClick={() => openMarketplaceDialog()}
+              >
+                Add Marketplace
+              </Button>
+              <Button
+                size="small"
+                variant="contained"
+                sx={WORKSPACE_HEADER_PRIMARY_BUTTON_SX}
+                onClick={() => {
+                  setBulkInitialUrls([]);
+                  setBulkSourceLabel(undefined);
+                  setBulkOpen(true);
+                }}
               >
                 Bulk Import
               </Button>
@@ -3589,6 +3828,309 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
       </Box>
       {skillsTab === "manage" ? (
         <>
+          <Box className="list-shell">
+            <Stack spacing={1.25}>
+              <Stack
+                direction={{ xs: "column", md: "row" }}
+                spacing={1}
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "stretch", md: "center" },
+                }}
+              >
+                <Stack spacing={0.25}>
+                  <Typography variant="h6">Marketplaces</Typography>
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: "text.secondary",
+                    }}
+                  >
+                    Add marketplace catalogs, refresh installers, then review
+                    selected installers through security analysis before import.
+                  </Typography>
+                </Stack>
+                <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap" }}>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    onClick={() => openMarketplaceDialog()}
+                  >
+                    Add
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="contained"
+                    disabled={selectedMarketplaceInstallerUrls.length === 0}
+                    onClick={() =>
+                      openBulkImportWithUrls(
+                        selectedMarketplaceInstallerUrls,
+                        "marketplace selection",
+                      )
+                    }
+                  >
+                    Review Selected ({selectedMarketplaceInstallerUrls.length})
+                  </Button>
+                </Stack>
+              </Stack>
+              {marketplacesQ.error ? (
+                <Alert severity="error">{errMessage(marketplacesQ.error)}</Alert>
+              ) : marketplaces.length === 0 ? (
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: "text.secondary",
+                  }}
+                >
+                  No marketplaces configured.
+                </Typography>
+              ) : (
+                <TableContainer className="table-shell">
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Marketplace</TableCell>
+                        <TableCell>Source</TableCell>
+                        <TableCell>Installers</TableCell>
+                        <TableCell>Status</TableCell>
+                        <TableCell align="right">Ops</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {marketplaces.map((marketplace) => {
+                        const id = str(marketplace.id, "");
+                        const lastError = str(marketplace.last_error, "");
+                        return (
+                          <TableRow key={id}>
+                            <TableCell sx={{ maxWidth: 220 }}>
+                              <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                                {str(marketplace.name, id)}
+                              </Typography>
+                              <Typography
+                                variant="caption"
+                                sx={{
+                                  color: "text.secondary",
+                                }}
+                              >
+                                {marketplace.enabled === false
+                                  ? "Disabled"
+                                  : "Enabled"}
+                              </Typography>
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 360 }}>
+                              <Typography
+                                variant="caption"
+                                noWrap
+                                title={str(marketplace.url, "")}
+                                sx={{
+                                  color: "text.secondary",
+                                  display: "block",
+                                }}
+                              >
+                                {str(marketplace.url, "-")}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              {asRecords(marketplace.installers).length}
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 260 }}>
+                              {lastError ? (
+                                <Typography
+                                  variant="caption"
+                                  color="error"
+                                  title={lastError}
+                                  noWrap
+                                  sx={{ display: "block" }}
+                                >
+                                  {lastError}
+                                </Typography>
+                              ) : (
+                                <Typography
+                                  variant="caption"
+                                  sx={{
+                                    color: "text.secondary",
+                                  }}
+                                >
+                                  Synced{" "}
+                                  {str(marketplace.last_synced_at, "never")}
+                                </Typography>
+                              )}
+                            </TableCell>
+                            <TableCell align="right">
+                              <RowOpsMenu
+                                actions={[
+                                  {
+                                    label: "Refresh",
+                                    disabled: refreshMarketplaceMutation.isPending,
+                                    onClick: async () => {
+                                      try {
+                                        await refreshMarketplaceMutation.mutateAsync(id);
+                                      } catch (err) {
+                                        setLastImport({
+                                          result: {
+                                            status: "error",
+                                            name: str(marketplace.name, id),
+                                            message: errMessage(err),
+                                          },
+                                          message: `Failed to refresh marketplace '${str(marketplace.name, id)}': ${errMessage(err)}`,
+                                        });
+                                      }
+                                    },
+                                  },
+                                  {
+                                    label: "Edit",
+                                    onClick: () => openMarketplaceDialog(marketplace),
+                                  },
+                                  {
+                                    label: "Delete",
+                                    tone: "error",
+                                    disabled: deleteMarketplaceMutation.isPending,
+                                    onClick: async () => {
+                                      const ok = window.confirm(
+                                        `Delete marketplace "${str(marketplace.name, id)}"?`,
+                                      );
+                                      if (!ok) return;
+                                      try {
+                                        await deleteMarketplaceMutation.mutateAsync(id);
+                                      } catch (err) {
+                                        setLastImport({
+                                          result: {
+                                            status: "error",
+                                            name: str(marketplace.name, id),
+                                            message: errMessage(err),
+                                          },
+                                          message: `Failed to delete marketplace '${str(marketplace.name, id)}': ${errMessage(err)}`,
+                                        });
+                                      }
+                                    },
+                                  },
+                                ]}
+                                ariaLabel="Marketplace options"
+                              />
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              )}
+              {marketplaceInstallers.length > 0 ? (
+                <Stack spacing={1}>
+                  <TextField
+                    size="small"
+                    placeholder="Search marketplace installers..."
+                    value={marketplaceSearch}
+                    onChange={(event) => setMarketplaceSearch(event.target.value)}
+                    slotProps={{ input: { sx: { fontSize: "0.85rem" } } }}
+                  />
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell padding="checkbox">Pull</TableCell>
+                          <TableCell>Installer</TableCell>
+                          <TableCell>Marketplace</TableCell>
+                          <TableCell>Category</TableCell>
+                          <TableCell>Source</TableCell>
+                          <TableCell align="right">Review</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {filteredMarketplaceInstallers.map((installer) => {
+                          const key = str(installer._key, "");
+                          const installUrl = str(installer.install_url, "").trim();
+                          const marketplaceEnabled =
+                            installer.marketplace_enabled !== false;
+                          const checked = marketplaceInstallerKeySet.has(key);
+                          return (
+                            <TableRow key={key}>
+                              <TableCell padding="checkbox">
+                                <Checkbox
+                                  size="small"
+                                  checked={checked}
+                                  disabled={!installUrl || !marketplaceEnabled}
+                                  onChange={(event) => {
+                                    const nextChecked = event.target.checked;
+                                    setSelectedMarketplaceInstallerKeys((prev) => {
+                                      const set = new Set(prev);
+                                      if (nextChecked) set.add(key);
+                                      else set.delete(key);
+                                      return Array.from(set);
+                                    });
+                                  }}
+                                />
+                              </TableCell>
+                              <TableCell sx={{ maxWidth: 280 }}>
+                                <Typography
+                                  variant="body2"
+                                  sx={{ fontWeight: 700 }}
+                                >
+                                  {str(installer.name, "-")}
+                                </Typography>
+                                {str(installer.description, "") ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "block",
+                                    }}
+                                  >
+                                    {str(installer.description, "")}
+                                  </Typography>
+                                ) : null}
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="caption">
+                                  {str(installer.marketplace_name, "-")}
+                                </Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="caption">
+                                  {str(installer.category, "-")}
+                                </Typography>
+                              </TableCell>
+                              <TableCell sx={{ maxWidth: 360 }}>
+                                <Typography
+                                  variant="caption"
+                                  noWrap
+                                  title={installUrl || str(installer.source_url, "")}
+                                  sx={{
+                                    color: installUrl
+                                      ? "text.secondary"
+                                      : "warning.main",
+                                    display: "block",
+                                  }}
+                                >
+                                  {installUrl || "No supported install URL"}
+                                </Typography>
+                              </TableCell>
+                              <TableCell align="right">
+                                <Button
+                                  size="small"
+                                  variant="outlined"
+                                  disabled={!installUrl || !marketplaceEnabled}
+                                  onClick={() =>
+                                    openBulkImportWithUrls(
+                                      [installUrl],
+                                      str(installer.name, "marketplace installer"),
+                                    )
+                                  }
+                                >
+                                  Review
+                                </Button>
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                </Stack>
+              ) : null}
+            </Stack>
+          </Box>
+
           {customSkills.length > 0 ? (
             <Box className="list-shell">
               <Stack spacing={1}>
@@ -3781,6 +4323,99 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
           </Stack>
         </Box>
       )}
+      <Dialog
+        open={marketplaceDialogOpen}
+        onClose={closeMarketplaceDialog}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          {marketplaceEditingId ? "Edit Marketplace" : "Add Marketplace"}
+        </DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.25}>
+            {marketplaceError ? (
+              <Alert severity="error">{marketplaceError}</Alert>
+            ) : null}
+            <Alert severity="info" variant="outlined">
+              Marketplaces only provide installer metadata. Selected installers
+              still run through the normal skill security review before import.
+            </Alert>
+            {!marketplaceEditingId ? (
+              <TextField
+                fullWidth
+                size="small"
+                label="Marketplace ID (optional)"
+                value={marketplaceForm.id}
+                onChange={(event) =>
+                  setMarketplaceForm((current) => ({
+                    ...current,
+                    id: event.target.value,
+                  }))
+                }
+                helperText="Leave blank to derive it from the name."
+              />
+            ) : null}
+            <TextField
+              fullWidth
+              size="small"
+              label="Name"
+              value={marketplaceForm.name}
+              onChange={(event) =>
+                setMarketplaceForm((current) => ({
+                  ...current,
+                  name: event.target.value,
+                }))
+              }
+              placeholder="Example Skills Marketplace"
+            />
+            <TextField
+              fullWidth
+              size="small"
+              label="Marketplace JSON URL"
+              value={marketplaceForm.url}
+              onChange={(event) =>
+                setMarketplaceForm((current) => ({
+                  ...current,
+                  url: event.target.value,
+                }))
+              }
+              placeholder="https://raw.githubusercontent.com/org/repo/main/marketplace.json"
+            />
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={marketplaceForm.enabled}
+                  onChange={(event) =>
+                    setMarketplaceForm((current) => ({
+                      ...current,
+                      enabled: event.target.checked,
+                    }))
+                  }
+                />
+              }
+              label="Enabled"
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={closeMarketplaceDialog}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={
+              createMarketplaceMutation.isPending ||
+              updateMarketplaceMutation.isPending ||
+              !marketplaceForm.url.trim()
+            }
+            onClick={saveMarketplace}
+          >
+            {createMarketplaceMutation.isPending ||
+            updateMarketplaceMutation.isPending
+              ? "Saving..."
+              : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
       <ImportUrlDialog
         open={importOpen}
         onClose={() => setImportOpen(false)}
@@ -3789,9 +4424,15 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
       />
       <BulkImportDialog
         open={bulkOpen}
-        onClose={() => setBulkOpen(false)}
+        onClose={() => {
+          setBulkOpen(false);
+          setBulkInitialUrls([]);
+          setBulkSourceLabel(undefined);
+        }}
         onImported={handleImported}
         onAfterImport={afterImport}
+        initialUrls={bulkInitialUrls}
+        sourceLabel={bulkSourceLabel}
       />
       <Dialog
         open={aiCreateOpen}

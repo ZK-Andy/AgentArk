@@ -529,7 +529,7 @@ impl Agent {
     ) -> PackedConversationContext {
         let mut packed = PackedConversationContext::default();
 
-        let all_messages = match self
+        let mut all_messages = match self
             .encrypted_storage
             .get_recent_messages_decrypted(conversation_id, CONTEXT_FETCH_LIMIT)
             .await
@@ -544,10 +544,26 @@ impl Agent {
                 return packed;
             }
         };
+        let omitted_current_turn_message = if let Some(last) = all_messages.last() {
+            if last.role == "user" && last.content.trim() == user_message.trim() {
+                all_messages.pop();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         packed.total_loaded = self
             .load_conversation_message_count(conversation_id)
             .await
             .max(all_messages.len());
+        if omitted_current_turn_message {
+            packed.total_loaded = packed
+                .total_loaded
+                .saturating_sub(1)
+                .max(all_messages.len());
+        }
 
         if all_messages.is_empty() {
             return packed;

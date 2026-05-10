@@ -244,9 +244,7 @@ impl Agent {
                 .join("\n")
         };
 
-        let preferred_direct_action =
-            crate::core::intent::preferred_direct_action_name(message, actions)
-                .unwrap_or_else(|| "none".to_string());
+        let preferred_direct_action = "none".to_string();
         let policy_hint_block = "Fallback routing is structure-first. Do not infer a delegated plan from keyword matches alone.";
 
         let routing_prompt = crate::core::self_evolve::prompt_evolution::render_router_user_prompt(
@@ -321,10 +319,9 @@ impl Agent {
     pub(crate) fn forced_swarm_specs(
         &self,
         message: &str,
-        actions: &[crate::actions::ActionDef],
+        _actions: &[crate::actions::ActionDef],
     ) -> Vec<crate::core::task_router::SubAgentSpec> {
-        let preferred_action = crate::core::intent::preferred_direct_action_name(message, actions)
-            .and_then(|name| actions.iter().find(|action| action.name == name));
+        let preferred_action: Option<&crate::actions::ActionDef> = None;
         let (primary_agent_type, primary_task, primary_role) = preferred_action
             .map(|action| {
                 let metadata = action.planner_metadata();

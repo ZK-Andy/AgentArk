@@ -593,7 +593,7 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
             meta.side_effect_level = PlannerSideEffectLevel::Notify;
             return meta;
         }
-        "watch" | "schedule_task" | "delegate" => {
+        "watch" | "schedule_task" | "delegate" | "watcher_delete" => {
             meta.role = PlannerActionRole::Orchestration;
             meta.integration_class = PlannerIntegrationClass::Internal;
             meta.cost = PlannerCostTier::Low;
@@ -772,6 +772,21 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
     if capabilities.contains("search") || capabilities.contains("research") {
         meta.role = PlannerActionRole::DataSource;
         meta.integration_class = PlannerIntegrationClass::Search;
+        return meta;
+    }
+
+    if capabilities.contains("custom_api") {
+        meta.role = if capabilities.contains("external_write") {
+            PlannerActionRole::Mutation
+        } else {
+            PlannerActionRole::DataSource
+        };
+        meta.requires_auth = action.authorization.requires_auth;
+        meta.integration_class = PlannerIntegrationClass::Network;
+        meta.cost = PlannerCostTier::Low;
+        if capabilities.contains("external_write") {
+            meta.side_effect_level = PlannerSideEffectLevel::Write;
+        }
         return meta;
     }
 
@@ -986,6 +1001,29 @@ mod tests {
             metadata.integration_class,
             PlannerIntegrationClass::Workspace
         );
+        assert!(metadata.requires_auth);
+    }
+
+    #[test]
+    fn planner_metadata_treats_custom_api_actions_as_saved_integrations() {
+        let action = ActionDef {
+            name: "api__project_tool__query".to_string(),
+            capabilities: vec![
+                "custom_api".to_string(),
+                "network".to_string(),
+                "external_write".to_string(),
+            ],
+            authorization: ActionAuthorization {
+                requires_auth: true,
+                ..ActionAuthorization::default()
+            },
+            ..ActionDef::default()
+        };
+
+        let metadata = planner_metadata_for_action(&action);
+        assert_eq!(metadata.role, PlannerActionRole::Mutation);
+        assert_eq!(metadata.integration_class, PlannerIntegrationClass::Network);
+        assert_eq!(metadata.side_effect_level, PlannerSideEffectLevel::Write);
         assert!(metadata.requires_auth);
     }
 

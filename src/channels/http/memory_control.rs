@@ -461,6 +461,69 @@ mod memory_control_tests {
             "semantic-source-key"
         );
     }
+
+    #[test]
+    fn stale_processing_recovery_is_not_a_failed_capture_health_status() {
+        assert!(!ARKMEMORY_FAILED_CAPTURE_STATUSES.contains(&"failed_stale_processing"));
+        assert!(!ARKMEMORY_FAILED_CAPTURE_STATUSES.contains(&"retired_stale_processing"));
+    }
+
+    fn memory_capture_event_with_status(
+        status: &str,
+    ) -> crate::storage::memory_capture_event::Model {
+        let now = "2026-05-03T00:00:00Z".to_string();
+        crate::storage::memory_capture_event::Model {
+            id: format!("memory-capture-{}", status),
+            source_message_id: Some("message-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
+            project_id: None,
+            channel: "chat".to_string(),
+            status: status.to_string(),
+            capture_kind: "user_fact_memory_capture".to_string(),
+            source_hash: "semantic-source-key".to_string(),
+            attempt_metadata: serde_json::json!({}),
+            error_history: serde_json::json!([]),
+            replay_count: 0,
+            next_retry_at: None,
+            completed_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn learned_review_context_redacts_source_text() {
+        let event = memory_capture_event_with_status("rejected_sensitive_input");
+        let context = arkmemory_capture_review_context_from_source_text(
+            &event,
+            "my OpenAI key is sk-abcdefghijklmnopqrstuvwxyz123456",
+        );
+
+        assert!(
+            context
+                .source_redactions
+                .iter()
+                .any(|value| value.contains("openai_key"))
+        );
+        assert!(
+            !context
+                .source_semantic_text
+                .contains("sk-abcdefghijklmnopqrstuvwxyz123456")
+        );
+    }
+
+    #[test]
+    fn learned_review_decision_parser_accepts_structured_json() {
+        let decision = arkmemory_parse_learned_review_decision(
+            r#"{"apply":true,"outcome":"expected_sensitive_skip","confidence":0.91,"matched_example_id":"capture-1","reason":"same reviewed credential-disclosure case"}"#,
+        )
+        .expect("decision should parse");
+
+        assert!(decision.apply);
+        assert_eq!(decision.outcome.as_deref(), Some("expected_sensitive_skip"));
+        assert_eq!(decision.matched_example_id.as_deref(), Some("capture-1"));
+        assert!(decision.confidence > 0.9);
+    }
 }
 
 async fn memory_fact_evidence_sources(
@@ -892,6 +955,12 @@ pub(super) const ARKMEMORY_REVIEWED_CAPTURE_STATUSES: &[&str] = &[
     "reviewed_sensitive_input",
 ];
 pub(super) const ARKMEMORY_APPLYING_LEASE_TIMEOUT_SECS: i64 = 10 * 60;
+const ARKMEMORY_LEARNED_REVIEW_FAILED_LIMIT: u64 = 50;
+const ARKMEMORY_LEARNED_REVIEW_EXAMPLE_LIMIT: u64 = 200;
+const ARKMEMORY_LEARNED_REVIEW_MAX_EXAMPLES: usize = 6;
+const ARKMEMORY_LEARNED_REVIEW_MIN_CONFIDENCE: f64 = 0.82;
+const ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS: u64 = 8;
+const ARKMEMORY_LEARNED_REVIEW_MAX_OUTPUT_TOKENS: u32 = 360;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ArkMemoryHealthReviewRequest {
@@ -904,6 +973,34 @@ struct ArkMemoryCaptureReviewPattern {
     expected_sensitive_skip_count: usize,
     false_positive_safe_memory_count: usize,
     acknowledged_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ArkMemoryCaptureReviewContext {
+    source_semantic_text: String,
+    source_redactions: Vec<String>,
+    status: String,
+    capture_kind: String,
+    channel: String,
+    last_error_code: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ArkMemoryLearnedReviewExample {
+    event_id: String,
+    outcome: &'static str,
+    reviewed_at: Option<String>,
+    failure_key: String,
+    context: ArkMemoryCaptureReviewContext,
+}
+
+#[derive(Clone, Debug)]
+struct ArkMemoryLearnedReviewDecision {
+    apply: bool,
+    outcome: Option<String>,
+    confidence: f64,
+    matched_example_id: Option<String>,
+    reason: String,
 }
 
 pub(super) fn arkmemory_project_param(params: &HashMap<String, String>) -> Option<&str> {
@@ -929,7 +1026,20 @@ fn arkmemory_capture_event_reviewed_status(
     if outcome == "false_positive_safe_memory" {
         return "reviewed_false_positive_capture";
     }
-    let status = event.status.trim();
+    let status = event
+        .attempt_metadata
+        .get("user_review")
+        .and_then(|value| value.get("failure_signature"))
+        .and_then(|value| value.get("status"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            event
+                .attempt_metadata
+                .get("previous_status")
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_else(|| event.status.as_str())
+        .trim();
     if status == "rejected_sensitive_input" {
         "reviewed_sensitive_input"
     } else {
@@ -972,6 +1082,196 @@ fn arkmemory_capture_event_error_summary(
     (code, detail)
 }
 
+fn arkmemory_known_capture_review_outcome(raw: &str) -> Option<&'static str> {
+    match raw.trim() {
+        "expected_sensitive_skip" => Some("expected_sensitive_skip"),
+        "false_positive_safe_memory" => Some("false_positive_safe_memory"),
+        "acknowledged" => Some("acknowledged"),
+        _ => None,
+    }
+}
+
+fn arkmemory_capture_review_context_from_source_text(
+    event: &crate::storage::memory_capture_event::Model,
+    source_text: &str,
+) -> ArkMemoryCaptureReviewContext {
+    let redacted = crate::security::redact_secret_input(source_text);
+    let (last_error_code, _) = arkmemory_capture_event_error_summary(event);
+    ArkMemoryCaptureReviewContext {
+        source_semantic_text: arkmemory_truncate_chars(&redacted.text, 700),
+        source_redactions: redacted.redactions,
+        status: event.status.trim().to_string(),
+        capture_kind: event.capture_kind.trim().to_string(),
+        channel: event.channel.trim().to_string(),
+        last_error_code,
+    }
+}
+
+fn arkmemory_capture_review_context_from_metadata(
+    event: &crate::storage::memory_capture_event::Model,
+) -> Option<ArkMemoryCaptureReviewContext> {
+    let review_context = event
+        .attempt_metadata
+        .get("user_review")
+        .and_then(|value| value.get("review_context"))?;
+    let source_semantic_text = review_context
+        .get("source_semantic_text")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let source_redactions = review_context
+        .get("source_redactions")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(ArkMemoryCaptureReviewContext {
+        source_semantic_text,
+        source_redactions,
+        status: review_context
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| event.status.as_str())
+            .trim()
+            .to_string(),
+        capture_kind: review_context
+            .get("capture_kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| event.capture_kind.as_str())
+            .trim()
+            .to_string(),
+        channel: review_context
+            .get("channel")
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| event.channel.as_str())
+            .trim()
+            .to_string(),
+        last_error_code: review_context
+            .get("last_error_code")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    })
+}
+
+async fn arkmemory_capture_review_context(
+    storage: &crate::storage::Storage,
+    event: &crate::storage::memory_capture_event::Model,
+) -> Option<ArkMemoryCaptureReviewContext> {
+    if let Some(context) = arkmemory_capture_review_context_from_metadata(event) {
+        return Some(context);
+    }
+    let source_text = match event.source_message_id.as_deref() {
+        Some(message_id) if !message_id.trim().is_empty() => storage
+            .get_message(message_id.trim())
+            .await
+            .ok()
+            .flatten()
+            .map(|message| message.content),
+        _ => None,
+    }
+    .or_else(|| {
+        event
+            .attempt_metadata
+            .get("user_message_for_link_capture")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    })?;
+
+    Some(arkmemory_capture_review_context_from_source_text(
+        event,
+        &source_text,
+    ))
+}
+
+fn arkmemory_capture_review_context_json(
+    context: &ArkMemoryCaptureReviewContext,
+) -> serde_json::Value {
+    serde_json::json!({
+        "source_semantic_text": context.source_semantic_text.clone(),
+        "source_redactions": context.source_redactions.clone(),
+        "status": context.status.clone(),
+        "capture_kind": context.capture_kind.clone(),
+        "channel": context.channel.clone(),
+        "last_error_code": context.last_error_code.clone(),
+    })
+}
+
+fn arkmemory_capture_review_context_embedding_text(
+    context: &ArkMemoryCaptureReviewContext,
+) -> String {
+    format!(
+        "source: {}\nredactions: {}\nstatus: {}\ncapture_kind: {}\nchannel: {}\nerror: {}",
+        context.source_semantic_text,
+        context.source_redactions.join(", "),
+        context.status,
+        context.capture_kind,
+        context.channel,
+        context.last_error_code.as_deref().unwrap_or("")
+    )
+}
+
+fn arkmemory_extract_json_object(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()
+}
+
+fn arkmemory_parse_learned_review_decision(text: &str) -> Option<ArkMemoryLearnedReviewDecision> {
+    let json = arkmemory_extract_json_object(text)?;
+    Some(ArkMemoryLearnedReviewDecision {
+        apply: json
+            .get("apply")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        outcome: json
+            .get("outcome")
+            .and_then(|value| value.as_str())
+            .and_then(arkmemory_known_capture_review_outcome)
+            .map(str::to_string),
+        confidence: json
+            .get("confidence")
+            .and_then(|value| {
+                value.as_f64().or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|raw| raw.trim().parse::<f64>().ok())
+                })
+            })
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0),
+        matched_example_id: json
+            .get("matched_example_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "null")
+            .map(str::to_string),
+        reason: json
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(|value| {
+                arkmemory_truncate_chars(&crate::security::redact_secret_input(value).text, 300)
+            })
+            .unwrap_or_default(),
+    })
+}
+
 fn arkmemory_capture_event_semantic_key(
     event: &crate::storage::memory_capture_event::Model,
 ) -> String {
@@ -992,9 +1292,7 @@ fn arkmemory_capture_event_semantic_key(
         })
 }
 
-fn arkmemory_capture_event_timestamp(
-    raw: &str,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+fn arkmemory_capture_event_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(raw.trim())
         .ok()
         .map(|value| value.with_timezone(&chrono::Utc))
@@ -1103,8 +1401,7 @@ async fn arkmemory_pending_capture_signal_payloads(
     }
     let mut payloads = Vec::with_capacity(grouped.len());
     for (semantic_key, events) in grouped {
-        payloads
-            .push(arkmemory_pending_capture_group_payload(storage, semantic_key, events).await);
+        payloads.push(arkmemory_pending_capture_group_payload(storage, semantic_key, events).await);
     }
     payloads.sort_by(|left, right| {
         let left_updated = left
@@ -1161,6 +1458,18 @@ fn arkmemory_capture_failure_signature(
         "channel": event.channel.trim(),
         "last_error_code": last_error_code,
     })
+}
+
+fn arkmemory_capture_review_failure_signature(
+    event: &crate::storage::memory_capture_event::Model,
+) -> serde_json::Value {
+    event
+        .attempt_metadata
+        .get("user_review")
+        .and_then(|value| value.get("failure_signature"))
+        .cloned()
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| arkmemory_capture_failure_signature(event))
 }
 
 fn arkmemory_capture_failure_signature_key(
@@ -1327,6 +1636,41 @@ async fn arkmemory_capture_source_context(
     })
 }
 
+fn arkmemory_json_evidence_ref_value(
+    evidence_refs: &serde_json::Value,
+    prefix: &str,
+) -> Option<String> {
+    evidence_refs.as_array().and_then(|items| {
+        items.iter().find_map(|item| {
+            item.as_str()
+                .and_then(|value| value.trim().strip_prefix(prefix))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+fn arkmemory_memory_operation_source_context(
+    operation: &crate::storage::memory_operation::Model,
+) -> serde_json::Value {
+    let capture_event_id = operation
+        .capture_event_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| arkmemory_json_evidence_ref_value(&operation.evidence_refs, "capture_event:"));
+    let source_message_id = arkmemory_json_evidence_ref_value(&operation.evidence_refs, "message:");
+    let channel = arkmemory_json_evidence_ref_value(&operation.evidence_refs, "channel:");
+    serde_json::json!({
+        "conversation_id": operation.conversation_id.clone(),
+        "conversation_channel": channel.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "capture_event_id": capture_event_id,
+        "source_message_id": source_message_id,
+    })
+}
+
 fn arkmemory_capture_event_finding(
     event: crate::storage::memory_capture_event::Model,
     review_pattern: Option<&ArkMemoryCaptureReviewPattern>,
@@ -1362,6 +1706,87 @@ fn arkmemory_capture_event_finding(
         "title": title,
         "detail": detail,
         "action": "review_capture_pipeline",
+        "created_at": event.updated_at,
+    })
+}
+
+fn arkmemory_capture_event_learned_review_finding(
+    event: crate::storage::memory_capture_event::Model,
+    source_context: serde_json::Value,
+) -> serde_json::Value {
+    let capture_event_id = event.id.clone();
+    let learned_review = event
+        .attempt_metadata
+        .get("learned_review")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let review = event
+        .attempt_metadata
+        .get("user_review")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let outcome = review
+        .get("outcome")
+        .and_then(|value| value.as_str())
+        .unwrap_or("acknowledged")
+        .to_string();
+    let title = match outcome.as_str() {
+        "expected_sensitive_skip" => "Memory capture auto-marked as correct secret-like skip",
+        "false_positive_safe_memory" => "Memory capture auto-marked as false positive",
+        _ => "Memory capture auto-marked reviewed",
+    };
+    let confidence = learned_review
+        .get("confidence")
+        .and_then(|value| value.as_f64());
+    let original_status = review
+        .get("failure_signature")
+        .and_then(|value| value.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
+    let can_correct_sensitive_skip = original_status == "rejected_sensitive_input"
+        || matches!(
+            outcome.as_str(),
+            "expected_sensitive_skip" | "false_positive_safe_memory"
+        );
+    let reason = learned_review
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            "The learned reviewer matched this to prior human feedback.".to_string()
+        });
+    let detail = match confidence {
+        Some(value) => format!(
+            "ArkMemory auto-applied learned review feedback with {:.0}% confidence. You can confirm or correct this outcome.",
+            (value * 100.0).clamp(0.0, 100.0)
+        ),
+        None => {
+            "ArkMemory auto-applied learned review feedback. You can confirm or correct this outcome."
+                .to_string()
+        }
+    };
+    serde_json::json!({
+        "id": format!("auto_reviewed_capture:{}", capture_event_id),
+        "kind": "auto_reviewed_capture",
+        "severity": "info",
+        "capture_event_id": capture_event_id,
+        "status": event.status,
+        "capture_kind": event.capture_kind,
+        "conversation_id": event.conversation_id,
+        "source_message_id": event.source_message_id,
+        "replay_count": event.replay_count,
+        "review": review,
+        "review_outcome": outcome,
+        "learned_review": learned_review,
+        "can_correct_sensitive_skip": can_correct_sensitive_skip,
+        "source_context": source_context,
+        "title": title,
+        "detail": detail,
+        "last_error_detail": reason,
+        "action": "review_learned_capture_review",
         "created_at": event.updated_at,
     })
 }
@@ -1421,6 +1846,15 @@ impl ArkMemoryEventContext {
             project_id: None,
             conversation_id: candidate.conversation_id.clone(),
             source_ref: Some(candidate.id.clone()),
+        }
+    }
+
+    fn from_operation(operation: &crate::storage::memory_operation::Model) -> Self {
+        Self {
+            scope: Some(operation.scope.clone()),
+            project_id: operation.project_id.clone(),
+            conversation_id: operation.conversation_id.clone(),
+            source_ref: Some(operation.id.clone()),
         }
     }
 }
@@ -1618,6 +2052,414 @@ pub(super) async fn arkmemory_list_memory_candidates(
     Ok(visible)
 }
 
+fn arkmemory_capture_review_outcome_from_event(
+    event: &crate::storage::memory_capture_event::Model,
+) -> Option<&'static str> {
+    let review = event.attempt_metadata.get("user_review")?;
+    if review
+        .get("learned")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    review
+        .get("outcome")
+        .and_then(|value| value.as_str())
+        .and_then(arkmemory_known_capture_review_outcome)
+}
+
+fn arkmemory_capture_event_has_learned_review(
+    event: &crate::storage::memory_capture_event::Model,
+) -> bool {
+    event
+        .attempt_metadata
+        .get("user_review")
+        .and_then(|value| value.get("learned"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || event
+            .attempt_metadata
+            .get("reviewed_from")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            == Some("arkmemory_learned_review")
+}
+
+fn arkmemory_learned_review_example_compatible(
+    event: &crate::storage::memory_capture_event::Model,
+    example: &ArkMemoryLearnedReviewExample,
+) -> bool {
+    example.context.status == event.status.trim()
+        && example.context.capture_kind == event.capture_kind.trim()
+}
+
+async fn arkmemory_learned_review_examples(
+    storage: &crate::storage::Storage,
+) -> Result<Vec<ArkMemoryLearnedReviewExample>> {
+    let reviewed_events = storage
+        .list_memory_capture_events_by_statuses_all_scopes(
+            ARKMEMORY_REVIEWED_CAPTURE_STATUSES,
+            ARKMEMORY_LEARNED_REVIEW_EXAMPLE_LIMIT,
+        )
+        .await?;
+    let mut examples = Vec::new();
+    for event in reviewed_events {
+        let Some(outcome) = arkmemory_capture_review_outcome_from_event(&event) else {
+            continue;
+        };
+        let Some(failure_key) = arkmemory_reviewed_capture_failure_signature_key(&event) else {
+            continue;
+        };
+        let Some(context) = arkmemory_capture_review_context(storage, &event).await else {
+            continue;
+        };
+        examples.push(ArkMemoryLearnedReviewExample {
+            event_id: event.id.clone(),
+            outcome,
+            reviewed_at: event
+                .attempt_metadata
+                .get("user_review")
+                .and_then(|value| value.get("reviewed_at"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            failure_key,
+            context,
+        });
+    }
+    Ok(examples)
+}
+
+async fn arkmemory_rank_learned_review_examples(
+    embedder: Option<&crate::core::embeddings::EmbeddingClient>,
+    current: &ArkMemoryCaptureReviewContext,
+    examples: &[ArkMemoryLearnedReviewExample],
+) -> Vec<ArkMemoryLearnedReviewExample> {
+    if examples.is_empty() {
+        return Vec::new();
+    }
+    if let Some(embedder) = embedder {
+        let mut texts = Vec::with_capacity(examples.len() + 1);
+        texts.push(arkmemory_capture_review_context_embedding_text(current));
+        texts.extend(
+            examples
+                .iter()
+                .map(|example| arkmemory_capture_review_context_embedding_text(&example.context)),
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS),
+            embedder.embed_texts(&texts),
+        )
+        .await
+        {
+            Ok(Ok(embeddings)) if embeddings.len() == texts.len() => {
+                let current_embedding = &embeddings[0];
+                let mut scored = examples
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, example)| {
+                        let score = crate::core::document_search::normalized_embedding_similarity(
+                            current_embedding.as_slice(),
+                            embeddings[index + 1].as_slice(),
+                        )
+                        .map(f64::from)
+                        .unwrap_or(-1.0);
+                        (score, example)
+                    })
+                    .collect::<Vec<_>>();
+                scored.sort_by(|left, right| {
+                    right
+                        .0
+                        .partial_cmp(&left.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| right.1.reviewed_at.cmp(&left.1.reviewed_at))
+                });
+                return scored
+                    .into_iter()
+                    .take(ARKMEMORY_LEARNED_REVIEW_MAX_EXAMPLES)
+                    .map(|(_, example)| example)
+                    .collect();
+            }
+            Ok(Ok(_)) => {
+                tracing::debug!(
+                    "ArkMemory learned review embedding ranker returned unexpected vector count"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    "ArkMemory learned review embedding ranker unavailable: {}",
+                    error
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "ArkMemory learned review embedding ranker timed out after {}s",
+                    ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS
+                );
+            }
+        }
+    }
+
+    let mut ranked = examples.to_vec();
+    ranked.sort_by(|left, right| right.reviewed_at.cmp(&left.reviewed_at));
+    ranked.truncate(ARKMEMORY_LEARNED_REVIEW_MAX_EXAMPLES);
+    ranked
+}
+
+fn arkmemory_learned_review_prompt(
+    current: &crate::storage::memory_capture_event::Model,
+    current_context: &ArkMemoryCaptureReviewContext,
+    examples: &[ArkMemoryLearnedReviewExample],
+) -> String {
+    let examples_payload = examples
+        .iter()
+        .map(|example| {
+            serde_json::json!({
+                "event_id": example.event_id.clone(),
+                "outcome": example.outcome,
+                "reviewed_at": example.reviewed_at.clone(),
+                "review_context": arkmemory_capture_review_context_json(&example.context),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "task": "Decide whether prior human ArkMemory health-review feedback should apply to the current capture finding.",
+        "decision_rules": [
+            "Compare semantic meaning, intent, subject, polarity, and source context after secret redaction.",
+            "Do not rely on exact wording, punctuation, casing, spacing, token text, or one shared word.",
+            "If the examples conflict, the current source has a different meaning, or the match is uncertain, return apply=false.",
+            "Use a prior outcome only when a human-reviewed example is clearly the same kind of review case."
+        ],
+        "allowed_outcomes": {
+            "expected_sensitive_skip": "The human said this was correctly skipped because it is credential/secret-like input rather than useful memory.",
+            "false_positive_safe_memory": "The human said this skip/failure was wrong and the source should have been treated as safe memory material.",
+            "acknowledged": "The human dismissed a non-actionable capture failure."
+        },
+        "current_event": {
+            "event_id": current.id.clone(),
+            "failure_signature": arkmemory_capture_failure_signature(current),
+            "review_context": arkmemory_capture_review_context_json(current_context),
+        },
+        "human_reviewed_examples": examples_payload,
+        "response_schema": {
+            "apply": "boolean",
+            "outcome": "expected_sensitive_skip | false_positive_safe_memory | acknowledged | null",
+            "confidence": "number from 0 to 1",
+            "matched_example_id": "event_id string or null",
+            "reason": "brief explanation"
+        }
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+async fn arkmemory_judge_learned_review(
+    llm: &crate::core::LlmClient,
+    current: &crate::storage::memory_capture_event::Model,
+    current_context: &ArkMemoryCaptureReviewContext,
+    examples: &[ArkMemoryLearnedReviewExample],
+) -> Option<ArkMemoryLearnedReviewDecision> {
+    let system = "You are a strict semantic reviewer for ArkMemory health feedback. \
+        You apply previous human review outcomes only when the current case has the same meaning and review intent. \
+        Return only the required JSON object.";
+    let user = arkmemory_learned_review_prompt(current, current_context, examples);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS),
+        llm.chat_classifier_bounded(system, &user, ARKMEMORY_LEARNED_REVIEW_MAX_OUTPUT_TOKENS),
+    )
+    .await
+    {
+        Ok(Ok(response)) => arkmemory_parse_learned_review_decision(&response.content),
+        Ok(Err(error)) => {
+            tracing::debug!("ArkMemory learned reviewer model call failed: {}", error);
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                "ArkMemory learned reviewer timed out after {}s",
+                ARKMEMORY_LEARNED_REVIEW_TIMEOUT_SECS
+            );
+            None
+        }
+    }
+}
+
+fn arkmemory_learned_review_can_apply(
+    decision: &ArkMemoryLearnedReviewDecision,
+    examples: &[ArkMemoryLearnedReviewExample],
+) -> bool {
+    if !decision.apply || decision.confidence < ARKMEMORY_LEARNED_REVIEW_MIN_CONFIDENCE {
+        return false;
+    }
+    let Some(outcome) = decision.outcome.as_deref() else {
+        return false;
+    };
+    examples.iter().any(|example| example.outcome == outcome)
+}
+
+pub(crate) async fn run_arkmemory_learned_review_pass(
+    storage: &crate::storage::Storage,
+    llm: &crate::core::LlmClient,
+    embedder: Option<&crate::core::embeddings::EmbeddingClient>,
+) -> Result<serde_json::Value> {
+    let examples = arkmemory_learned_review_examples(storage).await?;
+    if examples.is_empty() {
+        return Ok(serde_json::json!({
+            "reviewed_examples": 0,
+            "failed_examined": 0,
+            "semantic_judgments": 0,
+            "auto_reviewed": 0,
+            "skipped_no_examples": 0,
+            "skipped_no_context": 0,
+            "skipped_uncertain": 0,
+        }));
+    }
+
+    let failed_events = storage
+        .list_memory_capture_events_by_statuses_all_scopes(
+            ARKMEMORY_FAILED_CAPTURE_STATUSES,
+            ARKMEMORY_LEARNED_REVIEW_FAILED_LIMIT,
+        )
+        .await?;
+    let mut failed_examined = 0usize;
+    let mut semantic_judgments = 0usize;
+    let mut auto_reviewed = 0usize;
+    let mut skipped_no_examples = 0usize;
+    let mut skipped_no_context = 0usize;
+    let mut skipped_uncertain = 0usize;
+
+    for mut event in failed_events {
+        failed_examined += 1;
+        let failure_key = arkmemory_capture_event_failure_signature_key(&event);
+        let mut matching_examples = examples
+            .iter()
+            .filter(|example| example.failure_key == failure_key)
+            .cloned()
+            .collect::<Vec<_>>();
+        if matching_examples.is_empty() {
+            matching_examples = examples
+                .iter()
+                .filter(|example| arkmemory_learned_review_example_compatible(&event, example))
+                .cloned()
+                .collect::<Vec<_>>();
+        }
+        if matching_examples.is_empty() {
+            skipped_no_examples += 1;
+            continue;
+        }
+        let Some(current_context) = arkmemory_capture_review_context(storage, &event).await else {
+            skipped_no_context += 1;
+            continue;
+        };
+        let ranked_examples =
+            arkmemory_rank_learned_review_examples(embedder, &current_context, &matching_examples)
+                .await;
+        if ranked_examples.is_empty() {
+            skipped_no_examples += 1;
+            continue;
+        }
+        semantic_judgments += 1;
+        let Some(decision) =
+            arkmemory_judge_learned_review(llm, &event, &current_context, &ranked_examples).await
+        else {
+            skipped_uncertain += 1;
+            continue;
+        };
+        if !arkmemory_learned_review_can_apply(&decision, &ranked_examples) {
+            skipped_uncertain += 1;
+            continue;
+        }
+        let outcome = decision
+            .outcome
+            .clone()
+            .unwrap_or_else(|| "acknowledged".to_string());
+        let source_review_event_id = decision
+            .matched_example_id
+            .as_deref()
+            .and_then(|matched| {
+                ranked_examples
+                    .iter()
+                    .find(|example| example.event_id == matched)
+                    .map(|example| example.event_id.clone())
+            })
+            .or_else(|| {
+                ranked_examples
+                    .iter()
+                    .find(|example| example.outcome == outcome.as_str())
+                    .map(|example| example.event_id.clone())
+            });
+        let previous_status = event.status.trim().to_string();
+        let reviewed_status =
+            arkmemory_capture_event_reviewed_status(&event, outcome.as_str()).to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let failure_signature = arkmemory_capture_failure_signature(&event);
+        let review_context_json = arkmemory_capture_review_context_json(&current_context);
+        let previous_metadata = std::mem::take(&mut event.attempt_metadata);
+        let mut metadata = match previous_metadata {
+            serde_json::Value::Object(map) => map,
+            serde_json::Value::Null => serde_json::Map::new(),
+            value => {
+                let mut map = serde_json::Map::new();
+                map.insert("previous_metadata".to_string(), value);
+                map
+            }
+        };
+        metadata.insert(
+            "reviewed_at".to_string(),
+            serde_json::Value::String(now.clone()),
+        );
+        metadata.insert(
+            "reviewed_from".to_string(),
+            serde_json::Value::String("arkmemory_learned_review".to_string()),
+        );
+        metadata.insert(
+            "previous_status".to_string(),
+            serde_json::Value::String(previous_status.clone()),
+        );
+        metadata.insert(
+            "user_review".to_string(),
+            serde_json::json!({
+                "outcome": outcome.clone(),
+                "outcome_label": arkmemory_capture_review_outcome_label(outcome.as_str()),
+                "reviewed_at": now.clone(),
+                "failure_signature": failure_signature,
+                "review_context": review_context_json,
+                "learned": true,
+                "reviewed_from": "arkmemory_learned_review",
+            }),
+        );
+        metadata.insert(
+            "learned_review".to_string(),
+            serde_json::json!({
+                "applied_at": now.clone(),
+                "outcome": outcome,
+                "confidence": decision.confidence,
+                "reason": decision.reason,
+                "source_review_event_id": source_review_event_id,
+                "ranked_example_count": ranked_examples.len(),
+            }),
+        );
+        event.status = reviewed_status;
+        event.attempt_metadata = serde_json::Value::Object(metadata);
+        if event.completed_at.is_none() {
+            event.completed_at = Some(now.clone());
+        }
+        event.updated_at = now;
+        storage.upsert_memory_capture_event(&event).await?;
+        auto_reviewed += 1;
+    }
+
+    Ok(serde_json::json!({
+        "reviewed_examples": examples.len(),
+        "failed_examined": failed_examined,
+        "semantic_judgments": semantic_judgments,
+        "auto_reviewed": auto_reviewed,
+        "skipped_no_examples": skipped_no_examples,
+        "skipped_no_context": skipped_no_context,
+        "skipped_uncertain": skipped_uncertain,
+    }))
+}
+
 pub(super) async fn arkmemory_build_health_findings(
     storage: &crate::storage::Storage,
     project_id: Option<&str>,
@@ -1642,14 +2484,38 @@ pub(super) async fn arkmemory_build_health_findings(
         .await?
     {
         let pattern_key = arkmemory_capture_event_failure_signature_key(&event);
+        let review_pattern = reviewed_capture_patterns.get(&pattern_key);
         let source_context = arkmemory_capture_source_context(storage, &event).await;
         findings.push(arkmemory_capture_event_finding(
             event,
-            reviewed_capture_patterns.get(&pattern_key),
+            review_pattern,
             source_context,
         ));
         if findings.len() >= limit as usize {
             return Ok(findings);
+        }
+    }
+
+    if findings.len() < limit as usize {
+        for event in storage
+            .list_memory_capture_events_by_statuses(
+                ARKMEMORY_REVIEWED_CAPTURE_STATUSES,
+                project_id,
+                limit,
+            )
+            .await?
+        {
+            if !arkmemory_capture_event_has_learned_review(&event) {
+                continue;
+            }
+            let source_context = arkmemory_capture_source_context(storage, &event).await;
+            findings.push(arkmemory_capture_event_learned_review_finding(
+                event,
+                source_context,
+            ));
+            if findings.len() >= limit as usize {
+                return Ok(findings);
+            }
         }
     }
 
@@ -1713,31 +2579,75 @@ pub(super) async fn arkmemory_build_health_findings(
     }
     if findings.len() < limit as usize {
         for operation in storage
-            .list_memory_operations_by_statuses(
-                &["queued_review", "apply_failed"],
-                project_id,
-                limit,
-            )
+            .list_memory_operations_by_statuses(&["apply_failed"], project_id, limit)
             .await?
         {
             let operation_id = operation.id.clone();
+            let operation_capture_event_id = operation.capture_event_id.clone();
             let operation_status = operation.status.clone();
             let operation_type = operation.operation_type.clone();
+            let operation_key = operation.key.clone();
+            let operation_value = if operation.looks_sensitive {
+                None
+            } else {
+                operation.value.clone()
+            };
+            let operation_title = operation_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|key| format!("Memory operation {}: {}", operation_type, key))
+                .unwrap_or_else(|| format!("Memory operation {}", operation_type));
             let memory_id = operation
                 .applied_memory_id
                 .clone()
                 .or_else(|| operation.target_memory_id.clone());
+            let source_context = arkmemory_memory_operation_source_context(&operation);
             findings.push(serde_json::json!({
                 "id": format!("operation:{}", operation_id),
                 "kind": operation_status.clone(),
                 "severity": if operation_status == "apply_failed" { "warning" } else { "review" },
                 "memory_id": memory_id,
-                "operation_id": operation_id,
-                "title": format!("Memory operation {}", operation_type),
+                "operation_id": operation_id.clone(),
+                "capture_event_id": operation_capture_event_id.clone(),
+                "operation_type": operation_type.clone(),
+                "status": operation_status.clone(),
+                "title": operation_title,
                 "detail": operation
                     .review_notes
                     .clone()
                     .unwrap_or_else(|| "This staged memory operation still needs ArkMemory review.".to_string()),
+                "source_context": source_context,
+                "operation": {
+                    "id": operation_id,
+                    "capture_event_id": operation_capture_event_id,
+                    "operation_type": operation_type,
+                    "status": operation_status,
+                    "target_memory_id": operation.target_memory_id,
+                    "applied_memory_id": operation.applied_memory_id,
+                    "key": operation_key,
+                    "value": operation_value,
+                    "memory_kind": operation.memory_kind,
+                    "durability": operation.durability,
+                    "scope": operation.scope,
+                    "project_id": operation.project_id,
+                    "conversation_id": operation.conversation_id,
+                    "confidence": operation.confidence,
+                    "looks_sensitive": operation.looks_sensitive,
+                    "sensitive_reason": operation.sensitive_reason,
+                    "valid_from": operation.valid_from,
+                    "expires_at": operation.expires_at,
+                    "review_at": operation.review_at,
+                    "rationale": operation.rationale,
+                    "evidence_refs": operation.evidence_refs,
+                    "model_metadata": operation.model_metadata,
+                    "apply_metadata": operation.apply_metadata,
+                    "applied_at": operation.applied_at,
+                    "reviewed_at": operation.reviewed_at,
+                    "review_notes": operation.review_notes,
+                    "created_at": operation.created_at,
+                    "updated_at": operation.updated_at,
+                },
                 "action": "review_memory_operation",
                 "created_at": operation.updated_at,
             }));
@@ -2130,21 +3040,23 @@ pub(super) async fn arkmemory_summary(
         .await
         .map(|items| items.len())
         .unwrap_or(0);
-    let pending_capture_signals = arkmemory_pending_capture_signal_payloads(storage, project_id, 200)
+    let pending_capture_signals =
+        arkmemory_pending_capture_signal_payloads(storage, project_id, 200)
+            .await
+            .unwrap_or_default();
+    let pending_capture = pending_capture_signals.len();
+    let health_findings = arkmemory_build_health_findings(storage, project_id, 200)
         .await
         .unwrap_or_default();
-    let pending_capture = pending_capture_signals.len();
-    let failed_capture = storage
-        .list_memory_capture_events_by_statuses(ARKMEMORY_FAILED_CAPTURE_STATUSES, project_id, 200)
-        .await
-        .map(|items| items.len())
-        .unwrap_or(0);
+    let failed_capture = health_findings
+        .iter()
+        .filter(|finding| {
+            finding.get("kind").and_then(|value| value.as_str()) == Some("capture_failed")
+        })
+        .count();
     let ledger = storage.count_recall_events(project_id).await.unwrap_or(0);
     let tests = storage.count_recall_tests(project_id).await.unwrap_or(0);
-    let health = arkmemory_build_health_findings(storage, project_id, 200)
-        .await
-        .map(|items| items.len())
-        .unwrap_or(0);
+    let health = health_findings.len();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2472,6 +3384,73 @@ pub(super) async fn arkmemory_apply_health(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let operation_id = finding
+            .get("operation_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let mut operation_context = None;
+        let operation_resolution = if let Some(operation_id) = operation_id.as_deref() {
+            let mut operation = agent
+                .storage
+                .get_memory_operation(operation_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Memory operation not found."))?;
+            if let Some(pid) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
+                if operation
+                    .project_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some_and(|operation_project| operation_project != pid)
+                {
+                    anyhow::bail!("Memory operation is outside the active memory scope.");
+                }
+            } else if operation.project_id.is_some() {
+                anyhow::bail!("Memory operation is outside the active memory scope.");
+            }
+            operation_context = Some(ArkMemoryEventContext::from_operation(&operation));
+            let previous_status = operation.status.trim().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            operation.status = "reviewed_ignored".to_string();
+            operation.reviewed_at = Some(now.clone());
+            operation.review_notes = Some("Dismissed from ArkMemory health.".to_string());
+            operation.updated_at = now.clone();
+            agent.storage.upsert_memory_operation(&operation).await?;
+
+            let candidate_id = format!("memory-candidate-{}", operation_id);
+            let mut candidate_resolution = None;
+            for status in ["draft", "applying"] {
+                let updated = agent
+                    .storage
+                    .update_learning_candidate_review_if_status(
+                        &candidate_id,
+                        status,
+                        "rejected",
+                        Some("Dismissed from ArkMemory health."),
+                        None,
+                    )
+                    .await?;
+                if updated {
+                    candidate_resolution = Some(serde_json::json!({
+                        "candidate_id": candidate_id,
+                        "previous_status": status,
+                        "status": "rejected",
+                    }));
+                    break;
+                }
+            }
+
+            Some(serde_json::json!({
+                "operation_id": operation_id,
+                "previous_status": previous_status,
+                "status": "reviewed_ignored",
+                "candidate_resolution": candidate_resolution,
+            }))
+        } else {
+            None
+        };
         let context = if let Some(memory_id) = memory_id.as_deref() {
             match agent.storage.get_experience_item(memory_id).await? {
                 Some(item) => {
@@ -2484,6 +3463,8 @@ pub(super) async fn arkmemory_apply_health(
                 }
                 None => ArkMemoryEventContext::default(),
             }
+        } else if let Some(context) = operation_context {
+            context
         } else {
             ArkMemoryEventContext::default()
         };
@@ -2506,9 +3487,21 @@ pub(super) async fn arkmemory_apply_health(
             let reviewed_status =
                 arkmemory_capture_event_reviewed_status(&event, review_outcome).to_string();
             let mut final_status = previous_status.clone();
-            if ARKMEMORY_FAILED_CAPTURE_STATUSES.contains(&previous_status.as_str()) {
+            let finding_kind = finding
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            let is_reviewable_capture = ARKMEMORY_FAILED_CAPTURE_STATUSES
+                .contains(&previous_status.as_str())
+                || (finding_kind == "auto_reviewed_capture"
+                    && ARKMEMORY_REVIEWED_CAPTURE_STATUSES.contains(&previous_status.as_str()));
+            if is_reviewable_capture {
                 let now = chrono::Utc::now().to_rfc3339();
-                let failure_signature = arkmemory_capture_failure_signature(&event);
+                let failure_signature = arkmemory_capture_review_failure_signature(&event);
+                let review_context = arkmemory_capture_review_context(&agent.storage, &event)
+                    .await
+                    .map(|context| arkmemory_capture_review_context_json(&context));
                 let previous_metadata = std::mem::take(&mut event.attempt_metadata);
                 let mut metadata = match previous_metadata {
                     serde_json::Value::Object(map) => map,
@@ -2519,6 +3512,8 @@ pub(super) async fn arkmemory_apply_health(
                         map
                     }
                 };
+                let previous_user_review = metadata.get("user_review").cloned();
+                let previous_learned_review = metadata.get("learned_review").cloned();
                 metadata.insert(
                     "reviewed_at".to_string(),
                     serde_json::Value::String(now.clone()),
@@ -2531,6 +3526,15 @@ pub(super) async fn arkmemory_apply_health(
                     "previous_status".to_string(),
                     serde_json::Value::String(previous_status.clone()),
                 );
+                if let Some(previous_user_review) = previous_user_review {
+                    metadata.insert("previous_user_review".to_string(), previous_user_review);
+                }
+                if let Some(previous_learned_review) = previous_learned_review {
+                    metadata.insert(
+                        "superseded_learned_review".to_string(),
+                        previous_learned_review,
+                    );
+                }
                 metadata.insert(
                     "user_review".to_string(),
                     serde_json::json!({
@@ -2538,6 +3542,10 @@ pub(super) async fn arkmemory_apply_health(
                         "outcome_label": arkmemory_capture_review_outcome_label(review_outcome),
                         "reviewed_at": now.clone(),
                         "failure_signature": failure_signature,
+                        "review_context": review_context,
+                        "learned": false,
+                        "reviewed_from": "arkmemory_health",
+                        "corrected_auto_review": finding_kind == "auto_reviewed_capture",
                     }),
                 );
                 event.status = reviewed_status.clone();
@@ -2571,6 +3579,7 @@ pub(super) async fn arkmemory_apply_health(
             serde_json::json!({
                 "finding_id": id,
                 "capture_resolution": capture_resolution,
+                "operation_resolution": operation_resolution,
             }),
             context,
         )

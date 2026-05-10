@@ -18,7 +18,7 @@ const MAX_FRAGMENT_SURFACE_CHARS: usize = 64;
 const MAX_PROMPT_FRAGMENTS: usize = 64;
 const REQUIRED_BASELINE_FRAGMENT_IDS: &[&str] = &[
     "fragment.baseline.identity_security",
-    "fragment.baseline.turn_contract",
+    "fragment.baseline.semantic_dag_contract",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -160,14 +160,14 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
 - Keep retries bounded and report the last error plus the next safe recovery step when blocked."#,
             ),
             fragment(
-                "fragment.baseline.turn_contract",
+                "fragment.baseline.semantic_dag_contract",
                 "agent_loop",
                 &[],
                 true,
                 950,
-                r#"- Treat the structured turn plan, routing signal, action schemas, and current state as the execution contract for this turn.
-- Use prior conversation only to resolve clear references, continuations, corrections, approvals, and dependencies. If the current turn changes outcome or work type, follow the new turn.
-- Prefer the fewest authorized actions that complete the user-visible outcome. Do not invent tool results, IDs, links, schedules, objects, credentials, or notifications.
+                r#"- Treat the Semantic DAG Router trace, action capability contracts, and current state snapshot as the execution contract for this turn.
+- Use prior conversation only to resolve clear references, continuations, corrections, approvals, and dependencies that the route graph already preserves.
+- Use only actions emitted by the ExecutionDAG. Do not invent tool results, IDs, links, schedules, objects, credentials, or notifications.
 - User-facing text should be concise, concrete, and operationally honest. Do not emit control JSON, scope sentinels, or chain-of-thought into final prose."#,
             ),
             fragment(
@@ -245,12 +245,12 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
 - If a visual attachment arrives without a non-empty user message, treat the turn as an implicit request to understand the image, without inferring sensitive traits or saving one-off image contents as durable preferences."#,
             ),
             fragment(
-                "fragment.read_only.synthesis",
+                "fragment.evidence.synthesis",
                 "agent_loop",
-                &["read_only", "role_data_source", "role_inspection"],
+                &["evidence_lookup", "role_data_source", "role_inspection"],
                 false,
                 780,
-                r#"- For read-only answer turns, call the minimum needed data-source or inspection action, then answer from observed results.
+                r#"- For evidence-gathering nodes, call the minimum needed data-source or inspection action, then continue according to the Semantic DAG contract.
 - If the intended result is an in-chat report, synthesis, or analysis, use prose and tables for exact values. Include fenced `agentark-chart` JSON only when a chart materially clarifies quantitative comparisons, trends, distributions, proportions, uncertainty, evidence coverage, or grouped breakdowns.
 - Use app delivery only when the requested final object is a managed browser-runnable, reusable, hosted, or previewable experience."#,
             ),
@@ -295,15 +295,6 @@ pub fn default_prompt_fragment_bundle() -> PromptFragmentBundleProfile {
                 r#"- Treat built-in connectors, extension packs, custom integrations, and acquired capabilities as distinct surfaces.
 - Inspect the available catalog or integration state before claiming a capability is unavailable.
 - For credentialed integrations, use secure credential/auth flows. Do not place raw tokens, passwords, cookies, or API keys in generated code, tool arguments, logs, or final answers."#,
-            ),
-            fragment(
-                "fragment.scope.expansion",
-                "agent_loop",
-                &["scope_expansion"],
-                false,
-                700,
-                r#"- If the supplied action subset is insufficient for the current turn, request action-scope expansion using the exact expansion sentinel from the prompt protocol.
-- Do not claim a capability is unavailable while expansion is allowed. Do not combine the sentinel with prose, JSON, or any other content."#,
             ),
         ],
     }

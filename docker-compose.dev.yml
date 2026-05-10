@@ -18,6 +18,13 @@ services:
       args:
         AGENTARK_DOCKER_FEATURES: ${AGENTARK_DOCKER_FEATURES:-telegram,docker,ssh}
         AGENTARK_BUILD_JOBS: ${AGENTARK_BUILD_JOBS:-2}
+        # Fast-rebuild profile for local dev: lto=off, codegen-units=16,
+        # incremental=on, opt-level=1. The published GHCR image keeps using
+        # the release profile (this override only applies to local builds
+        # via `scripts\start.bat build`). Set AGENTARK_BUILD_PROFILE=release
+        # in the environment to override and produce a release-optimized
+        # local build.
+        AGENTARK_BUILD_PROFILE: ${AGENTARK_BUILD_PROFILE:-dev-fast}
         INSTALL_PLAYWRIGHT_RUNTIME: ${AGENTARK_INSTALL_PLAYWRIGHT_RUNTIME:-true}
         INSTALL_TAILSCALE: ${AGENTARK_INSTALL_TAILSCALE:-true}
         INSTALL_CLOUDFLARED: ${AGENTARK_INSTALL_CLOUDFLARED:-true}

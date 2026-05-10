@@ -1,5 +1,21 @@
 use super::*;
 
+fn automation_delivery_channel_requires_connection(channel: &str) -> bool {
+    let normalized = channel.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && normalized != "preferred"
+        && normalized != AUTOMATION_IN_APP_NOTIFICATION_CHANNEL
+        && is_external_notification_channel(&normalized)
+}
+
+fn automation_unavailable_delivery_note(channel: &str) -> String {
+    let display = notification_channel_display_name(channel);
+    format!(
+        "{} delivery is requested but not connected yet. AgentArk will save the automation with that requested route, keep updates in app while it is unavailable, and use {} automatically once the channel is connected.",
+        display, display
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum PendingConversationActionKind {
     ForceImportSkill,
@@ -423,26 +439,12 @@ impl Agent {
                     .to_string(),
             );
         }
-        if !delivery_channel.is_empty()
-            && delivery_channel != "preferred"
-            && is_external_notification_channel(&delivery_channel)
+        if automation_delivery_channel_requires_connection(&delivery_channel)
             && !self
                 .notification_channel_is_configured_any(&delivery_channel)
                 .await
         {
-            let requested = notification_channel_display_name(&delivery_channel).to_string();
-            delivery_channel = "preferred".to_string();
-            if self.configured_push_channels().await.is_empty() {
-                notes.push(format!(
-                    "{} delivery is not connected yet. The automation is saved, but push updates will not work until you connect Telegram, WhatsApp, Slack, or another channel in Settings > Channels. Until then updates will stay in-app.",
-                    requested
-                ));
-            } else {
-                notes.push(format!(
-                    "{} delivery is not connected yet. Updates will use the preferred connected notification channel instead.",
-                    requested
-                ));
-            }
+            notes.push(automation_unavailable_delivery_note(&delivery_channel));
         } else if delivery_channel == "preferred"
             && self.configured_push_channels().await.is_empty()
         {
@@ -649,5 +651,25 @@ impl Agent {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_external_delivery_route_is_preserved_for_later_setup() {
+        assert!(automation_delivery_channel_requires_connection("telegram"));
+        assert!(!automation_delivery_channel_requires_connection(
+            "preferred"
+        ));
+        assert!(!automation_delivery_channel_requires_connection(
+            AUTOMATION_IN_APP_NOTIFICATION_CHANNEL
+        ));
+
+        let note = automation_unavailable_delivery_note("telegram");
+        assert!(note.contains("Telegram delivery is requested"));
+        assert!(note.contains("use Telegram automatically once the channel is connected"));
     }
 }

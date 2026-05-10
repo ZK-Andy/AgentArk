@@ -57,7 +57,12 @@ pub(super) async fn create_custom_api(
     )
     .await
     {
-        Ok(api) => Json(serde_json::json!({ "status": "ok", "custom_api": api })).into_response(),
+        Ok(api) => {
+            agent
+                .refresh_action_catalog_index("custom_api_upsert")
+                .await;
+            Json(serde_json::json!({ "status": "ok", "custom_api": api })).into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -78,7 +83,12 @@ pub(super) async fn update_custom_api(
     )
     .await
     {
-        Ok(api) => Json(serde_json::json!({ "status": "ok", "custom_api": api })).into_response(),
+        Ok(api) => {
+            agent
+                .refresh_action_catalog_index("custom_api_upsert")
+                .await;
+            Json(serde_json::json!({ "status": "ok", "custom_api": api })).into_response()
+        }
         Err(error) if error.to_string().contains("not found") => {
             error_response(StatusCode::NOT_FOUND, error)
         }
@@ -100,7 +110,12 @@ pub(super) async fn delete_custom_api(
     )
     .await
     {
-        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Ok(()) => {
+            agent
+                .refresh_action_catalog_index("custom_api_delete")
+                .await;
+            Json(serde_json::json!({ "status": "ok" })).into_response()
+        }
         Err(error) if error.to_string().contains("not found") => {
             error_response(StatusCode::NOT_FOUND, error)
         }

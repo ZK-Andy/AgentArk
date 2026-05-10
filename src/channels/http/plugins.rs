@@ -340,6 +340,8 @@ mod tests {
         (format!("http://{}", addr), state, handle)
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn plugin_sdk_routes_work_end_to_end() {
         let (state, config_dir, data_dir) = build_test_state().await;
@@ -546,6 +548,8 @@ mod tests {
         server_handle.abort();
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn plugin_sdk_missing_plugin_routes_return_not_found() {
         let (state, _config_dir, _data_dir) = build_test_state().await;

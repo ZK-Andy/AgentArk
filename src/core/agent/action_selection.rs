@@ -1,11 +1,6 @@
 use super::*;
 use crate::actions::ActionDef;
 
-const DIRECT_REPLY_READ_ONLY_ACTION_MIN_SCORE: f32 = 0.62;
-const DIRECT_REPLY_READ_ONLY_ACTION_MIN_MARGIN: f32 = 0.04;
-const DIRECT_REPLY_SEMANTIC_READ_ONLY_OVERRIDE_MIN_SCORE: f32 = 0.72;
-const DIRECT_REPLY_SEMANTIC_READ_ONLY_OVERRIDE_MIN_MARGIN: f32 = 0.08;
-
 pub(super) fn action_is_read_only(action: &ActionDef) -> bool {
     matches!(
         action.planner_metadata().side_effect_level,
@@ -104,17 +99,29 @@ pub(super) fn routing_signal_has_read_only_retrieval_need(
         || routing.external_info_expected
 }
 
-fn semantic_read_only_action_gate_should_yield(
-    best_score: f32,
-    runner_up: f32,
-    routing_has_retrieval_need: bool,
-) -> bool {
-    if routing_has_retrieval_need {
-        return best_score >= DIRECT_REPLY_READ_ONLY_ACTION_MIN_SCORE
-            && best_score - runner_up >= DIRECT_REPLY_READ_ONLY_ACTION_MIN_MARGIN;
+fn connected_read_only_action_score(
+    scope_query: &str,
+    action: &ActionDef,
+    semantic_scores: &HashMap<String, f32>,
+) -> f32 {
+    let mut lexical = crate::core::capability_router::score_action_intent(scope_query, action);
+    for part in scope_query
+        .lines()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        lexical = lexical.max(crate::core::capability_router::score_action_intent(
+            part, action,
+        ));
     }
-    best_score >= DIRECT_REPLY_SEMANTIC_READ_ONLY_OVERRIDE_MIN_SCORE
-        && best_score - runner_up >= DIRECT_REPLY_SEMANTIC_READ_ONLY_OVERRIDE_MIN_MARGIN
+    lexical
+        .max(
+            semantic_scores
+                .get(&action.name)
+                .copied()
+                .unwrap_or_default(),
+        )
+        .clamp(0.0, 1.0)
 }
 
 impl Agent {
@@ -155,9 +162,6 @@ impl Agent {
         let scores = self
             .semantic_action_scores_for_agent_loop(&scope_query, &authorized)
             .await;
-        if scores.is_empty() {
-            return false;
-        }
 
         let routing_has_retrieval_need = request_hints
             .routing
@@ -167,12 +171,13 @@ impl Agent {
         let mut scored = authorized
             .iter()
             .filter(|action| action_is_read_only_knowledge_action(action))
-            .filter_map(|action| {
-                scores
-                    .get(&action.name)
-                    .copied()
-                    .map(|score| (action, score))
+            .map(|action| {
+                (
+                    action,
+                    connected_read_only_action_score(&scope_query, action, &scores),
+                )
             })
+            .filter(|(_, score)| *score > 0.0)
             .collect::<Vec<_>>();
         scored.sort_by(|left, right| {
             right
@@ -183,19 +188,13 @@ impl Agent {
         let Some((best_action, best_score)) = scored.first().copied() else {
             return false;
         };
-        let runner_up = scored.get(1).map(|(_, score)| *score).unwrap_or(0.0);
-        let should_yield = semantic_read_only_action_gate_should_yield(
-            best_score,
-            runner_up,
-            routing_has_retrieval_need,
-        );
+        let should_yield = routing_has_retrieval_need;
         if should_yield {
             tracing::info!(
                 action = %best_action.name,
                 score = best_score,
-                runner_up = runner_up,
                 routing_has_retrieval_need,
-                "Direct conversation path yielded to semantic read-only action"
+                "Direct conversation path yielded to structurally routed read-only action"
             );
         }
         should_yield
@@ -220,23 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn semantic_read_only_gate_can_override_untrusted_direct_reply() {
-        assert!(semantic_read_only_action_gate_should_yield(
-            0.82, 0.68, false
-        ));
-    }
+    fn routed_retrieval_need_is_structural_not_score_gated() {
+        let routing = crate::security::intent_classifier::InboundRoutingSignal {
+            current_answer_expected: true,
+            live_state_expected: true,
+            ..Default::default()
+        };
 
-    #[test]
-    fn semantic_read_only_gate_rejects_close_ambiguous_action_scores() {
-        assert!(!semantic_read_only_action_gate_should_yield(
-            0.82, 0.76, false
-        ));
-    }
-
-    #[test]
-    fn routed_retrieval_need_uses_standard_read_only_threshold() {
-        assert!(semantic_read_only_action_gate_should_yield(
-            0.78, 0.73, true
-        ));
+        assert!(routing_signal_has_read_only_retrieval_need(&routing));
     }
 }

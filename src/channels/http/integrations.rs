@@ -367,6 +367,14 @@ pub(super) fn integration_user_disabled_key(id: &str) -> String {
     crate::integrations::integration_user_disabled_key(id)
 }
 
+pub(super) async fn refresh_connected_action_surfaces(
+    state: &AppState,
+    reason: &'static str,
+) {
+    let agent = { state.agent.read().await.clone() };
+    agent.refresh_action_catalog_index(reason).await;
+}
+
 fn set_builtin_integration_enabled(
     config_dir: &std::path::Path,
     data_dir: &std::path::Path,
@@ -417,6 +425,29 @@ fn set_builtin_integration_user_disabled(
             })?;
     }
     Ok(())
+}
+
+fn builtin_runtime_integration_ids_for_service(
+    config_dir: &std::path::Path,
+    service_id: &str,
+) -> Vec<&'static str> {
+    match service_id {
+        "gmail" => vec!["gmail"],
+        "google_calendar" | "calendar" => vec!["google_calendar"],
+        "google_workspace" => {
+            let mut ids = vec!["google_workspace"];
+            let granted =
+                crate::actions::google_workspace::granted_bundles(config_dir).unwrap_or_default();
+            if granted.iter().any(|bundle| bundle == "gmail") {
+                ids.push("gmail");
+            }
+            if granted.iter().any(|bundle| bundle == "calendar") {
+                ids.push("google_calendar");
+            }
+            ids
+        }
+        _ => Vec::new(),
+    }
 }
 
 pub(super) fn parse_boolish(value: &str) -> Option<bool> {
@@ -1423,22 +1454,8 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
                     PendingOAuthTarget::Integration { service_id } => service_id.as_str(),
                     PendingOAuthTarget::AuthProfile { .. } => "",
                 };
-                let mut integration_ids = match service_id {
-                    "gmail" => vec!["gmail"],
-                    "google_calendar" | "calendar" => vec!["google_calendar"],
-                    "google_workspace" => vec!["google_workspace"],
-                    _ => Vec::new(),
-                };
-                if service_id == "google_workspace" {
-                    let granted = crate::actions::google_workspace::granted_bundles(&config_dir)
-                        .unwrap_or_default();
-                    if granted.iter().any(|bundle| bundle == "gmail") {
-                        integration_ids.push("gmail");
-                    }
-                    if granted.iter().any(|bundle| bundle == "calendar") {
-                        integration_ids.push("google_calendar");
-                    }
-                }
+                let integration_ids =
+                    builtin_runtime_integration_ids_for_service(&config_dir, service_id);
                 if let Err(error) =
                     set_builtin_integration_enabled(&config_dir, &data_dir, &integration_ids, true)
                 {
@@ -1469,9 +1486,13 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
                     ));
                 }
             }
-            let (extension_packs, runtime) = {
+            let (extension_packs, runtime, agent_for_catalog) = {
                 let agent = state.agent.read().await;
-                (agent.extension_packs.clone(), agent.runtime.clone())
+                (
+                    agent.extension_packs.clone(),
+                    agent.runtime.clone(),
+                    agent.clone(),
+                )
             };
             if let Err(error) = extension_packs.read().await.sync_to_runtime(&runtime).await {
                 tracing::warn!(
@@ -1484,6 +1505,9 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
                     error
                 ));
             }
+            agent_for_catalog
+                .refresh_action_catalog_index("oauth_connection_state_changed")
+                .await;
             let callback_detail = callback_warnings.join(" ");
             let signal = match &oauth_target {
                 PendingOAuthTarget::Integration { service_id } => {
@@ -2480,6 +2504,9 @@ pub(super) async fn configure_integration(
                                 );
                             }
                         }
+                        agent
+                            .refresh_action_catalog_index("prebuilt_integration_connected")
+                            .await;
                         (
                             StatusCode::OK,
                             Json(serde_json::json!({
@@ -2509,6 +2536,9 @@ pub(super) async fn configure_integration(
                                 Some("false".to_string()),
                             );
                         }
+                        agent
+                            .refresh_action_catalog_index("prebuilt_integration_disabled")
+                            .await;
                         (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
@@ -2534,6 +2564,9 @@ pub(super) async fn configure_integration(
                                 Some("false".to_string()),
                             );
                         }
+                        agent
+                            .refresh_action_catalog_index("prebuilt_integration_disabled")
+                            .await;
                         (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
@@ -2625,12 +2658,17 @@ pub(super) async fn enable_integration(
             validate_calendar_oauth_connection(&config_dir).await
         };
         if has_refresh_token && validation.is_ok() {
-            let _ =
-                manager.set_custom_secret(&integration_enabled_key(&id), Some("true".to_string()));
-            let _ = manager.set_custom_secret(
-                &integration_user_disabled_key(&id),
-                Some("false".to_string()),
-            );
+            let integration_ids = builtin_runtime_integration_ids_for_service(&config_dir, &id);
+            for integration_id in &integration_ids {
+                let _ = manager.set_custom_secret(
+                    &integration_enabled_key(integration_id),
+                    Some("true".to_string()),
+                );
+                let _ = manager.set_custom_secret(
+                    &integration_user_disabled_key(integration_id),
+                    Some("false".to_string()),
+                );
+            }
             {
                 let agent = state.agent.read().await;
                 let sync_ctx = crate::core::integration_sync::context_from_agent(
@@ -2647,17 +2685,25 @@ pub(super) async fn enable_integration(
                     );
                 }
             }
+            refresh_connected_action_surfaces(&state, "prebuilt_integration_enabled").await;
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"status":"ok","enabled":true,"connected":true})),
             )
                 .into_response();
         }
-        let _ = manager.set_custom_secret(&integration_enabled_key(&id), Some("false".to_string()));
-        let _ = manager.set_custom_secret(
-            &integration_user_disabled_key(&id),
-            Some("false".to_string()),
-        );
+        let integration_ids = builtin_runtime_integration_ids_for_service(&config_dir, &id);
+        for integration_id in &integration_ids {
+            let _ = manager.set_custom_secret(
+                &integration_enabled_key(integration_id),
+                Some("false".to_string()),
+            );
+            let _ = manager.set_custom_secret(
+                &integration_user_disabled_key(integration_id),
+                Some("false".to_string()),
+            );
+        }
+        refresh_connected_action_surfaces(&state, "prebuilt_integration_disabled").await;
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2711,6 +2757,9 @@ pub(super) async fn enable_integration(
                     error
                 );
             }
+            agent
+                .refresh_action_catalog_index("prebuilt_integration_enabled")
+                .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -2735,6 +2784,9 @@ pub(super) async fn enable_integration(
                     Some("false".to_string()),
                 );
             }
+            agent
+                .refresh_action_catalog_index("prebuilt_integration_disabled")
+                .await;
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -2755,6 +2807,9 @@ pub(super) async fn enable_integration(
                     Some("false".to_string()),
                 );
             }
+            agent
+                .refresh_action_catalog_index("prebuilt_integration_disabled")
+                .await;
             (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -2788,12 +2843,26 @@ pub(super) async fn disable_integration(
     if let Ok(manager) =
         crate::core::config::SecureConfigManager::new_with_data_dir(&config_dir, Some(&data_dir))
     {
-        let _ = manager.set_custom_secret(&integration_enabled_key(&id), Some("false".to_string()));
-        let _ = manager.set_custom_secret(
-            &integration_user_disabled_key(&id),
-            Some("true".to_string()),
-        );
+        let integration_ids = if matches!(
+            id.as_str(),
+            "gmail" | "google_calendar" | "calendar" | "google_workspace"
+        ) {
+            builtin_runtime_integration_ids_for_service(&config_dir, &id)
+        } else {
+            vec![id.as_str()]
+        };
+        for integration_id in integration_ids {
+            let _ = manager.set_custom_secret(
+                &integration_enabled_key(integration_id),
+                Some("false".to_string()),
+            );
+            let _ = manager.set_custom_secret(
+                &integration_user_disabled_key(integration_id),
+                Some("true".to_string()),
+            );
+        }
     }
+    refresh_connected_action_surfaces(&state, "prebuilt_integration_disabled").await;
     (
         StatusCode::OK,
         Json(serde_json::json!({"status":"ok","enabled":false})),
@@ -3111,14 +3180,22 @@ pub(super) async fn configure_google_workspace(
         || crate::actions::google_workspace::granted_bundles(&config_dir)
             .map(|granted| granted.is_empty())
             .unwrap_or(true);
-    let _ = manager.set_custom_secret(
-        &integration_enabled_key("google_workspace"),
-        Some((!reconnect_required).to_string()),
-    );
-    let _ = manager.set_custom_secret(
-        &integration_user_disabled_key("google_workspace"),
-        Some("false".to_string()),
-    );
+    let integration_ids = if reconnect_required {
+        vec!["google_workspace"]
+    } else {
+        builtin_runtime_integration_ids_for_service(&config_dir, "google_workspace")
+    };
+    for integration_id in integration_ids {
+        let _ = manager.set_custom_secret(
+            &integration_enabled_key(integration_id),
+            Some((!reconnect_required).to_string()),
+        );
+        let _ = manager.set_custom_secret(
+            &integration_user_disabled_key(integration_id),
+            Some("false".to_string()),
+        );
+    }
+    refresh_connected_action_surfaces(&state, "prebuilt_integration_configured").await;
 
     (
         StatusCode::OK,

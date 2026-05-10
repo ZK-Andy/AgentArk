@@ -2,7 +2,7 @@
 
 pub(crate) mod stream_blocks;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,9 +11,9 @@ use tokio::sync::mpsc::Sender;
 
 use crate::core::agent::{ConversationMessage, StreamEvent};
 use crate::core::llm_provider::{
-    display_openai_base_url, force_refresh_codex_cli_api_key, is_codex_cli_base_url,
-    openai_provider_label, resolve_openai_request_config, PromptCacheCapability,
-    ResolvedOpenAiRequestConfig,
+    PromptCacheCapability, ResolvedOpenAiRequestConfig, display_openai_base_url,
+    force_refresh_codex_cli_api_key, is_codex_cli_base_url, openai_provider_label,
+    resolve_openai_request_config,
 };
 
 // OpenRouter enforces request affordability against the declared output budget.
@@ -1196,9 +1196,36 @@ fn openai_responses_usage(
             total_tokens,
             estimated: false,
             cost_usd: usage.get("cost").and_then(parse_json_f64),
+            cached_prompt_tokens: openai_cached_prompt_tokens_from_usage_value(usage),
+            cache_creation_prompt_tokens: 0,
         },
         completion_chars,
     ))
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OpenAiTokenUsageDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+fn openai_cached_prompt_tokens_from_details(
+    prompt_tokens_details: Option<&OpenAiTokenUsageDetails>,
+    input_tokens_details: Option<&OpenAiTokenUsageDetails>,
+) -> u64 {
+    prompt_tokens_details
+        .map(|details| details.cached_tokens)
+        .or_else(|| input_tokens_details.map(|details| details.cached_tokens))
+        .unwrap_or(0)
+}
+
+fn openai_cached_prompt_tokens_from_usage_value(usage: &serde_json::Value) -> u64 {
+    usage
+        .get("prompt_tokens_details")
+        .or_else(|| usage.get("input_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
 }
 
 fn parse_json_f64(value: &serde_json::Value) -> Option<f64> {
@@ -1865,22 +1892,21 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: 
 #[cfg(test)]
 mod tests {
     use super::{
-        append_runtime_temporal_context, attach_runtime_identity_contract,
-        attach_runtime_temporal_context, emit_partial_draft_file_previews,
-        extract_openai_reasoning_delta, extract_partial_draft_files,
-        generated_output_chars_for_usage, json_contains_tool_call_indicators, merge_usage_field,
-        normalize_openai_tool_schema, openai_prompt_cache_key, openai_prompt_cache_key_for_config,
-        openai_prompt_cache_retention, openai_stream_data_has_terminal_finish_reason,
-        parse_openai_responses_payload, parse_partial_tool_arguments,
-        prompt_cache_uses_openai_explicit_key, should_request_openai_stream_usage,
-        total_tokens_or_sum, usage_with_generated_output_floor, LlmTokenUsage, ModelRequestMode,
-        ToolCall,
-    };
-    use crate::core::llm_provider::{
-        PromptCacheCapability, ResolvedOpenAiRequestConfig, OPENAI_PROVIDER_ID,
-        OPENROUTER_PROVIDER_ID,
+        LlmTokenUsage, ModelRequestMode, ToolCall, append_runtime_temporal_context,
+        attach_runtime_identity_contract, attach_runtime_temporal_context,
+        emit_partial_draft_file_previews, extract_openai_reasoning_delta,
+        extract_partial_draft_files, generated_output_chars_for_usage,
+        json_contains_tool_call_indicators, merge_usage_field, normalize_openai_tool_schema,
+        openai_prompt_cache_key, openai_prompt_cache_key_for_config, openai_prompt_cache_retention,
+        openai_stream_data_has_terminal_finish_reason, parse_openai_responses_payload,
+        parse_partial_tool_arguments, prompt_cache_uses_openai_explicit_key,
+        should_request_openai_stream_usage, total_tokens_or_sum, usage_with_generated_output_floor,
     };
     use crate::core::StreamEvent;
+    use crate::core::llm_provider::{
+        OPENAI_PROVIDER_ID, OPENROUTER_PROVIDER_ID, PromptCacheCapability,
+        ResolvedOpenAiRequestConfig,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -2002,10 +2028,12 @@ mod tests {
             normalized.get("type").and_then(|v| v.as_str()),
             Some("object")
         );
-        assert!(normalized
-            .get("properties")
-            .and_then(|v| v.as_object())
-            .is_some());
+        assert!(
+            normalized
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .is_some()
+        );
         assert!(normalized.get("anyOf").is_none());
         let description = normalized
             .get("description")
@@ -2129,6 +2157,29 @@ mod tests {
                 .expect("usage cost should parse");
         let usage = response.usage.expect("usage should be present");
         assert_eq!(usage.cost_usd, Some(0.00125));
+    }
+
+    #[test]
+    fn openai_responses_parser_preserves_cached_prompt_tokens() {
+        let payload = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "cached response" }]
+            }],
+            "usage": {
+                "input_tokens": 1200,
+                "output_tokens": 40,
+                "total_tokens": 1240,
+                "input_tokens_details": { "cached_tokens": 1024 }
+            }
+        });
+
+        let response = parse_openai_responses_payload(&payload, 1, "", "openai", "gpt-5")
+            .expect("cached usage should parse");
+        let usage = response.usage.expect("usage should be present");
+
+        assert_eq!(usage.prompt_tokens, 1200);
+        assert_eq!(usage.cached_prompt_tokens, 1024);
     }
 
     #[test]
@@ -2296,6 +2347,8 @@ mod tests {
                 total_tokens: 11,
                 estimated: false,
                 cost_usd: None,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
             },
             1_000,
         );
@@ -2461,6 +2514,10 @@ pub struct LlmTokenUsage {
     pub total_tokens: u64,
     pub estimated: bool,
     pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub cached_prompt_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_prompt_tokens: u64,
 }
 
 pub(crate) fn estimate_tokens_from_chars(chars: usize) -> u64 {
@@ -2493,6 +2550,8 @@ pub(crate) fn estimated_usage_from_chars(
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
         estimated: true,
         cost_usd: None,
+        cached_prompt_tokens: 0,
+        cache_creation_prompt_tokens: 0,
     }
 }
 
@@ -3056,8 +3115,9 @@ impl LlmClient {
         let mode_label = model_request_mode_label(mode);
         let timeout_secs = llm_non_stream_total_timeout_secs();
         let start = std::time::Instant::now();
-        let result =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            async {
                 match &self.provider {
                     LlmProvider::Anthropic { api_key, model } => {
                         self.chat_anthropic_with_history(
@@ -3100,18 +3160,19 @@ impl LlmClient {
                         .await
                     }
                 }
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(anyhow!(
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
                 "LLM non-streaming request timed out after {}s (provider={}, model={}, mode={})",
                 timeout_secs,
                 provider_name,
                 model_name,
                 mode_label
             )),
-            };
+        };
 
         let elapsed = start.elapsed();
         match &result {
@@ -3217,6 +3278,10 @@ impl LlmClient {
             input_tokens: u64,
             #[serde(default)]
             output_tokens: u64,
+            #[serde(default)]
+            cache_creation_input_tokens: u64,
+            #[serde(default)]
+            cache_read_input_tokens: u64,
         }
 
         #[derive(Deserialize)]
@@ -3224,12 +3289,24 @@ impl LlmClient {
         enum ContentBlock {
             #[serde(rename = "text")]
             Text { text: String },
+            #[serde(rename = "thinking")]
+            Thinking {
+                #[serde(default)]
+                thinking: String,
+            },
+            #[serde(rename = "redacted_thinking")]
+            RedactedThinking {
+                #[serde(default)]
+                data: String,
+            },
             #[serde(rename = "tool_use")]
             ToolUse {
                 id: String,
                 name: String,
                 input: serde_json::Value,
             },
+            #[serde(other)]
+            Other,
         }
 
         let mut tools: Vec<AnthropicTool> = actions
@@ -3296,12 +3373,29 @@ impl LlmClient {
             read_response_json_limited(response, "Anthropic API").await?;
 
         let mut content = String::new();
+        let mut reasoning: Option<String> = None;
         let mut tool_calls = Vec::new();
 
         for block in response.content {
             match block {
                 ContentBlock::Text { text } => {
                     content.push_str(&text);
+                }
+                ContentBlock::Thinking { thinking } => {
+                    if !thinking.trim().is_empty() {
+                        reasoning
+                            .get_or_insert_with(String::new)
+                            .push_str(&thinking);
+                    }
+                }
+                ContentBlock::RedactedThinking { data } => {
+                    if !data.trim().is_empty() {
+                        let reasoning = reasoning.get_or_insert_with(String::new);
+                        if !reasoning.is_empty() {
+                            reasoning.push('\n');
+                        }
+                        reasoning.push_str("[redacted_thinking]");
+                    }
                 }
                 ContentBlock::ToolUse { id, name, input } => {
                     tool_calls.push(ToolCall {
@@ -3310,6 +3404,7 @@ impl LlmClient {
                         arguments: input,
                     });
                 }
+                ContentBlock::Other => {}
             }
         }
 
@@ -3319,11 +3414,20 @@ impl LlmClient {
         let completion_chars = generated_output_chars_for_usage(&content, &tool_calls);
         let usage = Some(usage_or_estimated_with_output_floor(
             response.usage.map(|u| LlmTokenUsage {
-                prompt_tokens: u.input_tokens,
+                prompt_tokens: u
+                    .input_tokens
+                    .saturating_add(u.cache_creation_input_tokens)
+                    .saturating_add(u.cache_read_input_tokens),
                 completion_tokens: u.output_tokens,
-                total_tokens: u.input_tokens.saturating_add(u.output_tokens),
+                total_tokens: u
+                    .input_tokens
+                    .saturating_add(u.cache_creation_input_tokens)
+                    .saturating_add(u.cache_read_input_tokens)
+                    .saturating_add(u.output_tokens),
                 estimated: false,
                 cost_usd: None,
+                cached_prompt_tokens: u.cache_read_input_tokens,
+                cache_creation_prompt_tokens: u.cache_creation_input_tokens,
             }),
             prompt_chars,
             completion_chars,
@@ -3332,7 +3436,7 @@ impl LlmClient {
         Ok(LlmResponse {
             content,
             tool_calls,
-            reasoning: None,
+            reasoning,
             usage,
             provider: "anthropic".to_string(),
             model: model.to_string(),
@@ -3436,6 +3540,10 @@ impl LlmClient {
             total_tokens: u64,
             #[serde(default)]
             cost: Option<serde_json::Value>,
+            #[serde(default)]
+            prompt_tokens_details: Option<OpenAiTokenUsageDetails>,
+            #[serde(default)]
+            input_tokens_details: Option<OpenAiTokenUsageDetails>,
         }
 
         #[derive(Deserialize)]
@@ -3888,6 +3996,11 @@ impl LlmClient {
                     ),
                     estimated: false,
                     cost_usd: u.cost.as_ref().and_then(parse_json_f64),
+                    cached_prompt_tokens: openai_cached_prompt_tokens_from_details(
+                        u.prompt_tokens_details.as_ref(),
+                        u.input_tokens_details.as_ref(),
+                    ),
+                    cache_creation_prompt_tokens: 0,
                 }),
                 prompt_chars,
                 completion_chars,
@@ -4179,6 +4292,8 @@ impl LlmClient {
                     total_tokens: p.saturating_add(c),
                     estimated: false,
                     cost_usd: None,
+                    cached_prompt_tokens: 0,
+                    cache_creation_prompt_tokens: 0,
                 }),
                 _ => None,
             },
@@ -4358,6 +4473,8 @@ impl LlmClient {
                     total_tokens: p.saturating_add(c),
                     estimated: false,
                     cost_usd: None,
+                    cached_prompt_tokens: 0,
+                    cache_creation_prompt_tokens: 0,
                 }),
                 _ => None,
             },
@@ -4733,6 +4850,10 @@ impl LlmClient {
             total_tokens: u64,
             #[serde(default)]
             cost: Option<serde_json::Value>,
+            #[serde(default)]
+            prompt_tokens_details: Option<OpenAiTokenUsageDetails>,
+            #[serde(default)]
+            input_tokens_details: Option<OpenAiTokenUsageDetails>,
         }
 
         #[derive(Deserialize)]
@@ -5238,6 +5359,11 @@ impl LlmClient {
                         ),
                         estimated: false,
                         cost_usd: chunk_usage.cost.as_ref().and_then(parse_json_f64),
+                        cached_prompt_tokens: openai_cached_prompt_tokens_from_details(
+                            chunk_usage.prompt_tokens_details.as_ref(),
+                            chunk_usage.input_tokens_details.as_ref(),
+                        ),
+                        cache_creation_prompt_tokens: 0,
                     });
                     chunk_had_meaningful_progress = true;
                 }
@@ -5709,6 +5835,10 @@ impl LlmClient {
             input_tokens: Option<u64>,
             #[serde(default)]
             output_tokens: Option<u64>,
+            #[serde(default)]
+            cache_creation_input_tokens: Option<u64>,
+            #[serde(default)]
+            cache_read_input_tokens: Option<u64>,
         }
 
         #[derive(Deserialize, Default)]
@@ -5730,6 +5860,10 @@ impl LlmClient {
             #[serde(default)]
             text: Option<String>,
             #[serde(default)]
+            thinking: Option<String>,
+            #[serde(default)]
+            data: Option<String>,
+            #[serde(default)]
             partial_json: Option<String>,
         }
 
@@ -5741,6 +5875,16 @@ impl LlmClient {
                 #[serde(default)]
                 text: Option<String>,
             },
+            #[serde(rename = "thinking")]
+            Thinking {
+                #[serde(default)]
+                thinking: Option<String>,
+            },
+            #[serde(rename = "redacted_thinking")]
+            RedactedThinking {
+                #[serde(default)]
+                data: Option<String>,
+            },
             #[serde(rename = "tool_use")]
             ToolUse {
                 id: String,
@@ -5748,6 +5892,16 @@ impl LlmClient {
                 #[serde(default)]
                 input: Option<serde_json::Value>,
             },
+            #[serde(other)]
+            Other,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum AnthropicStreamBlockKind {
+            Text,
+            Thinking,
+            Tool,
+            Other,
         }
 
         #[derive(Default)]
@@ -5841,7 +5995,9 @@ impl LlmClient {
         }
 
         let mut content = String::new();
+        let mut reasoning: Option<String> = None;
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
+        let mut block_kinds: HashMap<usize, AnthropicStreamBlockKind> = HashMap::new();
         let mut stream_block_parser = stream_blocks::StreamBlockParser::new();
         let stream_started = std::time::Instant::now();
 
@@ -5850,6 +6006,8 @@ impl LlmClient {
         let mut done = false;
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
+        let mut cache_creation_input_tokens: Option<u64> = None;
+        let mut cache_read_input_tokens: Option<u64> = None;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -5879,18 +6037,36 @@ impl LlmClient {
                         if let Ok(parsed) = serde_json::from_str::<MessageStartEvent>(data) {
                             merge_usage_field(&mut input_tokens, parsed.usage.input_tokens);
                             merge_usage_field(&mut output_tokens, parsed.usage.output_tokens);
+                            merge_usage_field(
+                                &mut cache_creation_input_tokens,
+                                parsed.usage.cache_creation_input_tokens,
+                            );
+                            merge_usage_field(
+                                &mut cache_read_input_tokens,
+                                parsed.usage.cache_read_input_tokens,
+                            );
                         }
                     }
                     "message_delta" => {
                         if let Ok(parsed) = serde_json::from_str::<MessageDeltaEvent>(data) {
                             merge_usage_field(&mut input_tokens, parsed.usage.input_tokens);
                             merge_usage_field(&mut output_tokens, parsed.usage.output_tokens);
+                            merge_usage_field(
+                                &mut cache_creation_input_tokens,
+                                parsed.usage.cache_creation_input_tokens,
+                            );
+                            merge_usage_field(
+                                &mut cache_read_input_tokens,
+                                parsed.usage.cache_read_input_tokens,
+                            );
                         }
                     }
                     "content_block_start" => {
                         if let Ok(parsed) = serde_json::from_str::<ContentBlockStartEvent>(data) {
                             match parsed.content_block {
                                 AnthropicContentBlock::Text { text } => {
+                                    block_kinds
+                                        .insert(parsed.index, AnthropicStreamBlockKind::Text);
                                     if let Some(text) = text {
                                         if !text.is_empty() {
                                             content.push_str(&text);
@@ -5902,11 +6078,40 @@ impl LlmClient {
                                         }
                                     }
                                 }
+                                AnthropicContentBlock::Thinking { thinking } => {
+                                    block_kinds
+                                        .insert(parsed.index, AnthropicStreamBlockKind::Thinking);
+                                    if let Some(thinking) = thinking {
+                                        if !thinking.is_empty() {
+                                            reasoning
+                                                .get_or_insert_with(String::new)
+                                                .push_str(&thinking);
+                                            queue_reasoning_delta(&token_tx, "model", thinking);
+                                        }
+                                    }
+                                }
+                                AnthropicContentBlock::RedactedThinking { data } => {
+                                    block_kinds
+                                        .insert(parsed.index, AnthropicStreamBlockKind::Thinking);
+                                    if data.as_deref().is_some_and(|value| !value.is_empty()) {
+                                        let reasoning = reasoning.get_or_insert_with(String::new);
+                                        if !reasoning.is_empty() {
+                                            reasoning.push('\n');
+                                        }
+                                        reasoning.push_str("[redacted_thinking]");
+                                    }
+                                }
                                 AnthropicContentBlock::ToolUse { id, name, input } => {
+                                    block_kinds
+                                        .insert(parsed.index, AnthropicStreamBlockKind::Tool);
                                     let entry = tool_builders.entry(parsed.index).or_default();
                                     entry.id = id;
                                     entry.name = name;
                                     entry.input_value = input;
+                                }
+                                AnthropicContentBlock::Other => {
+                                    block_kinds
+                                        .insert(parsed.index, AnthropicStreamBlockKind::Other);
                                 }
                             }
                         }
@@ -5916,13 +6121,45 @@ impl LlmClient {
                             if parsed.delta.delta_type == "text_delta" {
                                 if let Some(text) = parsed.delta.text {
                                     if !text.is_empty() {
-                                        content.push_str(&text);
-                                        emit_stream_block_events(
-                                            &token_tx,
-                                            stream_block_parser.feed(&text),
-                                        )
-                                        .await;
+                                        if block_kinds.get(&parsed.index).is_some_and(|kind| {
+                                            *kind == AnthropicStreamBlockKind::Thinking
+                                        }) {
+                                            reasoning
+                                                .get_or_insert_with(String::new)
+                                                .push_str(&text);
+                                            queue_reasoning_delta(&token_tx, "model", text);
+                                        } else {
+                                            content.push_str(&text);
+                                            emit_stream_block_events(
+                                                &token_tx,
+                                                stream_block_parser.feed(&text),
+                                            )
+                                            .await;
+                                        }
                                     }
+                                }
+                            } else if parsed.delta.delta_type == "thinking_delta" {
+                                let delta = parsed
+                                    .delta
+                                    .thinking
+                                    .or(parsed.delta.text)
+                                    .unwrap_or_default();
+                                if !delta.is_empty() {
+                                    reasoning.get_or_insert_with(String::new).push_str(&delta);
+                                    queue_reasoning_delta(&token_tx, "model", delta);
+                                }
+                            } else if parsed.delta.delta_type == "redacted_thinking_delta" {
+                                if parsed
+                                    .delta
+                                    .data
+                                    .as_deref()
+                                    .is_some_and(|value| !value.is_empty())
+                                {
+                                    let reasoning = reasoning.get_or_insert_with(String::new);
+                                    if !reasoning.is_empty() {
+                                        reasoning.push('\n');
+                                    }
+                                    reasoning.push_str("[redacted_thinking]");
                                 }
                             } else if parsed.delta.delta_type == "input_json_delta" {
                                 if let Some(partial) = parsed.delta.partial_json {
@@ -6075,22 +6312,42 @@ impl LlmClient {
         let usage = Some(usage_or_estimated_with_output_floor(
             match (input_tokens, output_tokens) {
                 (Some(prompt_tokens), Some(completion_tokens)) => Some(LlmTokenUsage {
-                    prompt_tokens,
+                    prompt_tokens: prompt_tokens
+                        .saturating_add(cache_creation_input_tokens.unwrap_or(0))
+                        .saturating_add(cache_read_input_tokens.unwrap_or(0)),
                     completion_tokens,
-                    total_tokens: total_tokens_or_sum(0, prompt_tokens, completion_tokens),
+                    total_tokens: total_tokens_or_sum(
+                        0,
+                        prompt_tokens
+                            .saturating_add(cache_creation_input_tokens.unwrap_or(0))
+                            .saturating_add(cache_read_input_tokens.unwrap_or(0)),
+                        completion_tokens,
+                    ),
                     estimated: false,
                     cost_usd: None,
+                    cached_prompt_tokens: cache_read_input_tokens.unwrap_or(0),
+                    cache_creation_prompt_tokens: cache_creation_input_tokens.unwrap_or(0),
                 }),
                 _ => None,
             },
             prompt_chars,
             completion_chars,
         ));
+        if reasoning.is_some() {
+            queue_stream_event(
+                &token_tx,
+                StreamEvent::ReasoningDelta {
+                    phase: "model".to_string(),
+                    content_delta: String::new(),
+                    done: true,
+                },
+            );
+        }
 
         Ok(LlmResponse {
             content,
             tool_calls,
-            reasoning: None,
+            reasoning,
             usage,
             provider: "anthropic".to_string(),
             model: model.to_string(),

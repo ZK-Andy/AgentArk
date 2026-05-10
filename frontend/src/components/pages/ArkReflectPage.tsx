@@ -681,7 +681,7 @@ function followupHasSourceEvidence(item: ReflectSuggestedFollowup): boolean {
 
 function isDisplayableOpportunity(item: ReflectSuggestedFollowup): boolean {
   if (item.kind === "recovery_advice") return true;
-  if (item.kind === "latest_developments") return followupHasSourceEvidence(item);
+  if (item.kind === "latest_developments") return true;
   return false;
 }
 
@@ -973,7 +973,7 @@ function latestDevelopmentSummary(item: ReflectSuggestedFollowup): string {
   if (item.search_error) return compactText(item.search_error, 180);
   return item.search_results.length > 0
     ? "Sources are cached. The plain-language insight will appear after the background synthesis worker finishes."
-    : compactText(item.detail || "Current-source check is queued.", 180);
+    : compactText(item.detail || "Opportunity classified. Source enrichment is queued.", 180);
 }
 
 function latestUpdateSummary(item: ReflectSuggestedFollowup): string {
@@ -999,7 +999,7 @@ function followupWhatThisIs(item: ReflectSuggestedFollowup): string {
     if (item.latest_summary) return `Source-backed insight inferred from ${origin}.`;
     if (item.search_results.length > 0) return `Current-source check inferred from ${origin}; summary worker pending.`;
     if (item.status === "failed") return `Current-source check inferred from ${origin}; source fetch failed.`;
-    return `Inferred intent from ${origin}; queued for current-source research.`;
+    return `Classified opportunity from ${origin}; source enrichment is queued.`;
   }
   if (item.kind === "recovery_advice") {
     return `Recovery item from ${origin}; a prior run needs follow-up.`;
@@ -1064,7 +1064,7 @@ function followupKindLabel(kind: string): string {
 
 function followupStatusLabel(item: ReflectSuggestedFollowup): string {
   if (item.kind === "latest_developments") {
-    if (item.status === "queued") return "Checking current sources";
+    if (item.status === "queued") return "Research queued";
     if (item.status === "failed") return "Source check failed";
     if (item.search_results.length > 0 && !item.latest_summary && !item.latest_summary_error) {
       return "Summarizing insight";
@@ -1391,7 +1391,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     () => narrativeLines(response, focusLabel, totalUnits, learnedCount, backgroundCount, recurringCount),
     [backgroundCount, focusLabel, learnedCount, recurringCount, response, totalUnits],
   );
-  const hasReflectContent = clusters.length > 0;
+  const hasReflectContent = Boolean(response) || reflectQ.isFetching || refreshMutation.isPending;
   const selectedRangeLabel = rangeLabel || formatUiDateRange(fromIso, toIso);
   const sourceSignalCount = totalForSourceCounts(response?.source_counts);
   const emptyStateDetail = response
@@ -1906,9 +1906,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
     ...(topClusters.length > 0
       ? [{ value: "topics" as const, label: "Topics", short: "Topics", count: topicRows.length }]
       : []),
-    ...(opportunityFollowups.length > 0
-      ? [{ value: "latest" as const, label: "Opportunities", short: "Opportunities", count: opportunityFollowups.length }]
-      : []),
+    { value: "latest" as const, label: "Opportunities", short: "Opportunities", count: opportunityFollowups.length },
     ...(showWeeklyReplay
       ? [{ value: "timeline" as const, label: "Timeline", short: "Timeline", count: replayUnits.length }]
       : []),
@@ -1992,15 +1990,13 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
                 clickable
                 onClick={() => setStoryTab("topics")}
               />
-              {opportunityFollowups.length > 0 ? (
-                <Chip
-                  className="arkreflect-pill"
-                  icon={<SearchRoundedIcon />}
-                  label={`${opportunityFollowups.length} opportunities`}
-                  clickable
-                  onClick={() => setStoryTab("latest")}
-                />
-              ) : null}
+              <Chip
+                className="arkreflect-pill"
+                icon={<SearchRoundedIcon />}
+                label={`${opportunityFollowups.length} opportunities`}
+                clickable
+                onClick={() => setStoryTab("latest")}
+              />
               <Chip
                 className="arkreflect-pill"
                 icon={<RefreshRoundedIcon />}
@@ -2313,6 +2309,46 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
             </Stack>
           </Stack>
           <Stack spacing={1}>
+            {opportunityFollowups.length === 0 ? (
+              <Box
+                sx={{
+                  p: { xs: 1.4, md: 1.8 },
+                  minHeight: 220,
+                  border: "1px solid var(--surface-border)",
+                  borderRadius: "8px",
+                  background: "var(--ui-rgba-255-255-255-020)",
+                  display: "grid",
+                  alignItems: "center",
+                }}
+              >
+                <Stack spacing={1.1} sx={{ maxWidth: 720 }}>
+                  <Box sx={{ color: "var(--cyan)" }}>
+                    <SearchRoundedIcon />
+                  </Box>
+                  <Typography sx={{ ...titleSx, fontSize: { xs: "1.15rem", md: "1.35rem" } }}>
+                    {response?.refresh_status.running || refreshMutation.isPending
+                      ? "Finding opportunities"
+                      : "No opportunities ready for this range"}
+                  </Typography>
+                  <Typography sx={bodySx}>
+                    {response?.refresh_status.running || refreshMutation.isPending
+                      ? "ArkReflect is refreshing this range. Any useful source check, recovery path, or follow-up will appear here."
+                      : totalUnits > 0
+                        ? "This range has reflected activity, but nothing is actionable enough to show as an opportunity yet."
+                        : "No reflected activity is cached for this range yet. This tab stays available while ArkReflect waits for enough activity."}
+                  </Typography>
+                  <Button
+                    variant="outlined"
+                    startIcon={<RefreshRoundedIcon />}
+                    disabled={refreshMutation.isPending || response?.refresh_status.running}
+                    onClick={() => refreshMutation.mutate()}
+                    sx={{ alignSelf: "flex-start", borderRadius: "8px" }}
+                  >
+                    {response?.refresh_status.running || refreshMutation.isPending ? "Running ArkReflect" : "Run ArkReflect now"}
+                  </Button>
+                </Stack>
+              </Box>
+            ) : null}
             {visibleOpportunityFollowups.map((item) => {
               const isLatest = item.kind === "latest_developments";
               const itemIcon = isLatest ? (
@@ -2475,7 +2511,7 @@ export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkRef
   return (
     <WorkspacePageShell spacing={1.4}>
       <WorkspacePageHeader
-        eyebrow="Ark Core / ArkReflect"
+        eyebrow="ARK CORE"
         title="ArkReflect"
         description={
           <span>

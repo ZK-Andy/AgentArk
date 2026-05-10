@@ -1,17 +1,23 @@
 use super::action_selection::{action_is_read_only, action_is_read_only_knowledge_action};
 use super::*;
 
-fn action_supports_orchestration(action: &crate::actions::ActionDef) -> bool {
-    matches!(
-        action.planner_metadata().role,
-        PlannerActionRole::Orchestration
-    )
-}
-
-fn action_supports_code_mutation(action: &crate::actions::ActionDef) -> bool {
+fn action_is_scheduler_default_candidate(action: &crate::actions::ActionDef) -> bool {
     let metadata = action.planner_metadata();
-    matches!(metadata.role, PlannerActionRole::Mutation)
-        && matches!(metadata.integration_class, PlannerIntegrationClass::Code)
+    let read_only_source = matches!(metadata.side_effect_level, PlannerSideEffectLevel::None)
+        && matches!(
+            metadata.role,
+            PlannerActionRole::DataSource
+                | PlannerActionRole::Inspection
+                | PlannerActionRole::Trigger
+        );
+    let internal_notification =
+        matches!(metadata.side_effect_level, PlannerSideEffectLevel::Notify)
+            && matches!(metadata.role, PlannerActionRole::Delivery)
+            && matches!(
+                metadata.integration_class,
+                PlannerIntegrationClass::Internal
+            );
+    read_only_source || internal_notification
 }
 
 fn watcher_cadence_label(interval_secs: u64) -> String {
@@ -2377,37 +2383,33 @@ impl Agent {
             return;
         }
         if is_external_notification_channel(&report_to) {
-            let outcomes = self
-                .notify_preferred_channel_reported_with_hint(
-                    message,
-                    Some(&report_to),
-                    !super::task::task_is_scheduled_reminder(task),
-                )
-                .await;
-            if outcomes.iter().any(|outcome| {
-                outcome.success && is_external_notification_channel(&outcome.channel)
-            }) {
+            let outcome = if self
+                .notification_channel_is_configured_any(&report_to)
+                .await
+            {
+                self.try_send_notification_reported(&report_to, message)
+                    .await
+            } else {
+                notification_channel_not_connected_outcome(&report_to)
+            };
+            if outcome.success && is_external_notification_channel(&outcome.channel) {
                 return;
             }
             let delivery_label = notification_channel_display_name(&report_to);
-            let errors = outcomes
-                .iter()
-                .filter_map(|outcome| outcome.error.as_deref())
+            let error = outcome
+                .error
+                .as_deref()
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
-            let body = if errors.is_empty() {
+                .filter(|value| !value.is_empty());
+            let body = if let Some(error) = error {
                 format!(
-                    "Task '{}' completed. {} delivery and fallback delivery were unavailable, so the result stayed in-app.\n\n{}",
-                    task.description, delivery_label, message
+                    "Task '{}' completed. {} delivery is unavailable, so the result stayed in-app.\n\nDelivery error: {}\n\n{}",
+                    task.description, delivery_label, error, message
                 )
             } else {
                 format!(
-                    "Task '{}' completed. {} delivery and fallback delivery were unavailable, so the result stayed in-app.\n\nDelivery errors: {}\n\n{}",
-                    task.description,
-                    delivery_label,
-                    errors.join("; "),
-                    message
+                    "Task '{}' completed. {} delivery is unavailable, so the result stayed in-app.\n\n{}",
+                    task.description, delivery_label, message
                 )
             };
             if is_webhook {
@@ -3175,6 +3177,71 @@ impl Agent {
         let preferred_hint = self
             .preferred_watcher_notification_channel_hint(&watcher)
             .await;
+        let authorization_delivery_channel = if requested_channel == "preferred" {
+            preferred_hint
+                .clone()
+                .unwrap_or_else(|| "preferred".to_string())
+        } else {
+            requested_channel.clone()
+        };
+        if requested_channel == "preferred"
+            || is_external_notification_channel(&authorization_delivery_channel)
+        {
+            let notification_auth = automation_runtime_authorization_context(
+                &watcher.poll_arguments,
+                crate::actions::ActionExecutionSurface::Background,
+            );
+            let notify_arguments = serde_json::json!({
+                "message": notify_text.clone(),
+                "delivery_channel": authorization_delivery_channel.clone(),
+            });
+            let action_def = self.runtime.action_definition("notify_user").await;
+            let decision = self
+                .runtime
+                .authorize_action_invocation(
+                    "notify_user",
+                    action_def.as_ref(),
+                    &notify_arguments,
+                    &notification_auth,
+                )
+                .await;
+            match decision {
+                Ok(decision) if decision.allowed => {}
+                Ok(decision) => {
+                    self.watcher_manager
+                        .push_notification_attempt(
+                            watcher.id,
+                            super::watcher::WatcherNotificationAttempt {
+                                attempted_at: chrono::Utc::now(),
+                                channel: authorization_delivery_channel.clone(),
+                                success: false,
+                                message: notify_text.clone(),
+                                error: Some(decision.reason),
+                            },
+                        )
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    self.watcher_manager
+                        .push_notification_attempt(
+                            watcher.id,
+                            super::watcher::WatcherNotificationAttempt {
+                                attempted_at: chrono::Utc::now(),
+                                channel: authorization_delivery_channel.clone(),
+                                success: false,
+                                message: notify_text.clone(),
+                                error: Some(format!(
+                                    "Notification authorization failed: {}",
+                                    error
+                                )),
+                            },
+                        )
+                        .await;
+                    return;
+                }
+            }
+        }
         if requested_channel == "preferred" {
             let outcomes = self
                 .notify_preferred_channel_reported_with_hint(
@@ -3233,46 +3300,46 @@ impl Agent {
                 .await;
         } else if !requested_channel.is_empty() {
             if is_external_notification_channel(&requested_channel) {
-                let outcomes = self
-                    .notify_preferred_channel_reported_with_hint(
-                        &notify_text,
-                        Some(&requested_channel),
-                        true,
-                    )
-                    .await;
-                for outcome in outcomes {
-                    if outcome.success && is_external_notification_channel(&outcome.channel) {
-                        if let Some(image) = notification_image.as_ref() {
-                            let image_outcome = self
-                                .try_send_notification_image_reported(
-                                    &outcome.channel,
-                                    &notify_text,
-                                    image,
-                                )
-                                .await;
-                            if !image_outcome.success {
-                                tracing::warn!(
-                                    "Watcher '{}' image notification failed via '{}': {:?}",
-                                    watcher.id,
-                                    image_outcome.channel,
-                                    image_outcome.error
-                                );
-                            }
+                let outcome = if self
+                    .notification_channel_is_configured_any(&requested_channel)
+                    .await
+                {
+                    self.try_send_notification_reported(&requested_channel, &notify_text)
+                        .await
+                } else {
+                    notification_channel_not_connected_outcome(&requested_channel)
+                };
+                if outcome.success && is_external_notification_channel(&outcome.channel) {
+                    if let Some(image) = notification_image.as_ref() {
+                        let image_outcome = self
+                            .try_send_notification_image_reported(
+                                &outcome.channel,
+                                &notify_text,
+                                image,
+                            )
+                            .await;
+                        if !image_outcome.success {
+                            tracing::warn!(
+                                "Watcher '{}' image notification failed via '{}': {:?}",
+                                watcher.id,
+                                image_outcome.channel,
+                                image_outcome.error
+                            );
                         }
                     }
-                    self.watcher_manager
-                        .push_notification_attempt(
-                            watcher.id,
-                            super::watcher::WatcherNotificationAttempt {
-                                attempted_at: chrono::Utc::now(),
-                                channel: outcome.channel,
-                                success: outcome.success,
-                                message: notify_text.clone(),
-                                error: outcome.error,
-                            },
-                        )
-                        .await;
                 }
+                self.watcher_manager
+                    .push_notification_attempt(
+                        watcher.id,
+                        super::watcher::WatcherNotificationAttempt {
+                            attempted_at: chrono::Utc::now(),
+                            channel: outcome.channel,
+                            success: outcome.success,
+                            message: notify_text.clone(),
+                            error: outcome.error,
+                        },
+                    )
+                    .await;
                 return;
             }
             let outcome = self
@@ -3535,11 +3602,7 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         .into_iter()
         .max_by_key(|(_, score)| *score)?;
 
-        if best.1 == 0 {
-            None
-        } else {
-            Some(best.0)
-        }
+        if best.1 == 0 { None } else { Some(best.0) }
     }
 
     pub(super) async fn normalize_action_arguments(
@@ -3578,21 +3641,6 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             }
         }
 
-        let initial_missing = super::argument_repair::missing_required_fields(&action, &payload);
-
-        if !initial_missing.is_empty() {
-            let ctx = super::argument_repair::ArgumentRepairContext::from_message(fallback_text);
-            let mut memo = super::argument_repair::RepairMemo::default();
-            self.fill_missing_required_fields_via_inference(
-                &action,
-                &mut payload,
-                &ctx,
-                &initial_missing,
-                &mut memo,
-            )
-            .await;
-        }
-
         // Action-agnostic structural fallback: any required field literally
         // named `query` may be filled from the original fallback_text. This is
         // a schema-shape rule, not phrasing logic.
@@ -3618,60 +3666,6 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         }
 
         Ok(serde_json::Value::Object(payload))
-    }
-
-    pub(super) async fn infer_missing_action_arguments(
-        &self,
-        action: &crate::actions::ActionDef,
-        current_payload: &serde_json::Map<String, serde_json::Value>,
-        request_text: &str,
-        missing_fields: &[String],
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let trimmed_request = request_text.trim();
-        if trimmed_request.is_empty() || missing_fields.is_empty() {
-            return None;
-        }
-
-        let schema_props = action
-            .input_schema
-            .get("properties")
-            .and_then(|value| value.as_object())
-            .cloned()
-            .unwrap_or_default();
-        let mut missing_schema = serde_json::Map::new();
-        for field in missing_fields {
-            if let Some(definition) = schema_props.get(field) {
-                missing_schema.insert(field.clone(), definition.clone());
-            }
-        }
-
-        let prompt = serde_json::json!({
-            "action_name": action.name,
-            "action_description": action.description,
-            "request_text": trimmed_request,
-            "current_arguments": current_payload,
-            "missing_fields": missing_fields,
-            "missing_field_schema": missing_schema,
-        });
-
-        let response = self
-            .supervised_internal_chat(
-                "automation",
-                "argument_inference",
-                "argument_inference",
-                &ModelRole::Fast,
-                vec![],
-                "You infer missing required automation action arguments from a user request. Return strict JSON object only with the missing fields you can infer confidently. Do not include prose, markdown, or fields not requested.",
-                &prompt.to_string(),
-                &[],
-                &[],
-                internal_llm_timeout_ms("AGENTARK_ARGUMENT_INFERENCE_TIMEOUT_MS", 20_000),
-                2,
-            )
-            .await?;
-
-        let parsed = extract_json_object_from_text(&response.content)?;
-        parsed.as_object().cloned()
     }
 
     pub(super) fn extract_structured_watcher_condition_payload(
@@ -4559,25 +4553,16 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             &task_args,
         );
 
-        // Dynamically select the best action from registered actions.
-        let preferred_task_action = preferred_direct_action_name(&task_desc, &all_actions);
-        let best_action = all_actions
-            .iter()
-            .filter(|action| !action_supports_orchestration(action))
-            .map(|action| {
-                let mut score = action_intent_score(&task_desc, action);
-                if preferred_task_action
-                    .as_ref()
-                    .map(|name| name == &action.name)
-                    .unwrap_or(false)
-                {
-                    score = score.max(1.0);
-                }
-                (score, action.name.clone())
-            })
-            .filter(|(score, _)| *score >= 0.05)
-            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if explicit_action.is_some() && !explicit_valid {
+            return Some(format!(
+                "Scheduled task action `{}` is not available in the enabled action catalog. Use an enabled action or omit `action` so AgentArk can choose a safe default.",
+                explicit_action.as_deref().unwrap_or_default()
+            ));
+        }
 
+        // Runtime must not infer a different action from task text. It can use
+        // an explicit bound action, a safe reminder default, or a deterministic
+        // read-only/internal fallback that validation will still check.
         let mut action_name = if explicit_valid {
             explicit_action.unwrap_or_default()
         } else if reminder_default
@@ -4586,8 +4571,6 @@ Return: 1 short status paragraph + 3 bullet next steps.",
                 .any(|action| action.name == "notify_user")
         {
             "notify_user".to_string()
-        } else if let Some((_, name)) = best_action {
-            name
         } else if let Some(action) = all_actions
             .iter()
             .find(|action| action_is_read_only_knowledge_action(action))
@@ -4595,15 +4578,8 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             action.name.clone()
         } else if let Some(action) = all_actions
             .iter()
-            .find(|action| action_supports_code_mutation(action))
+            .find(|action| action_is_scheduler_default_candidate(action))
         {
-            action.name.clone()
-        } else if let Some(action) = all_actions
-            .iter()
-            .find(|action| action_is_read_only(action))
-        {
-            action.name.clone()
-        } else if let Some(action) = all_actions.first() {
             action.name.clone()
         } else {
             "notify_user".to_string()
@@ -5561,6 +5537,35 @@ Return: 1 short status paragraph + 3 bullet next steps.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn action(name: &str, description: &str, capabilities: &[&str]) -> crate::actions::ActionDef {
+        crate::actions::ActionDef {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            capabilities: capabilities.iter().map(|value| value.to_string()).collect(),
+            ..crate::actions::ActionDef::default()
+        }
+    }
+
+    #[test]
+    fn scheduler_default_selection_never_invents_app_deploy() {
+        let app_deploy = action(
+            "app_deploy",
+            "Deploy a browser application and return a live URL.",
+            &["app_hosting"],
+        );
+        let read_only = action(
+            "google_drive_search",
+            "Search connected Google Drive files.",
+            &["google_workspace"],
+        );
+        let notify = action("notify_user", "Notify the user.", &[]);
+
+        assert!(!action_is_scheduler_default_candidate(&app_deploy));
+        assert!(action_is_scheduler_default_candidate(&read_only));
+        assert!(action_is_scheduler_default_candidate(&notify));
+    }
 
     #[test]
     fn schedule_batch_items_inherit_and_override_delivery_route() {

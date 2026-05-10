@@ -209,6 +209,100 @@ mod tests {
         assert!(ids.contains("becf46bb"));
         assert_eq!(ids.len(), 2);
     }
+
+    #[test]
+    fn arkpulse_auth_failures_alone_are_not_security_incidents() {
+        let thresholds = ArkPulseSecurityThresholds {
+            auth_failures: 2,
+            rate_limit_hits: 10,
+            unauthorized_channel: 10,
+            combined: 12,
+        };
+        let auth_only = crate::core::SecuritySnapshot {
+            auth_failures: 200,
+            rate_limit_hits: 0,
+            unauthorized_channel_attempts: 0,
+            injection_attempts: 0,
+        };
+        assert!(!is_security_incident(Some(&auth_only), thresholds));
+
+        let rate_limited = crate::core::SecuritySnapshot {
+            rate_limit_hits: 10,
+            ..auth_only.clone()
+        };
+        assert!(is_security_incident(Some(&rate_limited), thresholds));
+
+        let mixed_spike = crate::core::SecuritySnapshot {
+            auth_failures: 11,
+            rate_limit_hits: 1,
+            ..auth_only
+        };
+        assert!(is_security_incident(Some(&mixed_spike), thresholds));
+    }
+
+    #[test]
+    fn arkpulse_auth_doctor_findings_need_correlated_attack_to_push() {
+        let auth_finding = DoctorFinding {
+            severity: "critical".to_string(),
+            category: "attack_surface".to_string(),
+            target: "/api/apps".to_string(),
+            title: "Public app surface exposed protected inventory endpoint".to_string(),
+            evidence: "GET /api/apps over public surface returned 200".to_string(),
+            root_cause: "Sensitive management endpoint is reachable without auth.".to_string(),
+            fix_command: "Require auth middleware for remotely reachable management routes"
+                .to_string(),
+            remediation: None,
+            user_actionable: true,
+        };
+        assert!(doctor_finding_requires_correlated_attack(&auth_finding));
+        assert!(!doctor_finding_counts_for_critical_alert(
+            &auth_finding,
+            false
+        ));
+        assert!(doctor_finding_counts_for_critical_alert(
+            &auth_finding,
+            true
+        ));
+
+        let secret_finding = DoctorFinding {
+            severity: "critical".to_string(),
+            category: "secrets".to_string(),
+            title: "Potential secret exposure".to_string(),
+            user_actionable: true,
+            ..DoctorFinding::default()
+        };
+        assert!(doctor_finding_counts_for_critical_alert(
+            &secret_finding,
+            false
+        ));
+    }
+
+    #[test]
+    fn arkpulse_critical_message_omits_auth_fix_without_attack_signal() {
+        let auth_finding = DoctorFinding {
+            severity: "critical".to_string(),
+            category: "attack_surface".to_string(),
+            target: "/api/apps".to_string(),
+            title: "Public app surface exposed protected inventory endpoint".to_string(),
+            evidence: "GET /api/apps over public surface returned 200".to_string(),
+            root_cause: "Sensitive management endpoint is reachable without auth.".to_string(),
+            fix_command: "Require auth middleware for remotely reachable management routes"
+                .to_string(),
+            remediation: None,
+            user_actionable: true,
+        };
+        let (message, flags) = build_critical_notification(
+            2,
+            0,
+            0,
+            None,
+            ArkPulseSecurityThresholds::default(),
+            &[auth_finding],
+        );
+        assert!(message.contains("2 failed task(s)"));
+        assert!(!message.contains("Require auth middleware"));
+        assert!(!flags.contains(&"doctor_high".to_string()));
+    }
 }
 
 struct SentinelMaintenanceGuard;
@@ -3721,6 +3815,8 @@ pub struct SentinelConfig {
     pub pattern_induction_interval: u64,
     /// How often to generate approval-gated learning candidates (seconds)
     pub candidate_generation_interval: u64,
+    /// How often to apply learned ArkMemory health-review feedback (seconds)
+    pub arkmemory_learned_review_interval: u64,
     /// How often to expire old approvals (seconds)
     pub approval_expiry_interval: u64,
     /// How often to run ArkPulse (seconds, 0 = disabled)
@@ -3746,6 +3842,7 @@ impl Default for SentinelConfig {
             heuristic_reflection_interval: 750,
             pattern_induction_interval: 900,
             candidate_generation_interval: 1200,
+            arkmemory_learned_review_interval: 6 * 3600,
             approval_expiry_interval: 300,
             pulse_interval: 1800,            // 30 minutes
             unused_app_check_interval: 3600, // Check hourly, notify once daily per unused app
@@ -4048,6 +4145,42 @@ pub fn start(
         })
     });
 
+    if config.arkmemory_learned_review_interval > 0 {
+        handles.push({
+            let agent = agent.clone();
+            let mut shutdown = shutdown_rx.clone();
+            crate::spawn_logged!("src/sentinel.rs:arkmemory_learned_review", async move {
+                if !sleep_or_shutdown(std::time::Duration::from_secs(600), &mut shutdown).await {
+                    return;
+                }
+                let mut interval = sentinel_interval_secs(config.arkmemory_learned_review_interval);
+                interval.tick().await;
+                loop {
+                    if is_agent_autonomy_paused(&agent).await {
+                        if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                            break;
+                        }
+                        continue;
+                    }
+                    run_with_busy_deferral(
+                        &agent,
+                        "arkmemory_learned_review",
+                        MAINTENANCE_DEFER_MINUTES,
+                        MAINTENANCE_MAX_DEFERS,
+                        || {
+                            let agent = agent.clone();
+                            async move { run_arkmemory_learned_review_job(&agent).await }
+                        },
+                    )
+                    .await;
+                    if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                        break;
+                    }
+                }
+            })
+        });
+    }
+
     // -- Approval Expiry -------------------------------------------------
     handles.push({
         let agent = agent.clone();
@@ -4298,7 +4431,7 @@ pub fn start(
     });
 
     tracing::info!(
-        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, background_session_consolidation={}s, heuristic_reflection={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
+        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, background_session_consolidation={}s, heuristic_reflection={}s, pattern_induction={}s, candidate_generation={}s, arkmemory_learned_review={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
         config.scheduler_interval,
         config.watcher_interval,
         if config.integration_sync_interval > 0 {
@@ -4311,6 +4444,11 @@ pub fn start(
         config.heuristic_reflection_interval,
         config.pattern_induction_interval,
         config.candidate_generation_interval,
+        if config.arkmemory_learned_review_interval > 0 {
+            config.arkmemory_learned_review_interval.to_string()
+        } else {
+            "off".to_string()
+        },
         if config.pulse_interval > 0 {
             config.pulse_interval.to_string()
         } else {
@@ -5100,6 +5238,89 @@ async fn run_candidate_generation_job(agent: &SharedAgent) {
     }
 }
 
+async fn run_arkmemory_learned_review_job(agent: &SharedAgent) {
+    let started_at = chrono::Utc::now();
+    let (storage, llm, embedding_client) = {
+        let agent = agent.read().await;
+        (
+            agent.storage.clone(),
+            agent.llm.clone(),
+            agent.embedding_client.clone(),
+        )
+    };
+    match channels::http::run_arkmemory_learned_review_pass(
+        &storage,
+        &llm,
+        embedding_client.as_deref(),
+    )
+    .await
+    {
+        Ok(stats) => {
+            let completed_at = chrono::Utc::now();
+            let auto_reviewed = stats
+                .get("auto_reviewed")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let failed_examined = stats
+                .get("failed_examined")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let semantic_judgments = stats
+                .get("semantic_judgments")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if auto_reviewed > 0 {
+                tracing::info!(
+                    "ArkSentinel: ArkMemory learned reviewer auto-reviewed {} capture finding(s)",
+                    auto_reviewed
+                );
+            }
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "arkmemory_learned_review",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    if auto_reviewed > 0 {
+                        format!(
+                            "Applied learned review feedback to {} memory capture finding(s).",
+                            auto_reviewed
+                        )
+                    } else {
+                        format!(
+                            "Examined {} capture finding(s); {} needed semantic judgment and none were confident enough to auto-review.",
+                            failed_examined, semantic_judgments
+                        )
+                    },
+                    auto_reviewed > 0,
+                    stats,
+                ),
+            )
+            .await;
+        }
+        Err(error) => {
+            let completed_at = chrono::Utc::now();
+            tracing::debug!("ArkSentinel: ArkMemory learned review skipped: {}", error);
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "arkmemory_learned_review",
+                    "failed",
+                    started_at,
+                    completed_at,
+                    format!("ArkMemory learned review skipped: {}", error),
+                    false,
+                    serde_json::json!({
+                        "error": error.to_string(),
+                    }),
+                ),
+            )
+            .await;
+        }
+    }
+}
+
 // ===========================================================================
 // Approval Expiry
 // ===========================================================================
@@ -5336,23 +5557,66 @@ fn is_security_incident(
     if sec.injection_attempts > 0 {
         return true;
     }
-    if sec.auth_failures >= thresholds.auth_failures {
-        return true;
-    }
+    has_correlated_abuse_spike(sec, thresholds)
+}
+
+fn has_correlated_abuse_spike(
+    sec: &crate::core::SecuritySnapshot,
+    thresholds: ArkPulseSecurityThresholds,
+) -> bool {
     if sec.rate_limit_hits >= thresholds.rate_limit_hits {
         return true;
     }
     if sec.unauthorized_channel_attempts >= thresholds.unauthorized_channel {
         return true;
     }
-    let combined = sec.auth_failures + sec.rate_limit_hits + sec.unauthorized_channel_attempts;
-    combined >= thresholds.combined
+    let non_auth = sec.rate_limit_hits + sec.unauthorized_channel_attempts;
+    let combined = sec.auth_failures + non_auth;
+    non_auth > 0 && combined >= thresholds.combined
+}
+
+fn doctor_finding_requires_correlated_attack(finding: &DoctorFinding) -> bool {
+    let category = finding.category.trim().to_ascii_lowercase();
+    if category != "attack_surface" && category != "resource" {
+        return false;
+    }
+    let mut text = String::new();
+    for part in [
+        finding.title.as_str(),
+        finding.target.as_str(),
+        finding.evidence.as_str(),
+        finding.root_cause.as_str(),
+        finding.fix_command.as_str(),
+    ] {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(part);
+    }
+    let text = text.to_ascii_lowercase();
+    text.contains("without auth")
+        || text.contains("auth-failure")
+        || text.contains("auth failure")
+        || text.contains("auth failures")
+        || text.contains("auth middleware")
+        || text.contains("authentication")
+        || text.contains("credential stuffing")
+}
+
+fn doctor_finding_counts_for_critical_alert(
+    finding: &DoctorFinding,
+    has_correlated_attack: bool,
+) -> bool {
+    finding.user_actionable
+        && matches!(finding.severity.as_str(), "critical" | "high")
+        && (!doctor_finding_requires_correlated_attack(finding) || has_correlated_attack)
 }
 
 fn build_noncritical_summary(
     overdue_tasks: usize,
     approaching_goals: usize,
     security: Option<&crate::core::SecuritySnapshot>,
+    doctor_high: usize,
     doctor_medium: usize,
     doctor_low: usize,
     health_warns: usize,
@@ -5376,8 +5640,11 @@ fn build_noncritical_summary(
             parts.push(format!("{} security event(s)", total));
         }
     }
-    if doctor_medium > 0 || doctor_low > 0 {
+    if doctor_high > 0 || doctor_medium > 0 || doctor_low > 0 {
         let mut d = Vec::new();
+        if doctor_high > 0 {
+            d.push(format!("{} high", doctor_high));
+        }
         if doctor_medium > 0 {
             d.push(format!("{} medium", doctor_medium));
         }
@@ -5432,12 +5699,7 @@ fn build_critical_notification(
                 sec.injection_attempts
             ));
         }
-        if sec.auth_failures >= thresholds.auth_failures
-            || sec.rate_limit_hits >= thresholds.rate_limit_hits
-            || sec.unauthorized_channel_attempts >= thresholds.unauthorized_channel
-            || (sec.auth_failures + sec.rate_limit_hits + sec.unauthorized_channel_attempts)
-                >= thresholds.combined
-        {
+        if has_correlated_abuse_spike(sec, thresholds) {
             flags.push("security_ddos".to_string());
             reasons.push(format!(
                 "security spike (auth_fail={}, rate_limit={}, unauthorized={})",
@@ -5450,9 +5712,11 @@ fn build_critical_notification(
         }
     }
 
+    let has_correlated_attack =
+        security.is_some_and(|sec| has_correlated_abuse_spike(sec, thresholds));
     let mut high_or_critical: Vec<&DoctorFinding> = doctor_findings
         .iter()
-        .filter(|f| f.user_actionable && (f.severity == "critical" || f.severity == "high"))
+        .filter(|f| doctor_finding_counts_for_critical_alert(f, has_correlated_attack))
         .collect();
     if !high_or_critical.is_empty() {
         flags.push("doctor_high".to_string());
@@ -6187,6 +6451,10 @@ pub async fn run_pulse(agent: &SharedAgent) {
     let has_security = details.security.as_ref().is_some_and(|s| s.has_events());
     let has_security_incident =
         is_security_incident(details.security.as_ref(), security_thresholds);
+    let has_correlated_attack = details
+        .security
+        .as_ref()
+        .is_some_and(|s| has_correlated_abuse_spike(s, security_thresholds));
     let has_goal_deadlines = !approaching_goals.is_empty();
     let has_dead_apps = deployed_apps
         .iter()
@@ -6200,10 +6468,18 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .iter()
         .filter(|f| f.user_actionable && (f.severity == "critical" || f.severity == "high"))
         .count();
-    let doctor_critical_count = details
+    let doctor_alert_high_count = details
         .doctor_findings
         .iter()
-        .filter(|f| f.user_actionable && f.severity == "critical")
+        .filter(|f| doctor_finding_counts_for_critical_alert(f, has_correlated_attack))
+        .count();
+    let doctor_alert_critical_count = details
+        .doctor_findings
+        .iter()
+        .filter(|f| {
+            f.severity == "critical"
+                && doctor_finding_counts_for_critical_alert(f, has_correlated_attack)
+        })
         .count();
     let doctor_medium_count = details
         .doctor_findings
@@ -6215,7 +6491,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .iter()
         .filter(|f| f.user_actionable && f.severity == "low")
         .count();
-    let has_doctor_alert = doctor_high_count > 0;
+    let has_doctor_alert = doctor_alert_high_count > 0;
     let has_doctor_findings = !details.doctor_findings.is_empty();
     let health_error_count = details
         .health_checks
@@ -6232,7 +6508,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
     let should_notify_user = has_security_incident
         || has_dead_apps
         || health_error_count > 0
-        || doctor_critical_count > 0;
+        || doctor_alert_critical_count > 0;
     let growth_notification = if !should_notify_user {
         build_knowledge_growth_notification(&details.doctor_findings)
     } else {
@@ -6281,6 +6557,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             overdue_tasks.len(),
             approaching_goals.len(),
             details.security.as_ref(),
+            doctor_high_count,
             doctor_medium_count,
             doctor_low_count,
             health_warn_count,
@@ -6350,7 +6627,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         approaching_goals.len(),
         details.security.as_ref(),
         dead_app_count,
-        doctor_high_count,
+        doctor_alert_high_count,
     );
     let should_emit_alert = if should_notify_user {
         should_emit_arkpulse_critical_notification(&storage, &alert_text).await

@@ -1032,6 +1032,13 @@
   background: linear-gradient(135deg, rgba(255, 190, 99, 0.05), var(--nw-panel));
 }
 
+.nw-panel--attention,
+.nw-panel--attention.nw-panel--alert {
+  overflow: visible;
+  border-color: rgba(124, 231, 255, 0.18);
+  background: var(--nw-panel);
+}
+
 .nw-panel--attention-setup {
   border-color: var(--nw-panel-edge);
   background: var(--nw-panel);
@@ -2686,6 +2693,8 @@
 .nw-attention-body {
   display: grid;
   gap: 8px;
+  min-height: 0;
+  overflow: visible;
 }
 
 .nw-attention-counts {

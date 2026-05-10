@@ -2809,6 +2809,38 @@ pub fn parse_config_values(arguments: &serde_json::Value) -> HashMap<String, Str
     out
 }
 
+pub fn parse_runtime_actions(arguments: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let Some(items) = arguments.get("runtime_actions").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for item in items {
+        let raw = match item {
+            serde_json::Value::String(value) => Some(value.as_str()),
+            serde_json::Value::Object(obj) => obj.get("action").and_then(|v| v.as_str()),
+            _ => None,
+        };
+        let Some(raw) = raw else {
+            continue;
+        };
+        let action = raw.trim();
+        if action.is_empty()
+            || action.len() > 160
+            || action.contains('/')
+            || action.contains('\\')
+            || action.chars().any(char::is_control)
+        {
+            continue;
+        }
+        let key = action.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(action.to_string());
+        }
+    }
+    out
+}
+
 fn resolve_secret_value(
     custom: &std::collections::HashMap<String, String>,
     _llm_env: &HashMap<String, String>,
@@ -8617,6 +8649,14 @@ pub async fn app_deploy(
             })
             .unwrap_or_default();
     }
+    let mut runtime_actions = parse_runtime_actions(arguments);
+    if runtime_actions.is_empty() {
+        runtime_actions = existing_target
+            .as_ref()
+            .and_then(|target| target.meta.as_ref())
+            .map(parse_runtime_actions)
+            .unwrap_or_default();
+    }
     let updating_existing = existing_target.is_some();
     let app_id = existing_target
         .as_ref()
@@ -8900,6 +8940,7 @@ pub async fn app_deploy(
         "required_env": required_secret_keys.clone(),
         "required_config": required_config_keys.clone(),
         "config_values": config_values.clone(),
+        "runtime_actions": runtime_actions.clone(),
         "access_guard_enabled": access_guard_enabled,
         "public_access_guard_enabled": public_access_guard_enabled,
         "enabled": true,
@@ -9824,6 +9865,28 @@ mod tests {
         assert_eq!(
             resolve_secret_value(&custom, &llm_env, "OPENAI_API_KEY"),
             None
+        );
+    }
+
+    #[test]
+    fn parse_runtime_actions_keeps_declared_action_names_only() {
+        let actions = parse_runtime_actions(&serde_json::json!({
+            "runtime_actions": [
+                "google_drive_search",
+                { "action": "api__linear__post-graphql" },
+                "GOOGLE_DRIVE_SEARCH",
+                "../bad",
+                { "name": "ignored_without_action_key" },
+                ""
+            ]
+        }));
+
+        assert_eq!(
+            actions,
+            vec![
+                "google_drive_search".to_string(),
+                "api__linear__post-graphql".to_string()
+            ]
         );
     }
 

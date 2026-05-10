@@ -80,6 +80,7 @@ mod sender_verification;
 mod sentinel_panel;
 mod server_utils;
 mod settings_control;
+mod skill_marketplaces;
 mod suggestions;
 mod swarm_control;
 mod trace;
@@ -91,6 +92,7 @@ pub(crate) mod webhooks;
 pub(crate) use analytics_control::estimate_cost_from_pricing_cache;
 pub(crate) use autonomy_control::run_autonomy_analysis_tick;
 pub use locked_control::serve_locked;
+pub(crate) use memory_control::run_arkmemory_learned_review_pass;
 
 pub(crate) use self::sentinel_panel::{
     load_background_learning_feed, record_background_learning_job_result,
@@ -1589,6 +1591,10 @@ pub async fn serve(
         .route("/metrics", get(metrics))
         .route("/chat", post(chat))
         .route("/chat/stream", post(chat_stream))
+        .route(
+            "/chat/tool-approvals/{id}/decision",
+            post(decide_chat_tool_approval),
+        )
         .route("/chat/credential-prompt", get(get_chat_credential_prompt))
         .route(
             "/chat/credential-prompt/submit",
@@ -1809,6 +1815,20 @@ pub async fn serve(
             post(actions::cancel_action_test),
         )
         .route("/skills/import", post(actions::import_action))
+        .route(
+            "/skills/marketplaces",
+            get(skill_marketplaces::list_skill_marketplaces)
+                .post(skill_marketplaces::create_skill_marketplace),
+        )
+        .route(
+            "/skills/marketplaces/{id}",
+            axum::routing::put(skill_marketplaces::update_skill_marketplace)
+                .delete(skill_marketplaces::delete_skill_marketplace),
+        )
+        .route(
+            "/skills/marketplaces/{id}/refresh",
+            post(skill_marketplaces::refresh_skill_marketplace),
+        )
         .route(
             "/skills/{name}",
             axum::routing::delete(actions::delete_action),

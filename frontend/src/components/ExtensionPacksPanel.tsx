@@ -696,9 +696,10 @@ export function ExtensionPacksPanel({
     onSuccess: async (payload) => {
       setNotice({
         kind: "success",
-        text: appendWarning("Pack removed.", payload.warning)
+        text: appendWarning("Pack deleted.", payload.warning)
       });
       await queryClient.invalidateQueries({ queryKey: ["extension-packs"] });
+      await queryClient.invalidateQueries({ queryKey: ["extension-pack-detail"] });
     },
     onError: (error: Error) => setNotice({ kind: "error", text: error.message })
   });
@@ -900,7 +901,7 @@ export function ExtensionPacksPanel({
           </Box>
           <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", justifyContent: "space-between" }}>
             <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: "wrap" }}>
-              <Chip size="small" label="Custom" sx={tagChipSx} />
+              <Chip size="small" label={isBuiltinPack(pack) ? "Bundled" : "Custom"} sx={tagChipSx} />
               {statusLabel ? <Chip size="small" label={statusLabel} sx={statusChipSx} /> : null}
             </Stack>
             {!installedPack ? (
@@ -954,7 +955,7 @@ export function ExtensionPacksPanel({
                 {sectionSubtitle}
               </Typography>
             </Box>
-            <Button size="small" variant="contained" onClick={() => setAddDialogOpen(true)}>
+            <Button variant="contained" sx={{ minWidth: 0, width: "auto", maxWidth: "fit-content", alignSelf: "flex-start", flex: "0 0 auto", whiteSpace: "nowrap" }} onClick={() => setAddDialogOpen(true)}>
               {addButtonLabel}
             </Button>
           </Stack>
@@ -1140,18 +1141,26 @@ export function ExtensionPacksPanel({
                 Uninstall runtime
               </MenuItem>
             ) : null,
-            <MenuItem
-              key="remove"
-              onClick={() => {
-                const pack = packMenuTarget;
-                closePackMenu();
-                if (!pack) return;
-                if (!window.confirm(`Remove ${displayPackName(pack)}?`)) return;
-                deleteMutation.mutate(pack.manifest.id);
-              }}
-            >
-              Remove
-            </MenuItem>,
+            !isBuiltinPack(packMenuTarget) ? (
+              <MenuItem
+                key="delete"
+                onClick={() => {
+                  const pack = packMenuTarget;
+                  closePackMenu();
+                  if (!pack) return;
+                  if (
+                    !window.confirm(
+                      `Delete ${displayPackName(pack)}? This removes saved connections, credentials, auth profiles, events, and local runtime files for this pack.`
+                    )
+                  ) {
+                    return;
+                  }
+                  deleteMutation.mutate(pack.manifest.id);
+                }}
+              >
+                Delete
+              </MenuItem>
+            ) : null,
           ].filter(Boolean)
         ) : null}
       </Menu>

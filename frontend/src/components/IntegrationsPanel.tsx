@@ -30,7 +30,7 @@ import Grid2 from "@mui/material/Grid";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { formatUiDateTime } from "../lib/dateFormat";
@@ -51,6 +51,8 @@ import { PluginSdkPanel } from "./PluginSdkPanel";
 const REFRESH_MS = 8000;
 const OAUTH_SIGNAL_STORAGE_KEY = "agentark:oauth-callback";
 const OAUTH_SIGNAL_CHANNEL = "agentark-oauth";
+const OAUTH_PENDING_TIMEOUT_MS = 2 * 60 * 1000;
+const OAUTH_COMPLETION_REFRESH_DELAYS_MS = [0, 500, 1500, 3500, 7000];
 
 const CHANNEL_ICON_COLORS: Record<string, string> = {
   email: "#14B8A6",
@@ -703,6 +705,11 @@ function normalizeIntegrationId(value: string): string {
   return normalized;
 }
 
+function oauthConnectionTerminal(status: string): boolean {
+  const normalized = status.trim().toLowerCase();
+  return normalized === "connected" || normalized === "error" || normalized === "not_configured";
+}
+
 function integrationDisplayName(id: string, integrations: IntegrationItem[]): string {
   const normalized = normalizeIntegrationId(id);
   return integrations.find((item) => item.id === normalized)?.name || normalized || "Integration";
@@ -905,6 +912,8 @@ export function IntegrationsPanel({
   const [showDisabledIntegrations, setShowDisabledIntegrations] = useState(false);
   const [oauthBusyId, setOauthBusyId] = useState<string | null>(null);
   const [oauthPendingId, setOauthPendingId] = useState<string | null>(null);
+  const [oauthPendingStartedAt, setOauthPendingStartedAt] = useState<number | null>(null);
+  const oauthRefreshTimersRef = useRef<number[]>([]);
   const [customMessagingCredentialTarget, setCustomMessagingCredentialTarget] =
     useState<CustomMessagingChannel | null>(null);
   const [customMessagingCredentialValues, setCustomMessagingCredentialValues] =
@@ -1864,8 +1873,31 @@ export function IntegrationsPanel({
   const sshConnectionsText = str(asRecord(sshConnectionsQ.data).connections, "");
   const sshConnectionNames = parseSshConnectionNames(sshConnectionsText);
 
+  function clearScheduledOAuthRefreshes() {
+    for (const timerId of oauthRefreshTimersRef.current) {
+      window.clearTimeout(timerId);
+      window.clearInterval(timerId);
+    }
+    oauthRefreshTimersRef.current = [];
+  }
+
+  function clearOAuthPending(targetId?: string | null) {
+    const normalizedTargetId = normalizeIntegrationId(str(targetId, ""));
+    setOauthPendingId((current) => {
+      if (normalizedTargetId && normalizeIntegrationId(str(current, "")) !== normalizedTargetId) {
+        return current;
+      }
+      return null;
+    });
+    setOauthPendingStartedAt(null);
+    clearScheduledOAuthRefreshes();
+  }
+
   async function refreshIntegrationState(targetId?: string | null) {
     const normalizedTargetId = normalizeIntegrationId(str(targetId, ""));
+    const pendingExpired =
+      Boolean(normalizedTargetId && oauthPendingStartedAt) &&
+      Date.now() - Number(oauthPendingStartedAt) > OAUTH_PENDING_TIMEOUT_MS;
     const refreshedIntegrations = shouldLoadConnectorCatalog ? await integrationsQ.refetch() : null;
     if (showIntegrations) {
       await Promise.allSettled([
@@ -1892,15 +1924,26 @@ export function IntegrationsPanel({
     if (!normalizedTargetId) return;
     const updated = refreshedItems.find((item) => item.id === normalizedTargetId);
     if (updated) {
-      const resolved =
-        updated.status === "connected" ||
-        updated.status === "error" ||
-        (updated.status !== "needs_auth" && !str(updated.auth_url, "").trim());
-      if (resolved) {
-        setOauthPendingId((current) =>
-          normalizeIntegrationId(str(current, "")) === normalizedTargetId ? null : current
-        );
+      if (updated.status === "connected") {
+        setConfigSuccess(false);
+        setEditingConnected(false);
       }
+      if (oauthConnectionTerminal(updated.status) || pendingExpired) {
+        clearOAuthPending(normalizedTargetId);
+      }
+    } else if (pendingExpired) {
+      clearOAuthPending(normalizedTargetId);
+    }
+  }
+
+  function scheduleOAuthCompletionRefresh(targetId: string) {
+    const normalizedTargetId = normalizeIntegrationId(targetId);
+    if (!normalizedTargetId) return;
+    for (const delayMs of OAUTH_COMPLETION_REFRESH_DELAYS_MS) {
+      const timerId = window.setTimeout(() => {
+        void refreshIntegrationState(normalizedTargetId);
+      }, delayMs);
+      oauthRefreshTimersRef.current.push(timerId);
     }
   }
 
@@ -1947,6 +1990,11 @@ export function IntegrationsPanel({
           kind: "error",
           text: detail ? `${targetName} connection failed: ${detail}` : `${targetName} connection failed.`
         });
+      } else if (status === "connected") {
+        setNotice({
+          kind: "success",
+          text: detail ? `${targetName} connected. ${detail}` : `${targetName} connected.`
+        });
       } else if (detail) {
         setNotice({
           kind: "error",
@@ -1960,6 +2008,7 @@ export function IntegrationsPanel({
       }
       if (targetId) {
         void refreshIntegrationState(targetId);
+        scheduleOAuthCompletionRefresh(targetId);
       }
     };
 
@@ -1970,6 +2019,11 @@ export function IntegrationsPanel({
 
     const handleWindowFocus = () => {
       void refreshIntegrationState(oauthPendingId);
+    };
+
+    const handleMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      handleSignal(event.data);
     };
 
     const handleVisibility = () => {
@@ -1991,6 +2045,7 @@ export function IntegrationsPanel({
 
     window.addEventListener("storage", handleStorage);
     window.addEventListener("focus", handleWindowFocus);
+    window.addEventListener("message", handleMessage);
     document.addEventListener("visibilitychange", handleVisibility);
 
     let oauthChannel: BroadcastChannel | null = null;
@@ -2002,10 +2057,13 @@ export function IntegrationsPanel({
     return () => {
       window.removeEventListener("storage", handleStorage);
       window.removeEventListener("focus", handleWindowFocus);
+      window.removeEventListener("message", handleMessage);
       document.removeEventListener("visibilitychange", handleVisibility);
       oauthChannel?.close();
     };
-  }, [showIntegrations, integrations, oauthPendingId, active?.id, channelsQ, channelForm.whatsapp_enabled, channelForm.whatsapp_mode]);
+  }, [showIntegrations, integrations, oauthPendingId, oauthPendingStartedAt, active?.id, channelsQ, channelForm.whatsapp_enabled, channelForm.whatsapp_mode]);
+
+  useEffect(() => () => clearScheduledOAuthRefreshes(), []);
 
   useEffect(() => {
     if (!notice || notice.kind !== "success") return;
@@ -2019,7 +2077,7 @@ export function IntegrationsPanel({
       void refreshIntegrationState(oauthPendingId);
     }, 3500);
     return () => window.clearInterval(intervalId);
-  }, [showIntegrations, needsPendingConnectionRefresh, oauthPendingId, telegramConnectionStatusRaw, whatsappConnectionStatusRaw]);
+  }, [showIntegrations, needsPendingConnectionRefresh, oauthPendingId, oauthPendingStartedAt, telegramConnectionStatusRaw, whatsappConnectionStatusRaw]);
 
   useEffect(() => {
     if (!showIntegrations || !settingsQ.data || channelsDirty) return;
@@ -2278,7 +2336,20 @@ export function IntegrationsPanel({
     setWhatsAppSetupOpen(true);
   };
 
-  const saveChannelDialog = async (onClose: () => void) => {
+  const saveChannelDialog = async (
+    onClose: () => void,
+    options: { confirmTelegramRestartOnEnable?: boolean } = {}
+  ) => {
+    if (
+      options.confirmTelegramRestartOnEnable &&
+      !telegramEnabledSaved &&
+      channelForm.telegram_enabled &&
+      !window.confirm(
+        "Enabling Telegram will restart the backend server so the Telegram bot listener can start. The UI may disconnect briefly. Continue?"
+      )
+    ) {
+      return;
+    }
     try {
       await saveChannelsMutation.mutateAsync(channelForm);
       onClose();
@@ -2318,12 +2389,14 @@ export function IntegrationsPanel({
     onClose,
     onDisconnect,
     disconnectVisible = false,
-    disconnectLabel = "Disconnect"
+    disconnectLabel = "Disconnect",
+    confirmTelegramRestartOnEnable = false
   }: {
     onClose: () => void;
     onDisconnect?: () => void | Promise<void>;
     disconnectVisible?: boolean;
     disconnectLabel?: string;
+    confirmTelegramRestartOnEnable?: boolean;
   }) => (
     <DialogActions>
       {disconnectVisible ? (
@@ -2345,7 +2418,7 @@ export function IntegrationsPanel({
         variant="contained"
         disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
         onClick={() => {
-          void saveChannelDialog(onClose);
+          void saveChannelDialog(onClose, { confirmTelegramRestartOnEnable });
         }}
       >
         {saveChannelsMutation.isPending ? "Saving..." : "Save"}
@@ -3411,13 +3484,26 @@ export function IntegrationsPanel({
         authUrl = extractAuthUrl(payload);
       }
       if (!authUrl) throw new Error("No OAuth URL is available yet. Configure this integration first.");
-      setOauthPendingId(normalizeIntegrationId(integration.id));
+      const pendingId = normalizeIntegrationId(integration.id);
+      setOauthPendingId(pendingId);
+      setOauthPendingStartedAt(Date.now());
       if (authWindow && !authWindow.closed) {
         authWindow.location.replace(authUrl);
         authWindow.focus();
+        const closePollId = window.setInterval(() => {
+          if (!authWindow.closed) return;
+          window.clearInterval(closePollId);
+          scheduleOAuthCompletionRefresh(pendingId);
+        }, 700);
+        const timeoutId = window.setTimeout(() => {
+          window.clearInterval(closePollId);
+        }, OAUTH_PENDING_TIMEOUT_MS);
+        oauthRefreshTimersRef.current.push(closePollId);
+        oauthRefreshTimersRef.current.push(timeoutId);
       } else {
         window.open(authUrl, "_blank", "noopener,noreferrer");
       }
+      scheduleOAuthCompletionRefresh(pendingId);
       setNotice({ kind: "success", text: "OAuth window opened. Finish sign-in and AgentArk will update this automatically." });
     } catch (err) {
       if (authWindow && !authWindow.closed) {
@@ -3429,7 +3515,7 @@ export function IntegrationsPanel({
         );
         authWindow.document.close();
       }
-      setOauthPendingId(null);
+      clearOAuthPending(integration.id);
       setNotice({ kind: "error", text: asErrorMessage(err) });
     } finally {
       setOauthBusyId(null);
@@ -3750,136 +3836,6 @@ export function IntegrationsPanel({
             onConfigureIntegration={() => {}}
             mode="custom-apis-only"
           />
-          {readyList.length > 0 ? (
-            <Box className="list-shell" sx={{ mb: 1.5 }}>
-              <Stack spacing={1.25}>
-              <Stack
-                direction={{ xs: "column", sm: "row" }}
-                spacing={1}
-                sx={{
-                  justifyContent: "space-between",
-                  alignItems: { xs: "flex-start", sm: "center" },
-                  mb: 1.25
-                }}>
-                <Box>
-                  <Typography variant="subtitle2">Connected</Typography>
-                  <Typography variant="caption" sx={{
-                    color: "text.secondary"
-                  }}>
-                    These integrations are live and available to the agent.
-                  </Typography>
-                </Box>
-                <Chip size="small" variant="outlined" label={`${readyList.length} connected`} sx={sectionCountChipSx} />
-              </Stack>
-                <Grid2 container spacing={1}>
-                  {readyList.map((integration) => {
-                    const cardState = integrationCardState(integration);
-                    const accent = integrationCardAccent(cardState);
-                    const dotColor = integrationCardDotColor(cardState);
-                    return (
-                      <Grid2 key={`connected-${integration.id}`} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
-                        <Box
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => {
-                            if (integration.config_fields && integration.config_fields.length > 0) {
-                              openConfig(integration);
-                            }
-                          }}
-                          onKeyDown={(e) => {
-                            if ((e.key === "Enter" || e.key === " ") && integration.config_fields && integration.config_fields.length > 0) {
-                              e.preventDefault();
-                              openConfig(integration);
-                            }
-                          }}
-                          sx={{
-                            height: "100%",
-                            p: 1.35,
-                            borderRadius: "8px",
-                            border: `1px solid ${accent.border}`,
-                            background: accent.background,
-                            cursor: "pointer",
-                            transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
-                            "&:hover": {
-                              borderColor: accent.hoverBorder,
-                              background: accent.hoverBackground,
-                              boxShadow: "0 8px 24px var(--ui-rgba-0-0-0-180)"
-                            }
-                          }}
-                        >
-                          <Stack spacing={0.75}>
-                            <Stack
-                              direction="row"
-                              spacing={1}
-                              sx={{
-                                alignItems: "center",
-                                justifyContent: "space-between"
-                              }}>
-                              <Stack direction="row" spacing={0.75} sx={{
-                                alignItems: "center"
-                              }}>
-                                <ConnectorIcon id={integration.id} name={integration.name} />
-                                <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
-                                  {integration.name}
-                                </Typography>
-                              </Stack>
-                              <Box
-                                sx={{
-                                  width: 8,
-                                  height: 8,
-                                  borderRadius: "50%",
-                                  background: dotColor,
-                                  flex: "0 0 auto"
-                                }}
-                              />
-                            </Stack>
-                            <Typography
-                              variant="caption"
-                              sx={{
-                                color: "text.secondary",
-                                lineHeight: 1.45,
-                                display: "-webkit-box",
-                                WebkitLineClamp: 2,
-                                WebkitBoxOrient: "vertical",
-                                overflow: "hidden"
-                              }}>
-                              {integrationCardCopy(integration)}
-                            </Typography>
-                            <Stack
-                              direction="row"
-                              spacing={1}
-                              sx={{
-                                justifyContent: "space-between",
-                                alignItems: "center"
-                              }}>
-                              <Chip
-                                size="small"
-                                label={integrationCardLabel(cardState)}
-                                sx={{
-                                  height: 20,
-                                  fontSize: "0.68rem",
-                                  fontWeight: 700,
-                                  borderColor: accent.chipBorder,
-                                  color: accent.chipColor
-                                }}
-                                variant="outlined"
-                              />
-                              <Button size="small" variant="text" sx={{ minWidth: 0 }} onClick={(e) => {
-                                e.stopPropagation();
-                                openConfig(integration);
-                              }}>
-                                Manage
-                              </Button>
-                            </Stack>
-                          </Stack>
-                        </Box>
-                      </Grid2>
-                    );
-                  })}
-                </Grid2>
-              </Stack>
-            </Box>
-          ) : null}
           <ExtensionPacksPanel mode="connectors" autoRefresh={autoRefresh} />
         </>
       ) : null}
@@ -5923,6 +5879,7 @@ export function IntegrationsPanel({
         </DialogContent>
         {renderMessagingDialogActions({
           onClose: () => setTelegramSetupOpen(false),
+          confirmTelegramRestartOnEnable: true,
           disconnectVisible: channelForm.telegram_enabled,
           onDisconnect: () =>
             disconnectChannel("Telegram", "telegram_enabled", () => setTelegramSetupOpen(false))
@@ -6951,18 +6908,6 @@ export function IntegrationsPanel({
             ) : null}
             {active?.status === "starting" && active?.status_detail ? (
               <Alert severity="info">{active.status_detail}</Alert>
-            ) : null}
-            {active?.status === "not_configured" ? (
-              <Alert severity="info">
-                This integration is disabled until you connect it.
-              </Alert>
-            ) : null}
-            {(!activeHasSavedConfig || editingConnected) && activeNeedsOauth ? (
-              <Alert severity="info">
-                {active?.id === "google_workspace"
-                  ? "Enter the Google OAuth client ID and client secret, choose the Workspace bundles, then continue with Google."
-                  : "Save your Google OAuth client credentials here, then click Connect to finish sign-in."}
-              </Alert>
             ) : null}
             {(!activeHasSavedConfig || editingConnected) && active?.id === "google_workspace" ? (
               <Box

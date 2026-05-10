@@ -4,6 +4,7 @@
 
 import {
   memo,
+  useCallback,
   useEffect,
   useId,
   useMemo,
@@ -113,6 +114,82 @@ function safePaneText(value: string, fallback = ""): string {
   return trimmed.length > 180 ? `${trimmed.slice(0, 177).trimEnd()}...` : trimmed;
 }
 
+function activityListCardsEqual(left: ChatStepCard, right: ChatStepCard): boolean {
+  return (
+    left.id === right.id &&
+    left.index === right.index &&
+    left.stepType === right.stepType &&
+    left.rawTitle === right.rawTitle &&
+    left.tone === right.tone &&
+    left.kind === right.kind &&
+    left.label === right.label &&
+    left.detail === right.detail &&
+    left.detailFull === right.detailFull &&
+    left.summary === right.summary &&
+    left.rawDetailFull === right.rawDetailFull &&
+    left.traceJson === right.traceJson &&
+    left.time === right.time &&
+    left.payloadView?.body === right.payloadView?.body &&
+    left.payloadView?.preview === right.payloadView?.preview
+  );
+}
+
+const ActivityListRow = memo(function ActivityListRow({
+  card,
+  isActive,
+  expanded,
+  onToggle,
+}: {
+  card: ChatStepCard;
+  isActive: boolean;
+  expanded: boolean;
+  onToggle: (id: string) => void;
+}) {
+  const time = card.time || "";
+  const detail = safePaneText(card.summary || card.detail || "");
+  const detailsId = `computer-pane-activity-details-${card.id}`.replace(
+    /[^a-zA-Z0-9_-]+/g,
+    "-",
+  );
+
+  return (
+    <li
+      className={`computer-pane-activity-row tone-${card.tone}${isActive ? " is-active" : ""}${expanded ? " is-expanded" : ""}`}
+    >
+      <button
+        type="button"
+        className="computer-pane-activity-button"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        onClick={() => onToggle(card.id)}
+      >
+        <span className="computer-pane-activity-kind">
+          {card.kind || "Update"}
+        </span>
+        <span className="computer-pane-activity-label">{card.label}</span>
+        {detail ? (
+          <span className="computer-pane-activity-detail">{detail}</span>
+        ) : null}
+        {time ? (
+          <span className="computer-pane-activity-time">{time}</span>
+        ) : null}
+        <KeyboardArrowDownRoundedIcon
+          fontSize="small"
+          className={`computer-pane-activity-chevron${expanded ? " is-expanded" : ""}`}
+          aria-hidden="true"
+        />
+      </button>
+      <Collapse in={expanded} mountOnEnter unmountOnExit>
+        <ActivityExpandedDetails card={card} detailsId={detailsId} />
+      </Collapse>
+    </li>
+  );
+}, (prev, next) =>
+  prev.isActive === next.isActive &&
+  prev.expanded === next.expanded &&
+  activityListCardsEqual(prev.card, next.card),
+);
+
 function ActivityList({
   cards,
   activeStepId,
@@ -122,14 +199,14 @@ function ActivityList({
 }) {
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
 
-  const toggleExpanded = (id: string) => {
+  const toggleExpanded = useCallback((id: string) => {
     setExpandedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  };
+  }, []);
 
   if (!cards || cards.length === 0) {
     return (
@@ -144,47 +221,15 @@ function ActivityList({
     <ol className="computer-pane-activity-list">
       {cards.map((card) => {
         const isActive = card.id === activeStepId;
-        const time = card.time || "";
-        const detail = safePaneText(card.summary || card.detail || "");
         const expanded = expandedIds.has(card.id);
-        const detailsId = `computer-pane-activity-details-${card.id}`.replace(
-          /[^a-zA-Z0-9_-]+/g,
-          "-",
-        );
         return (
-          <li
+          <ActivityListRow
             key={`activity-${card.id}`}
-            className={`computer-pane-activity-row tone-${card.tone}${isActive ? " is-active" : ""}${expanded ? " is-expanded" : ""}`}
-          >
-            <button
-              type="button"
-              className="computer-pane-activity-button"
-              aria-expanded={expanded}
-              aria-controls={detailsId}
-              onClick={() => toggleExpanded(card.id)}
-            >
-              <span className="computer-pane-activity-kind">
-                {card.kind || "Update"}
-              </span>
-              <span className="computer-pane-activity-label">{card.label}</span>
-              {detail ? (
-                <span className="computer-pane-activity-detail">
-                  {detail}
-                </span>
-              ) : null}
-              {time ? (
-                <span className="computer-pane-activity-time">{time}</span>
-              ) : null}
-              <KeyboardArrowDownRoundedIcon
-                fontSize="small"
-                className={`computer-pane-activity-chevron${expanded ? " is-expanded" : ""}`}
-                aria-hidden="true"
-              />
-            </button>
-            <Collapse in={expanded} mountOnEnter unmountOnExit>
-              <ActivityExpandedDetails card={card} detailsId={detailsId} />
-            </Collapse>
-          </li>
+            card={card}
+            isActive={isActive}
+            expanded={expanded}
+            onToggle={toggleExpanded}
+          />
         );
       })}
     </ol>
@@ -435,6 +480,11 @@ function asPaneRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function paneRecordFromMaybeJson(value: unknown): Record<string, unknown> {
+  if (typeof value === "string") return tryParseRecord(value) || {};
+  return asPaneRecord(value);
+}
+
 function structuredCardRecord(card: ChatStepCard): Record<string, unknown> | null {
   return (
     tryParseRecord(card.payloadView?.body || "") ||
@@ -447,13 +497,13 @@ function structuredCardRecord(card: ChatStepCard): Record<string, unknown> | nul
 
 function reasoningCardPhase(card: ChatStepCard): string {
   const record = structuredCardRecord(card);
-  const data = asPaneRecord(record?.data);
-  return str(record?.phase, str(data.phase, "")).trim();
+  const data = paneRecordFromMaybeJson(record?.data);
+  return str(record?.phase, str(data.phase, str(record?.step_type, ""))).trim();
 }
 
 function reasoningCardContent(card: ChatStepCard): string {
   const record = structuredCardRecord(card);
-  const data = asPaneRecord(record?.data);
+  const data = paneRecordFromMaybeJson(record?.data);
   return (
     str(record?.content_snapshot, "") ||
     str(data.content_snapshot, "") ||
@@ -463,6 +513,10 @@ function reasoningCardContent(card: ChatStepCard): string {
     str(data.content_delta, "") ||
     card.rawDetailFull ||
     card.detailFull ||
+    str(record?.detail, "") ||
+    str(data.detail, "") ||
+    str(record?.text, "") ||
+    str(data.text, "") ||
     card.detail ||
     card.summary ||
     ""
@@ -471,10 +525,18 @@ function reasoningCardContent(card: ChatStepCard): string {
 
 function isReasoningOnlyCard(card: ChatStepCard): boolean {
   const record = structuredCardRecord(card);
-  const kind = str(record?.kind, "").trim().toLowerCase();
-  const phase = str(record?.phase, "").trim();
+  const data = paneRecordFromMaybeJson(record?.data);
+  const kind = str(record?.kind, str(data.kind, "")).trim().toLowerCase();
+  const phase = str(record?.phase, str(data.phase, "")).trim();
   const stepType = (card.stepType || "").trim().toLowerCase();
-  if (kind === "reasoning_delta" || stepType === "reasoning_delta") {
+  const recordStepType = str(record?.step_type, str(data.step_type, ""))
+    .trim()
+    .toLowerCase();
+  if (
+    kind === "reasoning_delta" ||
+    stepType === "reasoning_delta" ||
+    recordStepType === "reasoning_delta"
+  ) {
     return true;
   }
   return Boolean(
@@ -755,9 +817,16 @@ function ComputerPaneInner({
     () => cardsForRun.filter((card) => !card.isHeartbeat),
     [cardsForRun],
   );
+  const reasoningCardIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const card of activityCards) {
+      if (isReasoningOnlyCard(card)) ids.add(card.id);
+    }
+    return ids;
+  }, [activityCards]);
   const primaryActivityCards = useMemo(
-    () => activityCards.filter((card) => !isReasoningOnlyCard(card)),
-    [activityCards],
+    () => activityCards.filter((card) => !reasoningCardIds.has(card.id)),
+    [activityCards, reasoningCardIds],
   );
   const navPool = useMemo(
     () => {
@@ -770,12 +839,14 @@ function ComputerPaneInner({
           );
         },
       );
-      const reasoningCards = activityCards.filter(isReasoningOnlyCard);
+      const reasoningCards = activityCards.filter((card) =>
+        reasoningCardIds.has(card.id),
+      );
       return [...reasoningCards, ...workspaceSurfaceCards].sort(
         (left, right) => left.index - right.index,
       );
     },
-    [activityCards, cardsForRun],
+    [activityCards, cardsForRun, reasoningCardIds],
   );
   const headerFilePath =
     followedLiveWritePath ||
@@ -820,7 +891,9 @@ function ComputerPaneInner({
   const canPrev = activeIndex > 0;
   const canNext = activeIndex >= 0 && activeIndex < navPool.length - 1;
   const view = activeCard ? pickComputerView(activeCard) : AGENTARK_RENDERERS.GENERIC;
-  const activeCardIsReasoning = activeCard ? isReasoningOnlyCard(activeCard) : false;
+  const activeCardIsReasoning = activeCard
+    ? reasoningCardIds.has(activeCard.id) || isReasoningOnlyCard(activeCard)
+    : false;
   const activeSurfaceStatus = activeCard ? surfaceStatus(activeCard, Boolean(isStreaming)) : null;
   const fileHeaderText =
     liveWriteActive && headerFilePath

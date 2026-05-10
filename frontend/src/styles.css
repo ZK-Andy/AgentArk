@@ -1109,14 +1109,14 @@ body {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 1px;
+  gap: 4px;
   padding-left: 3px;
 }
 
 .shell-kicker.MuiTypography-root {
   display: block;
   font-size: 1.05rem !important;
-  line-height: 1 !important;
+  line-height: 1.08 !important;
   font-weight: 700 !important;
   letter-spacing: 0;
   text-transform: none;
@@ -1132,7 +1132,7 @@ body {
 
 .shell-title.MuiTypography-root {
   font-size: 0.68rem !important;
-  line-height: 1 !important;
+  line-height: 1.12 !important;
   font-weight: 500 !important;
   letter-spacing: 0 !important;
   text-transform: uppercase;
@@ -4223,6 +4223,8 @@ body {
 .activity-timeline-row {
   padding: 8px 10px 10px;
   border-bottom: 1px solid var(--activity-divider);
+  content-visibility: auto;
+  contain-intrinsic-size: 76px;
 }
 
 .term-body > .activity-timeline-row:last-child {
@@ -4633,6 +4635,7 @@ body {
 
 .chat-workspace-shell .activity-timeline-row-detailed {
   padding-block: 10px 12px;
+  contain-intrinsic-size: 136px;
 }
 
 .chat-workspace-shell .term-prompt {
@@ -11473,7 +11476,14 @@ select,
   margin: 10px 0 0;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
-  background: #fff;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.chat-md-image-alt {
+  display: inline;
+  color: var(--ui-rgba-180-208-225-860);
+  font-size: 0.88em;
+  border-bottom: 1px dotted rgba(180, 208, 225, 0.32);
 }
 
 .chat-stream-section-stack {
@@ -12122,14 +12132,10 @@ select,
    =========================================================== */
 
 .computer-pane-shell {
-  background: linear-gradient(
-    180deg,
-    var(--ui-rgba-22-22-26-940),
-    var(--ui-rgba-15-16-19-920)
-  );
+  background: var(--activity-panel-bg);
   border: 1px solid var(--activity-panel-border);
   border-radius: var(--surface-radius-lg);
-  box-shadow: var(--surface-shadow-soft);
+  box-shadow: none;
   overflow: hidden;
 }
 
@@ -12140,8 +12146,8 @@ select,
 
 .computer-pane-toolbar {
   padding: 8px 12px;
-  border-bottom: 1px solid var(--ui-rgba-255-255-255-060);
-  background: var(--ui-rgba-255-255-255-020);
+  border-bottom: 1px solid var(--activity-panel-border);
+  background: rgba(255, 255, 255, 0.018);
   gap: 8px;
 }
 
@@ -12294,9 +12300,11 @@ select,
 .computer-pane-files-section {
   margin: 0 4px 10px;
   padding: 8px;
-  border: 1px solid rgba(118, 152, 190, 0.14);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
-  background: rgba(6, 10, 18, 0.42);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
 }
 
 .computer-pane-files-section.is-collapsed {
@@ -12444,10 +12452,12 @@ select,
 }
 
 .cview-terminal {
-  border: 1px solid var(--ui-rgba-118-152-190-120);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
   overflow: hidden;
-  background: var(--ui-rgba-5-11-21-720);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
   position: relative;
   min-height: 100%;
 }
@@ -12466,7 +12476,7 @@ select,
   gap: 8px;
   padding: 8px 10px;
   background: var(--ui-rgba-255-255-255-020);
-  border-bottom: 1px solid var(--ui-rgba-118-152-190-080);
+  border-bottom: 1px solid var(--activity-panel-border);
   position: relative;
   z-index: 1;
 }
@@ -12571,10 +12581,12 @@ select,
 /* ----- Computer view: file ----- */
 
 .cview-file {
-  border: 1px solid var(--ui-rgba-118-152-190-120);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
   overflow: hidden;
-  background: var(--ui-rgba-5-11-21-720);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
 }
 
 .cview-file-head {
@@ -12583,7 +12595,7 @@ select,
   gap: 8px;
   padding: 8px 10px;
   background: var(--ui-rgba-255-255-255-020);
-  border-bottom: 1px solid var(--ui-rgba-118-152-190-080);
+  border-bottom: 1px solid var(--activity-panel-border);
 }
 
 .cview-file-icon {
@@ -12637,10 +12649,12 @@ select,
 /* ----- Computer view: browse ----- */
 
 .cview-browse {
-  border: 1px solid var(--ui-rgba-118-152-190-120);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
   overflow: hidden;
-  background: var(--ui-rgba-5-11-21-720);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
 }
 
 .cview-browse-head {
@@ -12649,7 +12663,7 @@ select,
   gap: 10px;
   padding: 8px 10px;
   background: var(--ui-rgba-255-255-255-020);
-  border-bottom: 1px solid var(--ui-rgba-118-152-190-080);
+  border-bottom: 1px solid var(--activity-panel-border);
 }
 
 .cview-browse-dots {
@@ -12754,9 +12768,11 @@ select,
 }
 
 .cview-search-result {
-  border: 1px solid var(--ui-rgba-118-152-190-120);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
-  background: var(--ui-rgba-5-11-21-720);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
 }
 
 .cview-search-result-body {
@@ -12783,9 +12799,11 @@ select,
   align-items: flex-start;
   gap: 6px;
   padding: 18px 12px;
-  border: 1px dashed var(--ui-rgba-118-152-190-080);
+  border: 1px dashed var(--activity-panel-border);
   border-radius: 8px;
-  background: var(--ui-rgba-5-11-21-720);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
 }
 
 .cview-status-icon {
@@ -12820,6 +12838,8 @@ select,
 
 .computer-pane-activity-row {
   border-bottom: 1px solid var(--ui-rgba-255-255-255-060);
+  content-visibility: auto;
+  contain-intrinsic-size: 58px;
 }
 
 .computer-pane-activity-row:last-child {
@@ -13139,9 +13159,11 @@ select,
   display: flex;
   flex-direction: column;
   min-height: 100%;
-  border: 1px solid var(--ui-rgba-118-152-190-120);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
-  background: var(--ui-rgba-5-11-21-720);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
   overflow: hidden;
 }
 
@@ -13152,7 +13174,7 @@ select,
   gap: 8px;
   padding: 8px 10px;
   background: var(--ui-rgba-255-255-255-020);
-  border-bottom: 1px solid var(--ui-rgba-118-152-190-080);
+  border-bottom: 1px solid var(--activity-panel-border);
 }
 
 .cview-generic-icon {
@@ -13204,7 +13226,7 @@ select,
   justify-content: space-between;
   gap: 10px;
   padding: 7px 9px;
-  border: 1px solid var(--ui-rgba-118-152-190-080);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 6px;
   background: var(--ui-rgba-255-255-255-020);
 }
@@ -13243,7 +13265,7 @@ select,
 }
 
 .cview-generic-item {
-  border: 1px solid var(--ui-rgba-118-152-190-080);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 6px;
   overflow: hidden;
   transition: border-color 160ms ease, background 160ms ease;
@@ -13360,10 +13382,12 @@ select,
 
 .cview-working {
   min-height: 100%;
-  border: 1px solid var(--ui-rgba-118-152-190-120);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
   padding: 14px;
-  background: var(--ui-rgba-5-11-21-720);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -13379,6 +13403,13 @@ select,
   color: var(--ui-rgba-104-162-221-240);
 }
 
+.cview-working-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
 .cview-working-label {
   color: var(--ui-rgba-226-241-255-940) !important;
   font-family: var(--font-display) !important;
@@ -13386,7 +13417,6 @@ select,
 }
 
 .cview-working-elapsed {
-  margin-left: auto !important;
   color: var(--ui-rgba-255-229-173-960) !important;
   font-family: var(--font-mono) !important;
 }
@@ -13410,9 +13440,9 @@ select,
 .cview-working-preview {
   position: relative;
   margin-top: 8px;
-  border: 1px solid var(--ui-rgba-118-152-190-080);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
-  background: var(--ui-rgba-3-9-18-720);
+  background: rgba(10, 10, 10, 0.5);
   min-height: 118px;
   flex: 1 1 auto;
   display: flex;
@@ -13448,7 +13478,7 @@ select,
   inset: auto 0 0;
   height: 34px;
   pointer-events: none;
-  background: linear-gradient(180deg, transparent, var(--ui-rgba-3-9-18-920));
+  background: linear-gradient(180deg, transparent, rgba(10, 10, 10, 0.92));
   z-index: 1;
 }
 
@@ -13481,9 +13511,11 @@ select,
 }
 
 .cview-deploy {
-  border: 1px solid var(--ui-rgba-118-152-190-120);
+  border: 1px solid var(--activity-panel-border);
   border-radius: 8px;
-  background: var(--ui-rgba-5-11-21-720);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.006)),
+    rgba(8, 8, 9, 0.46);
   overflow: hidden;
 }
 
@@ -15785,10 +15817,15 @@ select,
 }
 
 /* Responsive chat reading width.
-   Assistant reports should use the available chat column instead of staying
-   capped at article width, especially when Run Details is open. */
+   Assistant prose should read like an article column, not a full-width log.
+   Keep tool/artifact tables wider via their own surfaces; normal prose gets
+   a stable measure in both plain chat and Run Details split view. */
 .chat-shell {
-  --chat-response-max-width: min(100%, clamp(760px, 78vw, 1180px));
+  --chat-response-max-width: min(100%, clamp(640px, 56vw, 860px));
+}
+
+.chat-shell.chat-shell-console-open {
+  --chat-response-max-width: min(100%, 76ch);
 }
 
 .chat-shell .chat-thread .chat-row:not(.chat-row-user):not(.chat-row-live-work):not(.chat-row-interrupted-work) {
@@ -15798,7 +15835,7 @@ select,
 .chat-shell .chat-thread .chat-row:not(.chat-row-user):not(.chat-row-live-work):not(.chat-row-interrupted-work)
   .chat-bubble-assistant:not(.chat-bubble-plan-confirmation),
 .chat-shell .chat-thread .chat-bubble-streaming:not(.chat-bubble-streaming-reply) {
-  flex: 1 1 auto;
+  flex: 0 1 var(--chat-response-max-width);
   width: var(--chat-response-max-width) !important;
   max-width: var(--chat-response-max-width) !important;
   min-width: 0;
@@ -15810,6 +15847,33 @@ select,
 .chat-shell .chat-thread .chat-bubble-streaming:not(.chat-bubble-streaming-reply) .chat-stream-section-reply {
   width: 100%;
   max-width: 100% !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown {
+  line-height: 1.58 !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown > * + * {
+  margin-top: 0.55rem !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown .chat-md-paragraph {
+  margin: 0 0 0.55rem !important;
+  line-height: 1.58 !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown .chat-md-heading {
+  margin: 0.78rem 0 0.28rem !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown .chat-md-list,
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown ul,
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown ol {
+  margin: 0.28rem 0 0.55rem !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-run-metrics {
+  margin-top: 6px;
 }
 
 .chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) table,

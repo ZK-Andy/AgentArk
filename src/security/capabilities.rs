@@ -1064,7 +1064,29 @@ fn push_structured_capability_observations(
             );
             true
         }
-        "broad-network" | "search" | "vision-ocr" | "video-generation" => {
+        "custom-api" | "integration" | "broad-network" | "search" | "vision-ocr"
+        | "video-generation" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "calls-network",
+                None,
+                &evidence,
+            );
+            true
+        }
+        "external-write" | "writes-external" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "writes-external",
+                None,
+                &evidence,
+            );
             push_observation(
                 out,
                 seen,
@@ -1531,6 +1553,11 @@ pub fn observations_from_action_def(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(target.default_target.as_str());
+        let normalized_target = normalize_capability_target(argument_target);
+        let in_process_delivery = matches!(
+            normalized_target.as_str(),
+            "" | "web" | "in_app" | "app" | "app_notification" | "app_notifications"
+        );
         push_observation(
             &mut out,
             &mut seen,
@@ -1540,15 +1567,17 @@ pub fn observations_from_action_def(
             Some(argument_target),
             "action access declares a messaging channel target",
         );
-        push_observation(
-            &mut out,
-            &mut seen,
-            layer,
-            entity_id,
-            "sends-external",
-            Some(argument_target),
-            "action access declares a messaging channel target",
-        );
+        if !in_process_delivery {
+            push_observation(
+                &mut out,
+                &mut seen,
+                layer,
+                entity_id,
+                "sends-external",
+                Some(argument_target),
+                "action access declares an external messaging channel target",
+            );
+        }
     }
 
     if action.authorization.outbound.outbound_write {
@@ -1737,7 +1766,7 @@ pub fn evaluate_capability_correlation(
     prior_observations: &[CapabilityObservation],
     candidate_observations: &[CapabilityObservation],
 ) -> CapabilityCorrelationDecision {
-    if candidate_observations.is_empty() || prior_observations.is_empty() {
+    if candidate_observations.is_empty() {
         return CapabilityCorrelationDecision::allow();
     }
     let mut combined = prior_observations.to_vec();
@@ -1824,6 +1853,67 @@ mod tests {
         assert!(report.matched_rules.iter().any(|rule| rule.id
             == "approve-sensitive-source-to-external-send"
             && rule.effect == "approval"));
+    }
+
+    #[test]
+    fn candidate_composite_sensitive_read_to_external_send_requires_approval() {
+        let candidate = [
+            ("runtime", "watch", "sends-external"),
+            ("runtime", "gmail_scan", "reads-email"),
+            ("runtime", "gmail_scan", "reads-user-data"),
+        ]
+        .iter()
+        .map(|(layer, entity_id, kind)| CapabilityObservation {
+            layer: layer.to_string(),
+            entity_id: entity_id.to_string(),
+            kind: kind.to_string(),
+            target: None,
+            evidence: None,
+            confidence: Some(1.0),
+        })
+        .collect::<Vec<_>>();
+
+        let decision = evaluate_capability_correlation(&[], &candidate);
+        assert!(matches!(
+            decision.effect,
+            CapabilityCorrelationEffect::RequireApproval
+        ));
+        assert!(decision
+            .report
+            .as_ref()
+            .is_some_and(|report| report.matched_rules.iter().any(|rule| {
+                rule.id == "approve-sensitive-source-to-external-send"
+            })));
+    }
+
+    #[test]
+    fn in_app_channel_target_is_not_external_delivery() {
+        let action = crate::actions::ActionDef {
+            name: "watch".to_string(),
+            capabilities: vec!["watcher".to_string()],
+            authorization: crate::actions::ActionAuthorization {
+                access: crate::actions::ActionAccessMetadata {
+                    channel_targets: vec![crate::actions::ActionChannelTarget {
+                        argument_key: "notify_channel".to_string(),
+                        default_target: "preferred".to_string(),
+                    }],
+                    ..crate::actions::ActionAccessMetadata::default()
+                },
+                ..crate::actions::ActionAuthorization::default()
+            },
+            ..crate::actions::ActionDef::default()
+        };
+
+        let observations = observations_from_action_def(
+            "runtime",
+            &action,
+            Some(&serde_json::json!({ "notify_channel": "in_app" })),
+        );
+        let selectors = observation_selector_set(&observations);
+
+        assert!(selectors.contains("sends-message:in_app"));
+        assert!(!selectors.contains("sends-external"));
+        assert!(!selectors.contains("sends-external:in_app"));
     }
 
     #[test]
@@ -1932,6 +2022,25 @@ mod tests {
         assert!(!selectors.contains("unknown-high-risk"));
         assert!(selectors.contains("calls-network"));
         assert!(selectors.contains("reads-user-data:database"));
+    }
+
+    #[test]
+    fn custom_api_action_capabilities_use_generic_external_api_vocabulary() {
+        let capabilities = [
+            "custom_api".to_string(),
+            "integration".to_string(),
+            "network".to_string(),
+            "external_write".to_string(),
+        ];
+        let selectors = observation_selector_set(&observations_from_declared_capabilities(
+            "custom_api",
+            "api__project_tool__post_items",
+            &capabilities,
+        ));
+
+        assert!(!selectors.contains("unknown-high-risk"));
+        assert!(selectors.contains("calls-network"));
+        assert!(selectors.contains("writes-external"));
     }
 
     #[test]

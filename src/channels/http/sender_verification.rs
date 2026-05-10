@@ -524,6 +524,8 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn sender_verification_routes_round_trip() {
         let (state, _config_dir, _data_dir) = build_test_state().await;

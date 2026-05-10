@@ -219,6 +219,8 @@ function FileViewInner({
     : (card.kind || "").toLowerCase();
   const [copied, setCopied] = useState(false);
   const preRef = useRef<HTMLPreElement | null>(null);
+  const followTailRef = useRef(true);
+  const previousPathRef = useRef(path);
 
   useEffect(() => {
     if (!copied) return;
@@ -226,15 +228,32 @@ function FileViewInner({
     return () => window.clearTimeout(timer);
   }, [copied]);
 
-  // Auto-scroll the body so the freshly-streamed line stays visible while the
-  // agent is writing. Only fires while `live` is true; static viewing keeps
-  // the user's scroll position untouched.
   useEffect(() => {
-    if (!live) return;
+    if (previousPathRef.current !== path) {
+      previousPathRef.current = path;
+      followTailRef.current = true;
+    }
+    if (live) followTailRef.current = true;
+  }, [live, path]);
+
+  // Auto-scroll the body so the freshly-streamed line stays visible while the
+  // agent is writing. If the user scrolls up, stop following until they return
+  // near the bottom or a new live file stream begins.
+  useEffect(() => {
+    if (!live || !followTailRef.current) return;
     const node = preRef.current;
     if (!node) return;
     node.scrollTop = node.scrollHeight;
   }, [body, live]);
+
+  function handleBodyScroll() {
+    if (!live) return;
+    const node = preRef.current;
+    if (!node) return;
+    const distanceFromBottom =
+      node.scrollHeight - node.scrollTop - node.clientHeight;
+    followTailRef.current = distanceFromBottom < 40;
+  }
 
   async function handleCopy() {
     if (!body) return;
@@ -283,7 +302,11 @@ function FileViewInner({
         </span>
       </Box>
       {body ? (
-        <pre ref={preRef} className="code-viewer-pre cview-file-body">
+        <pre
+          ref={preRef}
+          className="code-viewer-pre cview-file-body"
+          onScroll={handleBodyScroll}
+        >
           <code>{highlightedLines}</code>
           {live ? (
             <span className="cview-file-caret" aria-hidden="true">

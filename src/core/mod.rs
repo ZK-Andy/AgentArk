@@ -29,7 +29,6 @@ pub mod gateway_ops;
 pub mod inline_artifacts;
 pub mod integration_auth;
 pub mod integration_sync;
-pub mod intent;
 pub mod learning;
 pub mod live_run;
 mod llm;
@@ -61,6 +60,7 @@ pub mod watcher;
 
 pub(crate) use agent::chat_model_is_configured;
 pub(crate) use agent::queue_stream_event;
+#[cfg(test)]
 pub(crate) use agent::reasoning_stream;
 pub(crate) use agent::AUTONOMY_SETTINGS_STORAGE_KEY;
 pub(crate) use agent::USER_SELECTED_MODEL_SLOT_KEY;

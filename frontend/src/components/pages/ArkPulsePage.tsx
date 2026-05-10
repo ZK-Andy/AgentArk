@@ -507,7 +507,7 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
   return (
     <WorkspacePageShell spacing={1.5} className="arkpulse-page-shell">
       <WorkspacePageHeader
-        eyebrow="Ark Core / ArkPulse"
+        eyebrow="ARK CORE"
         title="ArkPulse"
         description={
           <>

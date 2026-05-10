@@ -615,7 +615,7 @@ mod tests {
     fn operational_diagnostic_text_still_redacts_secret_like_values() {
         let fake_key = ["sk", "-1234567890", "abcdefghijklmnop"].concat();
         let sanitized = Agent::sanitize_operational_text(&format!("api_key={fake_key}"), 128);
-        assert!(sanitized.contains("[REDACTED_API_KEY]"));
+        assert!(sanitized.contains("api_key=[REDACTED_SECRET]"));
         assert!(!sanitized.contains(&fake_key));
     }
 
@@ -638,7 +638,7 @@ mod tests {
         let sanitized = Agent::sanitize_operational_payload_json(&payload).expect("payload");
 
         assert!(sanitized.contains("specialist_prompt_v1+specialist-prompt-bundle-default-v1"));
-        assert!(sanitized.contains("[REDACTED_API_KEY]"));
+        assert!(sanitized.contains("api_key=[REDACTED_SECRET]"));
         assert!(!sanitized.contains(&fake_key));
     }
 }

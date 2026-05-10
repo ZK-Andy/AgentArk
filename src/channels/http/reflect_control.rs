@@ -1863,9 +1863,9 @@ async fn plan_reflect_external_pursuits(
     if planning_items.is_empty() {
         return BTreeMap::new();
     }
-    let system_prompt = "You decide whether ArkReflect reflected topics are worth showing as a user opportunity with a current public-source check. Work by meaning, not exact words. Do not validate private memories, profile facts, names, or assertions against the web. Do not surface normal system health, no-incident monitoring, routine maintenance, stale operational status, or other background state unless it clearly contains a user-facing decision or repair path. If a reflected topic implies a useful external-facing pursuit, emit a concise public search query and title that pursue the actual opportunity. Preserve the user's real requested deliverable, named entity, domain, constraints, and evaluation criteria when present. For analytical or research deliverables, target the required data breakouts, forecast inputs, decision drivers, and evidence that separates likely leading signals from merely coincident ones rather than generic news. Remove unrelated private facts and memory keys from the query. If the topic is only an ordinary profile fact, preference, nickname, identity detail, or internal work state with no useful public next step, mark it not useful. Return only JSON.";
+    let system_prompt = reflect_opportunity_classifier_system_prompt();
     let user_message = format!(
-        "Plan public-source checks for these reflected topics:\n{}\n\nReturn JSON in this exact shape: {{\"plans\":[{{\"id\":\"same id\",\"useful\":true|false,\"title\":\"short human-facing title when useful\",\"search_query\":\"public web search query when useful\",\"rationale\":\"brief reason\"}}]}}",
+        "Classify these reflected topics as human opportunities before any source enrichment runs:\n{}\n\nFor each useful opportunity, include the public-source query that should be used later to enrich the UI. Do not require search results to exist at this stage.\n\nReturn JSON in this exact shape: {{\"plans\":[{{\"id\":\"same id\",\"useful\":true|false,\"title\":\"short human-facing title when useful\",\"search_query\":\"public web search query for later enrichment when useful\",\"rationale\":\"brief reason\"}}]}}",
         serde_json::to_string_pretty(&planning_items).unwrap_or_else(|_| "[]".to_string())
     );
     match tokio::time::timeout(
@@ -1884,6 +1884,10 @@ async fn plan_reflect_external_pursuits(
             BTreeMap::new()
         }
     }
+}
+
+fn reflect_opportunity_classifier_system_prompt() -> &'static str {
+    "You classify whether ArkReflect reflected topics are human opportunities. Classification happens before search, so do not require source results to already exist. Work from the underlying human intent and likely usefulness, not exact words, topic labels, or keyword matches. A topic is useful when public evidence would materially help the user pursue, compare, decide, prepare, defer intelligently, monitor, or understand a constructive next step. The useful horizon may be immediate, later, exploratory, or recurring; judge whether external evidence improves the human pursuit, not whether the wording resembles an example. Treat private or personal context only as intent context, not as a fact to verify: do not validate private memories, profile facts, names, relationships, emotions, or assertions against the web. If the useful next step can be grounded in public sources without exposing unrelated private details, emit a concise human-facing title and public search query for later enrichment. Preserve the user's real requested deliverable, named entity, domain, constraints, and evaluation criteria when present. If the reflected activity implies currentness matters, target the freshest reliable evidence needed for the user's real decision rather than generic news. For complex analytical topics, target the evidence needed to answer the real decision rather than generic news. For potentially sensitive personal topics, avoid diagnosis and avoid turning private claims into public queries; target broadly useful, reputable, practical public resources. Remove unrelated private facts, names, raw memory keys, and credentials from the query. Do not surface routine background/system state unless it clearly contains a user-facing decision or repair path. If public evidence would not materially improve the user's next step, mark it not useful. Return only JSON."
 }
 
 fn apply_reflect_external_pursuit_plans(
@@ -1913,7 +1917,7 @@ fn apply_reflect_external_pursuit_plans(
                 plan.title
             );
             candidate.detail = if plan.rationale.trim().is_empty() {
-                "ArkReflect found a reflected topic that can be pursued with current public sources.".to_string()
+                "ArkReflect classified this reflected topic as a human opportunity. Source enrichment is queued.".to_string()
             } else {
                 plan.rationale.clone()
             };

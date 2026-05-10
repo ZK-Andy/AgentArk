@@ -11,10 +11,8 @@
 
 use super::*;
 
-/// Intent context passed into LLM-based argument repair so the model can fill
-/// missing required fields semantically: using the user's underlying meaning
-/// plus the routing classifier's signals plus the active turn-plan goals,
-/// rather than guessing from the surface phrasing of the user message alone.
+/// Legacy repair context retained for validator diagnostics. It must not be
+/// used to infer missing executable inputs after Semantic DAG binding.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ArgumentRepairContext {
     pub user_message: String,
@@ -23,6 +21,7 @@ pub(crate) struct ArgumentRepairContext {
 }
 
 impl ArgumentRepairContext {
+    #[cfg(test)]
     pub(crate) fn from_message(user_message: impl Into<String>) -> Self {
         Self {
             user_message: user_message.into(),
@@ -67,36 +66,10 @@ impl ArgumentRepairContext {
     }
 }
 
-/// Result of an LLM-driven repair attempt against a tool call payload.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ArgumentRepairOutcome {
-    pub repaired_payload: serde_json::Map<String, serde_json::Value>,
-    pub still_missing: Vec<String>,
-    pub partial_inference: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Per-turn memo so identical repair attempts (same action, same missing
-/// fields, same payload) do not invoke the LLM more than once within a single
-/// user turn.
+/// Retired per-turn repair memo. Kept as a unit type while older executor
+/// signatures are collapsed around direct Semantic DAG validation.
 #[derive(Debug, Default)]
-pub(crate) struct RepairMemo {
-    seen: std::collections::HashMap<String, ArgumentRepairOutcome>,
-    attempted_scopes: std::collections::HashSet<String>,
-}
-
-impl RepairMemo {
-    pub(crate) fn lookup(&self, key: &str) -> Option<&ArgumentRepairOutcome> {
-        self.seen.get(key)
-    }
-
-    pub(crate) fn record(&mut self, key: String, outcome: ArgumentRepairOutcome) {
-        self.seen.insert(key, outcome);
-    }
-
-    pub(crate) fn claim_attempt_scope(&mut self, key: String) -> bool {
-        self.attempted_scopes.insert(key)
-    }
-}
+pub(crate) struct RepairMemo;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ArgumentRepairClarification {
@@ -125,6 +98,7 @@ pub(super) fn missing_fields_signature(action_name: &str, missing_fields: &[Stri
 /// Stable de-duplication key for the per-turn repair memo. Identical
 /// `(action, missing-field-set, payload)` combinations hash to the same key
 /// regardless of field ordering inside the missing list.
+#[cfg(test)]
 pub(super) fn repair_memo_key(
     action_name: &str,
     missing_fields: &[String],
@@ -227,61 +201,6 @@ pub(super) fn shallow_schema_violation(
     }
 
     None
-}
-
-impl Agent {
-    /// Invoke the existing LLM-based argument inferer to fill missing required
-    /// fields semantically. Memoized per `(action, missing-field-set, payload)`
-    /// for the duration of one user turn so identical repeat attempts do not
-    /// re-call the model.
-    ///
-    /// Returns the outcome with `still_missing` empty when fully repaired.
-    /// On failure the original payload is preserved unchanged.
-    pub(super) async fn fill_missing_required_fields_via_inference(
-        &self,
-        action: &crate::actions::ActionDef,
-        payload: &mut serde_json::Map<String, serde_json::Value>,
-        ctx: &ArgumentRepairContext,
-        missing_fields: &[String],
-        memo: &mut RepairMemo,
-    ) -> ArgumentRepairOutcome {
-        if missing_fields.is_empty() {
-            return ArgumentRepairOutcome {
-                repaired_payload: payload.clone(),
-                still_missing: Vec::new(),
-                partial_inference: serde_json::Map::new(),
-            };
-        }
-
-        let key = repair_memo_key(&action.name, missing_fields, payload);
-        if let Some(cached) = memo.lookup(&key) {
-            for (k, v) in &cached.partial_inference {
-                payload.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            return cached.clone();
-        }
-
-        let request_text = ctx.build_request_text();
-        let inferred = self
-            .infer_missing_action_arguments(action, payload, &request_text, missing_fields)
-            .await
-            .unwrap_or_default();
-
-        for (k, v) in &inferred {
-            payload.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-
-        let still_missing = missing_required_fields(action, payload);
-
-        let outcome = ArgumentRepairOutcome {
-            repaired_payload: payload.clone(),
-            still_missing,
-            partial_inference: inferred,
-        };
-
-        memo.record(key, outcome.clone());
-        outcome
-    }
 }
 
 #[cfg(test)]

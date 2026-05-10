@@ -7,8 +7,8 @@ use crate::{
     identity::IdentityManager,
     proofs::ProofEngine,
     runtime::{
-        parse_workflow_action_marker, parse_workflow_missing_inputs_marker, ActionRuntime,
-        InstalledCliSkillManifest, WorkflowMissingInputsPayload,
+        ActionRuntime, InstalledCliSkillManifest, WorkflowMissingInputsPayload,
+        parse_workflow_action_marker, parse_workflow_missing_inputs_marker,
     },
     safety::SafetyEngine,
     security::SecurityGuard,
@@ -16,23 +16,27 @@ use crate::{
 };
 use anyhow::Result;
 use regex::Regex;
-use sea_orm::{entity::prelude::PgVector, TransactionTrait};
+use sea_orm::{TransactionTrait, entity::prelude::PgVector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 use super::{
+    AgentConfig, EmbeddingClient, ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus,
+    PlanSubstep, PromptMemory, RequestState,
     action_catalog::{
-        action_catalog_embedding_has_default_dim, action_catalog_entry_needs_embedding,
-        build_action_catalog_descriptor, ActionCatalogSyncStats,
+        ActionCatalogSyncStats, action_catalog_embedding_has_default_dim,
+        action_catalog_entry_needs_embedding, build_action_catalog_descriptor,
     },
     arkorbit,
     automation::{
-        self, append_run as append_automation_run, compute_retry_at,
+        self, AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
+        AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
+        AutomationValidationMode, append_run as append_automation_run, compute_retry_at,
         critique_result as critique_automation_result,
         current_attempt as automation_current_attempt,
         delete_supervisor_state as delete_automation_supervisor_state,
@@ -48,20 +52,16 @@ use super::{
         truncate_text as automation_truncate_text,
         upsert_supervisor_state as upsert_automation_supervisor_state,
         validation_from_request_argument as automation_validation_from_request_argument,
-        AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
-        AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
-        AutomationValidationMode,
     },
     autonomy::{self, ConversationScope},
     background_session, browser_session,
     config::{ModelCapabilityTier, ModelCostTier, ModelRole, ModelSlot},
     document_search::{self, DocumentSearchHit},
     execution::{
-        execute_supervised_transport_chat, ExecutionCandidateDescriptor, ExecutionRequest,
-        ExecutionRunStatus, ExecutionSupervisor, RecoveryAction, UserFacingOutcome,
-        UserFacingOutcomeStatus,
+        ExecutionCandidateDescriptor, ExecutionRequest, ExecutionRunStatus, ExecutionSupervisor,
+        RecoveryAction, UserFacingOutcome, UserFacingOutcomeStatus,
+        execute_supervised_transport_chat,
     },
-    intent::{action_intent_score, preferred_direct_action_name},
     llm::{self, LlmClient, LlmProvider},
     model_failover::{
         ModelFailoverControlPlane, ModelFailoverSelectionRequest, ProviderHealthEvent,
@@ -69,8 +69,7 @@ use super::{
     orchestra::{Orchestra, OrchestraConfig},
     swarm::{AgentId, SwarmManager},
     task::{self, TaskQueue},
-    task_router, watcher, AgentConfig, EmbeddingClient, ExecutionPlan, PlanPromptMode, PlanStep,
-    PlanStepStatus, PlanSubstep, PromptMemory, RequestState,
+    task_router, watcher,
 };
 
 mod action_selection;
@@ -78,9 +77,9 @@ mod agent_loop;
 mod argument_repair;
 mod automation_helpers;
 mod background_sessions;
+mod chat_approvals;
 mod conversation_context;
 mod daily_brief;
-mod intent_planning;
 mod memory;
 mod message_processing;
 mod model_runtime;
@@ -88,6 +87,7 @@ mod notifications;
 mod operational;
 mod pending_flows;
 mod prompt_builder;
+#[cfg(test)]
 pub(crate) mod reasoning_stream;
 mod request_context;
 mod resilience_followups;
@@ -103,18 +103,18 @@ mod watcher_followup;
 use automation_helpers::*;
 use background_sessions::*;
 pub use conversation_context::ConversationMessage;
-pub(crate) use intent_planning::{AdvisoryIntent, AdvisoryIntentPlan};
 use memory::*;
+pub use notifications::{NotificationDispatchOutcome, NotificationEvent, NotificationStore};
 use notifications::{
     inbound_security_source_label, is_external_notification_channel,
-    notification_channel_display_name, notification_push_signature,
-    telegram_notification_target_is_configured, whatsapp_notification_target_is_configured,
+    notification_channel_display_name, notification_channel_not_connected_outcome,
+    notification_push_signature, telegram_notification_target_is_configured,
+    whatsapp_notification_target_is_configured,
 };
-pub use notifications::{NotificationDispatchOutcome, NotificationEvent, NotificationStore};
 use request_context::*;
 use skill_import::*;
-pub(crate) use streaming::queue_stream_event;
 pub use streaming::StreamEvent;
+pub(crate) use streaming::queue_stream_event;
 use tool_responses::*;
 pub(crate) use watcher_followup::{WatcherFollowupPreparation, WatcherFollowupWorker};
 
@@ -135,8 +135,6 @@ const DEFAULT_CHAT_DIGEST_POINT_TOKENS: usize = 96;
 const CONTEXT_DIGEST_PAGE_SIZE: u64 = 64;
 const CONTEXT_DIGEST_VERSION: u8 = 3;
 const PROMPT_RECENT_HISTORY_RATIO_PERCENT: usize = 45;
-const READ_ONLY_PROMPT_RECENT_HISTORY_RATIO_PERCENT: usize = 25;
-const INTENT_PLAN_HISTORY_RATIO_PERCENT: usize = 20;
 const CONVERSATION_RECENT_ARTIFACT_KEY_PREFIX: &str = "conversation_recent_artifact_v1:";
 const CONVERSATION_RECENT_ARTIFACT_LIMIT: usize = 8;
 const BACKGROUND_SESSION_IDLE_CONSOLIDATION_AFTER_MINS: i64 = 10;
@@ -564,6 +562,8 @@ pub struct ChatCredentialPrompt {
     pub mode_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_path: Option<String>,
 }
 
 const PENDING_RESILIENCE_FOLLOWUP_TTL_HOURS: i64 = 24;
@@ -597,10 +597,49 @@ struct PendingResilienceFollowup {
     requested_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClarificationChoice {
     pub label: String,
     pub submit_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<DirectChatApprovalChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DirectChatApprovalChoice {
+    pub id: String,
+    pub decision: String,
+    pub action_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<DirectChatApprovalStepView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DirectChatApprovalView {
+    pub id: String,
+    pub action_name: String,
+    pub reason: String,
+    pub requested_at: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub arguments_preview: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<DirectChatApprovalStepView>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DirectChatApprovalStepView {
+    pub action_name: String,
+    #[serde(default)]
+    pub arguments_preview: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DirectChatChainApprovalCall {
+    pub action_name: String,
+    pub arguments: serde_json::Value,
 }
 
 fn tokenize_lower(text: &str) -> Vec<String> {
@@ -1561,6 +1600,7 @@ struct ImmediateExchangeContext<'a> {
     project_id: Option<&'a str>,
     model_used: &'a str,
     user_message_already_recorded: bool,
+    recorded_user_message_id: Option<String>,
     memory_capture_allowed: bool,
     memory_capture_source: Option<&'a str>,
     user_message_for_link_capture: Option<&'a str>,
@@ -1934,11 +1974,11 @@ pub struct RequestExecutionHints {
     pub direct_user_intent: bool,
     pub routing: Option<crate::security::intent_classifier::InboundRoutingSignal>,
     pub routing_trusted: bool,
-    pub intent_plan: Option<AdvisoryIntentPlan>,
     pub force_agent_loop: bool,
     pub secret_offered: Option<SecretOfferedHint>,
     pub attachments: Vec<ChatAttachmentHint>,
     pub saved_user_facts_context: Option<String>,
+    pub recorded_user_message_id: Option<String>,
     /// Per-call structural context describing the ArkOrbit canvas the user
     /// is on. Includes the active orbit id, widget summary, and the orbit's
     /// optional `agent_instructions`. Forwarded as augmentation only — never
@@ -1954,6 +1994,7 @@ enum InboundSecurityPrecheck {
         memory_capture_allowed: bool,
         routing: Option<crate::security::intent_classifier::InboundRoutingSignal>,
         routing_trusted: bool,
+        direct_response: Option<String>,
     },
     Respond(ProcessedMessage),
 }
@@ -2278,6 +2319,19 @@ impl Agent {
         let Some(usage) = resp.usage.as_ref() else {
             return;
         };
+        if usage.cached_prompt_tokens > 0 || usage.cache_creation_prompt_tokens > 0 {
+            tracing::debug!(
+                target: "agentark.llm_usage",
+                provider = %resp.provider,
+                model = %resp.model,
+                channel = %channel,
+                purpose = %purpose,
+                prompt_tokens = usage.prompt_tokens,
+                cached_prompt_tokens = usage.cached_prompt_tokens,
+                cache_creation_prompt_tokens = usage.cache_creation_prompt_tokens,
+                "LLM prompt cache usage"
+            );
+        }
         // Accumulate on current trace
         {
             let mut trace = self.last_trace.write().await;

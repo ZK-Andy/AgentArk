@@ -615,7 +615,7 @@ export function SentinelPanel({
     <>
       <WorkspacePageShell spacing={1.5}>
         <WorkspacePageHeader
-          eyebrow="Ark Core / ArkSentinel"
+          eyebrow="ARK CORE"
           title="ArkSentinel"
           description={
             <>

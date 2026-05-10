@@ -2155,6 +2155,8 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn webhook_source_secret_is_stored_encrypted_but_not_returned() {
         let (state, config_dir, data_dir) = build_test_state().await;
@@ -2219,6 +2221,8 @@ mod tests {
         assert!(!list_body.to_string().contains("super-secret-token"));
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn webhook_source_rejects_unknown_completion_channel() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2284,6 +2288,8 @@ mod tests {
             .expect("local-only no-auth webhooks are allowed");
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn inbound_webhook_queues_autonomous_task() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2394,6 +2400,8 @@ mod tests {
         );
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn failures_only_source_ignores_success_events() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
@@ -2452,6 +2460,8 @@ mod tests {
         assert!(tasks.all().is_empty());
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn duplicate_delivery_is_ignored() {
         let (state, _config_dir, _data_dir) = build_test_state().await;

@@ -106,6 +106,81 @@ pub struct AdminListUsersArgs {
     pub max_results: Option<u32>,
 }
 
+fn drive_file_owner_label(file: &serde_json::Value) -> Option<String> {
+    file.get("owners")
+        .and_then(|value| value.as_array())
+        .and_then(|owners| owners.first())
+        .and_then(|value| {
+            value
+                .get("displayName")
+                .and_then(|name| name.as_str())
+                .or_else(|| value.get("emailAddress").and_then(|email| email.as_str()))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn drive_search_result_payload(
+    args: &DriveSearchArgs,
+    files: Vec<serde_json::Value>,
+    page_size: u32,
+) -> String {
+    let query = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    let results = files
+        .iter()
+        .map(|file| {
+            let mut result = serde_json::Map::new();
+            if let Some(name) = file
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                result.insert("name".to_string(), serde_json::json!(name));
+            }
+            if let Some(mime_type) = file
+                .get("mimeType")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                result.insert("mimeType".to_string(), serde_json::json!(mime_type));
+            }
+            if let Some(modified) = file
+                .get("modifiedTime")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                result.insert("modifiedTime".to_string(), serde_json::json!(modified));
+            }
+            if let Some(owner) = drive_file_owner_label(file) {
+                result.insert("owner".to_string(), serde_json::json!(owner));
+            }
+            serde_json::Value::Object(result)
+        })
+        .collect::<Vec<_>>();
+    let count = results.len();
+
+    serde_json::json!({
+        "query": query,
+        "backend": "Google Drive",
+        "results": results,
+        "retrieval": {
+            "source": "connected_google_workspace",
+            "count": count,
+            "page_size": page_size,
+        }
+    })
+    .to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -1489,49 +1564,7 @@ pub async fn drive_search(config_dir: &Path, arguments: &serde_json::Value) -> R
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
-    if files.is_empty() {
-        return Ok("No matching Google Drive files found.".to_string());
-    }
-
-    let mut lines = Vec::new();
-    for file in files {
-        let name = file
-            .get("name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Untitled");
-        let mime = file
-            .get("mimeType")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        let modified = file
-            .get("modifiedTime")
-            .and_then(|value| value.as_str())
-            .unwrap_or("-");
-        let owner = file
-            .get("owners")
-            .and_then(|value| value.as_array())
-            .and_then(|owners| owners.first())
-            .and_then(|value| {
-                value
-                    .get("displayName")
-                    .and_then(|name| name.as_str())
-                    .or_else(|| value.get("emailAddress").and_then(|email| email.as_str()))
-            })
-            .unwrap_or("-");
-        let link = file
-            .get("webViewLink")
-            .and_then(|value| value.as_str())
-            .unwrap_or("-");
-        let file_id = file
-            .get("id")
-            .and_then(|value| value.as_str())
-            .unwrap_or("-");
-        lines.push(format!(
-            "- {} | {} | modified {} | owner {} | {} | id {}",
-            name, mime, modified, owner, link, file_id
-        ));
-    }
-    Ok(lines.join("\n"))
+    Ok(drive_search_result_payload(&args, files, page_size))
 }
 
 pub async fn docs_read(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
@@ -2118,6 +2151,36 @@ mod tests {
         ]);
         assert!(scopes.iter().any(|scope| scope.contains("gmail.readonly")));
         assert!(scopes.iter().any(|scope| scope.contains("calendar")));
+    }
+
+    #[test]
+    fn drive_search_result_payload_is_structured_for_chat_rendering() {
+        let args = DriveSearchArgs {
+            query: None,
+            page_size: Some(10),
+        };
+        let output = drive_search_result_payload(
+            &args,
+            vec![serde_json::json!({
+                "id": "file-secret-id",
+                "name": "Project Plan",
+                "mimeType": "application/vnd.google-apps.document",
+                "modifiedTime": "2026-05-08T10:00:00Z",
+                "webViewLink": "https://drive.google.test/file/d/file-secret-id/view",
+                "owners": [{"displayName": "Alex"}]
+            })],
+            10,
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&output).expect("payload should be JSON");
+
+        assert_eq!(value["backend"], "Google Drive");
+        assert_eq!(value["results"][0]["name"], "Project Plan");
+        assert_eq!(value["results"][0]["owner"], "Alex");
+        assert_eq!(value["retrieval"]["count"], 1);
+        assert!(!output.contains(" | id "));
+        assert!(!output.contains("webViewLink"));
+        assert!(!output.contains("file-secret-id"));
     }
 
     #[test]

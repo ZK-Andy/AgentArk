@@ -177,6 +177,63 @@ function customApiAuthRequiresSecret(authMode: string): boolean {
   return authMode !== "none" && authMode.trim().length > 0;
 }
 
+function customApiAuthUsesUsername(authMode: string): boolean {
+  return authMode === "basic";
+}
+
+function customApiAuthUsesAuthHeader(authMode: string): boolean {
+  return authMode === "bearer" || authMode === "oauth2";
+}
+
+function customApiAuthUsesName(authMode: string): boolean {
+  return authMode === "api_key_header" || authMode === "api_key_query";
+}
+
+function customApiAuthNameLabel(authMode: string): string {
+  if (authMode === "api_key_query") return "Query parameter";
+  if (authMode === "api_key_header") return "Header name";
+  return "Auth name";
+}
+
+function customApiSecretLabel(authMode: string): string {
+  if (authMode === "basic") return "Password";
+  if (authMode === "api_key_header" || authMode === "api_key_query") return "API key";
+  if (authMode === "bearer") return "Bearer token";
+  if (authMode === "oauth2") return "OAuth token";
+  return "Token / Secret";
+}
+
+function customApiSecretHelper(authMode: string, editing: boolean, hasSavedSecret: boolean): string {
+  if (editing && hasSavedSecret) return "Leave blank to keep the saved credential.";
+  if (authMode === "bearer") {
+    return "Paste the token only. AgentArk stores it encrypted and sends it as a bearer token.";
+  }
+  if (authMode === "api_key_header") {
+    return "Stored encrypted and sent in the configured request header.";
+  }
+  if (authMode === "api_key_query") {
+    return "Stored encrypted and sent as the configured query parameter.";
+  }
+  if (authMode === "basic") {
+    return "Stored encrypted and sent as the Basic auth password with the username.";
+  }
+  if (authMode === "oauth2") {
+    return "Stored encrypted and sent as an OAuth bearer token for this API.";
+  }
+  return "Stored encrypted and injected only into API requests.";
+}
+
+function customApiDefaultAuthHeader(authMode: string): string {
+  if (authMode === "bearer" || authMode === "oauth2") return "Authorization";
+  return "";
+}
+
+function customApiDefaultAuthName(authMode: string): string {
+  if (authMode === "api_key_header") return "X-API-Key";
+  if (authMode === "api_key_query") return "api_key";
+  return "";
+}
+
 function parseOperationDraft(value: unknown): OperationDraft {
   const row = asRecord(value);
   return {
@@ -364,16 +421,18 @@ export function IntegrationQuickstartPanel({
   async function handleSaveCustomApi() {
     setNotice(null);
     try {
+      const authMode = customApiForm.auth_mode;
       const payload = {
         name: customApiForm.name.trim(),
         description: customApiForm.description.trim(),
         base_url: customApiForm.base_url.trim(),
         enabled: customApiForm.enabled,
-        auth_mode: customApiForm.auth_mode,
-        auth_header: customApiForm.auth_header.trim() || undefined,
-        auth_name: customApiForm.auth_name.trim() || undefined,
-        auth_username: customApiForm.auth_username.trim() || undefined,
-        secret: customApiForm.secret.trim() || undefined,
+        auth_mode: authMode,
+        auth_header: customApiAuthUsesAuthHeader(authMode) ? customApiForm.auth_header.trim() || undefined : undefined,
+        auth_name: customApiAuthUsesName(authMode) ? customApiForm.auth_name.trim() || undefined : undefined,
+        auth_username: customApiAuthUsesUsername(authMode) ? customApiForm.auth_username.trim() || undefined : undefined,
+        secret: customApiAuthRequiresSecret(authMode) ? customApiForm.secret.trim() || undefined : undefined,
+        clear_secret: customApiAuthRequiresSecret(authMode) ? undefined : true,
         operations: customApiForm.operations
       };
       if (editingCustomApiId) {
@@ -398,9 +457,16 @@ export function IntegrationQuickstartPanel({
 
   async function handleDeleteCustomApi(id: string) {
     setNotice(null);
+    if (
+      !window.confirm(
+        "Delete this custom API integration? This removes the imported API config, saved credential, registered tools, and related local runtime records."
+      )
+    ) {
+      return;
+    }
     try {
       await deleteCustomApi.mutateAsync(id);
-      setNotice({ kind: "success", text: "Custom API removed." });
+      setNotice({ kind: "success", text: "Custom API deleted." });
     } catch (error) {
       setNotice({ kind: "error", text: errMessage(error) });
     }
@@ -409,11 +475,26 @@ export function IntegrationQuickstartPanel({
   async function handleTestCustomApi(id: string) {
     setNotice(null);
     try {
-      await testCustomApi.mutateAsync(id);
-      setNotice({ kind: "success", text: "Custom API test completed." });
+      const response = asRecord(await testCustomApi.mutateAsync(id));
+      const result = asRecord(response.result);
+      setNotice({ kind: "success", text: str(result.detail, "Custom API test completed.") });
     } catch (error) {
       setNotice({ kind: "error", text: errMessage(error) });
     }
+  }
+
+  function handleCustomApiAuthModeChange(authMode: string) {
+    setCustomApiForm((current) => ({
+      ...current,
+      auth_mode: authMode,
+      auth_header: customApiAuthUsesAuthHeader(authMode)
+        ? current.auth_header || customApiDefaultAuthHeader(authMode)
+        : "",
+      auth_name: customApiAuthUsesName(authMode)
+        ? current.auth_name || customApiDefaultAuthName(authMode)
+        : "",
+      auth_username: customApiAuthUsesUsername(authMode) ? current.auth_username : "",
+    }));
   }
 
   return (
@@ -575,6 +656,7 @@ export function IntegrationQuickstartPanel({
                   const needsSecret =
                     customApiAuthRequiresSecret(authMode) && !toBool(config.secret_configured);
                   const enabled = config.enabled !== false;
+                  const actionCount = Number(config.action_count) || 0;
                   return (
                     <TableRow key={configId}>
                       <TableCell>{str(config.name, configId)}</TableCell>
@@ -588,7 +670,7 @@ export function IntegrationQuickstartPanel({
                           sx={{ height: 22, fontSize: "0.68rem" }}
                         />
                       </TableCell>
-                      <TableCell>{String(Number(config.action_count) || 0)}</TableCell>
+                      <TableCell>{String(actionCount)}</TableCell>
                       <TableCell>{str(config.last_test_outcome, "-")}</TableCell>
                       <TableCell align="right">
                         <Stack direction="row" spacing={0.5} sx={{
@@ -600,13 +682,13 @@ export function IntegrationQuickstartPanel({
                           <Button
                             size="small"
                             variant="text"
-                            disabled={!str(config.test_action_name)}
+                            disabled={!enabled || actionCount <= 0 || testCustomApi.isPending}
                             onClick={() => handleTestCustomApi(configId)}
                           >
                             Test
                           </Button>
                           <Button size="small" color="error" variant="text" onClick={() => handleDeleteCustomApi(configId)}>
-                            Remove
+                            Delete
                           </Button>
                         </Stack>
                       </TableCell>
@@ -658,7 +740,7 @@ export function IntegrationQuickstartPanel({
             {customApiForm.operations.length > 0 ? (
               <>
                 <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
-                  <TextField select label="Auth" fullWidth value={customApiForm.auth_mode} onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_mode: e.target.value }))}>
+                  <TextField select label="Auth" fullWidth value={customApiForm.auth_mode} onChange={(e) => handleCustomApiAuthModeChange(e.target.value)}>
                     <MenuItem value="none">None</MenuItem>
                     <MenuItem value="bearer">Bearer token</MenuItem>
                     <MenuItem value="api_key_header">API key header</MenuItem>
@@ -666,24 +748,48 @@ export function IntegrationQuickstartPanel({
                     <MenuItem value="oauth2">OAuth token</MenuItem>
                     <MenuItem value="basic">Basic auth</MenuItem>
                   </TextField>
-                  <TextField label="Auth header" fullWidth value={customApiForm.auth_header} onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_header: e.target.value }))} />
-                  <TextField label="Auth name" fullWidth value={customApiForm.auth_name} onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_name: e.target.value }))} />
+                  {customApiAuthUsesAuthHeader(customApiForm.auth_mode) ? (
+                    <TextField
+                      label="Auth header"
+                      fullWidth
+                      value={customApiForm.auth_header}
+                      onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_header: e.target.value }))}
+                      helperText="The header used for the bearer token."
+                    />
+                  ) : null}
+                  {customApiAuthUsesName(customApiForm.auth_mode) ? (
+                    <TextField
+                      label={customApiAuthNameLabel(customApiForm.auth_mode)}
+                      fullWidth
+                      value={customApiForm.auth_name}
+                      onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_name: e.target.value }))}
+                    />
+                  ) : null}
                 </Stack>
-                <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
-                  <TextField label="Username" fullWidth value={customApiForm.auth_username} onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_username: e.target.value }))} />
-                  <TextField
-                    label="Token / Secret"
-                    type="password"
-                    fullWidth
-                    value={customApiForm.secret}
-                    onChange={(e) => setCustomApiForm((current) => ({ ...current, secret: e.target.value }))}
-                    helperText={
-                      editingCustomApiId && editingCustomApiSecretConfigured
-                        ? "Leave blank to keep the saved secret."
-                        : "Stored encrypted and injected only into API requests."
-                    }
-                  />
-                </Stack>
+                {customApiAuthRequiresSecret(customApiForm.auth_mode) ? (
+                  <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>
+                    {customApiAuthUsesUsername(customApiForm.auth_mode) ? (
+                      <TextField
+                        label="Username"
+                        fullWidth
+                        value={customApiForm.auth_username}
+                        onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_username: e.target.value }))}
+                      />
+                    ) : null}
+                    <TextField
+                      label={customApiSecretLabel(customApiForm.auth_mode)}
+                      type="password"
+                      fullWidth
+                      value={customApiForm.secret}
+                      onChange={(e) => setCustomApiForm((current) => ({ ...current, secret: e.target.value }))}
+                      helperText={customApiSecretHelper(
+                        customApiForm.auth_mode,
+                        !!editingCustomApiId,
+                        editingCustomApiSecretConfigured,
+                      )}
+                    />
+                  </Stack>
+                ) : null}
                 <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto", maxHeight: "none" }}>
                 <Table size="small" sx={{ minWidth: 720, "& td, & th": { borderColor: "var(--ui-rgba-112-153-201-120)", py: 0.75 } }}>
                   <TableHead>

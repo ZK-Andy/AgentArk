@@ -27,6 +27,10 @@ pub struct AutomationAuthorizationContext {
     pub direct_user_intent: bool,
     #[serde(default)]
     pub current_turn_is_explicit_approval: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_access_scope: Option<crate::core::swarm::AgentAccessScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_context_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -275,6 +279,8 @@ fn persistable_authorization_context(
         principal: Some(principal),
         direct_user_intent: true,
         current_turn_is_explicit_approval: authorization.current_turn_is_explicit_approval,
+        agent_access_scope: authorization.agent_access_scope.clone(),
+        capability_context_id: authorization.capability_context_id.clone(),
     })
 }
 
@@ -335,8 +341,8 @@ pub fn runtime_authorization_context_from_arguments(
         direct_user_intent: persisted.direct_user_intent,
         current_turn_is_explicit_approval: persisted.current_turn_is_explicit_approval,
         agent_name: None,
-        agent_access_scope: None,
-        capability_context_id: None,
+        agent_access_scope: persisted.agent_access_scope,
+        capability_context_id: persisted.capability_context_id,
     }
 }
 
@@ -746,6 +752,64 @@ pub fn truncate_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automation_authorization_context_preserves_runtime_scope_without_secrets() {
+        let mut scope = crate::core::swarm::AgentAccessScope::default();
+        scope.channel_ids.push("telegram".to_string());
+        scope.approved_permission_ids.push("watcher".to_string());
+        let authorization = ActionAuthorizationContext {
+            principal: Some(ActionCallerPrincipal::local_admin("web")),
+            surface: ActionExecutionSurface::Chat,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval: true,
+            agent_name: Some("Ops".to_string()),
+            agent_access_scope: Some(scope.clone()),
+            capability_context_id: Some("turn-123".to_string()),
+        };
+
+        let arguments = inject_authorization_context(&serde_json::json!({}), Some(&authorization));
+        let restored = runtime_authorization_context_from_arguments(
+            &arguments,
+            ActionExecutionSurface::Background,
+        );
+
+        assert_eq!(restored.principal, authorization.principal);
+        assert_eq!(restored.surface, ActionExecutionSurface::Background);
+        assert!(restored.direct_user_intent);
+        assert!(restored.current_turn_is_explicit_approval);
+        assert_eq!(restored.agent_access_scope, Some(scope));
+        assert_eq!(restored.capability_context_id.as_deref(), Some("turn-123"));
+        assert_eq!(restored.agent_name, None);
+    }
+
+    #[test]
+    fn automation_authorization_context_rejects_untrusted_persistence() {
+        let authorization = ActionAuthorizationContext {
+            principal: Some(ActionCallerPrincipal {
+                user_id: "external".to_string(),
+                role: "viewer".to_string(),
+                auth_source: "webhook".to_string(),
+                trusted: false,
+            }),
+            surface: ActionExecutionSurface::Api,
+            direct_user_intent: true,
+            current_turn_is_explicit_approval: false,
+            agent_name: None,
+            agent_access_scope: None,
+            capability_context_id: Some("turn-456".to_string()),
+        };
+
+        let arguments = inject_authorization_context(&serde_json::json!({}), Some(&authorization));
+        let restored = runtime_authorization_context_from_arguments(
+            &arguments,
+            ActionExecutionSurface::Background,
+        );
+
+        assert_eq!(restored.principal, None);
+        assert!(!restored.direct_user_intent);
+        assert_eq!(restored.capability_context_id, None);
+    }
 
     #[test]
     fn structured_success_requires_structured_signal() {

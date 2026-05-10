@@ -53,6 +53,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { Orbit as OrbitIcon } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import { api } from "./api/client";
@@ -369,7 +370,7 @@ const NAV_GROUPS: NavGroup[] = [
       {
         key: "arkorbit",
         label: "Orbit",
-        icon: <HubRoundedIcon fontSize="small" />,
+        icon: <OrbitIcon size={18} strokeWidth={2.2} aria-hidden="true" />,
         tooltip: "Your canvases, projects, and working spaces.",
       },
     ],

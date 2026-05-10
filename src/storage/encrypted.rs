@@ -259,6 +259,8 @@ impl EncryptedStorage {
 mod tests {
     use super::*;
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn reencrypt_all_sensitive_data_updates_rows_and_live_key() {
         let _temp_dir = tempfile::tempdir().unwrap();

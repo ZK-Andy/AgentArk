@@ -296,32 +296,11 @@ fn postgres_url_from_parts(
 
 #[cfg(test)]
 fn test_database_url() -> Result<String> {
-    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    URL.get_or_init(|| {
-        explicit_test_database_url()
-            .or_else(test_database_url_from_compose_postgres)
-            .unwrap_or_else(|| {
-                "postgres://agentark:agentark@127.0.0.1:5432/agentark_test".to_string()
-            })
-    });
-    let url = URL
-        .get()
-        .cloned()
-        .unwrap_or_else(|| "postgres://agentark:agentark@127.0.0.1:5432/agentark_test".to_string());
+    let url = std::env::var("AGENTARK_TEST_DATABASE_URL").context(
+        "DB integration tests require AGENTARK_TEST_DATABASE_URL; default tests must not open Postgres",
+    )?;
     ensure_database_url_is_test_scoped(&url)?;
     Ok(url)
-}
-
-#[cfg(test)]
-fn explicit_test_database_url() -> Option<String> {
-    std::env::var("AGENTARK_TEST_DATABASE_URL")
-        .ok()
-        .filter(|value| ensure_database_url_is_test_scoped(value).is_ok())
-        .or_else(|| {
-            std::env::var("AGENTARK_DATABASE_URL")
-                .ok()
-                .filter(|value| ensure_database_url_is_test_scoped(value).is_ok())
-        })
 }
 
 #[cfg(test)]
@@ -336,7 +315,7 @@ fn ensure_database_url_is_test_scoped(raw: &str) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!(
-            "Refusing to run tests against non-test Postgres database '{}'. Set AGENTARK_TEST_DATABASE_URL or AGENTARK_TEST_POSTGRES_DB to an isolated database such as agentark_test_<id>.",
+            "Refusing to run tests against non-test Postgres database '{}'. Set AGENTARK_TEST_DATABASE_URL to an isolated database such as agentark_test_<id>.",
             database
         )
     }
@@ -349,64 +328,6 @@ fn database_is_test_scoped(database: &str) -> bool {
         || normalized.starts_with("test_agentark")
         || normalized.ends_with("_test")
         || normalized.contains("_test_")
-}
-
-#[cfg(test)]
-fn test_database_url_from_compose_postgres() -> Option<String> {
-    let output = std::process::Command::new("docker")
-        .args([
-            "exec",
-            "agentark-postgres",
-            "sh",
-            "-lc",
-            "cat /run/secrets/pg_pw",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let password = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if password.is_empty() {
-        return None;
-    }
-    let user = std::env::var("AGENTARK_POSTGRES_USER").unwrap_or_else(|_| "agentark".to_string());
-    let host =
-        std::env::var("AGENTARK_TEST_POSTGRES_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = std::env::var("AGENTARK_POSTGRES_PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(5432);
-    let database = test_compose_postgres_database_name()?;
-    ensure_compose_test_database(&database);
-    postgres_url_from_parts(&user, &password, &host, port, &database).ok()
-}
-
-#[cfg(test)]
-fn test_compose_postgres_database_name() -> Option<String> {
-    let raw = std::env::var("AGENTARK_TEST_POSTGRES_DB")
-        .unwrap_or_else(|_| format!("agentark_test_{}", std::process::id()));
-    let database = raw.trim();
-    if database.is_empty()
-        || !database
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        || !database_is_test_scoped(database)
-    {
-        return None;
-    }
-    Some(database.to_string())
-}
-
-#[cfg(test)]
-fn ensure_compose_test_database(database: &str) {
-    let script = format!(
-        "PGPASSWORD=\"$(cat /run/secrets/pg_pw)\" createdb -h 127.0.0.1 -U \"${{POSTGRES_USER:-agentark}}\" {} 2>/dev/null || true",
-        database
-    );
-    let _ = std::process::Command::new("docker")
-        .args(["exec", "agentark-postgres", "sh", "-lc", &script])
-        .status();
 }
 
 #[cfg(test)]
@@ -5795,6 +5716,111 @@ impl Storage {
             .await?)
     }
 
+    pub async fn list_memory_capture_events_by_source_hash(
+        &self,
+        source_hash: &str,
+        limit: u64,
+    ) -> Result<Vec<memory_capture_event::Model>> {
+        Ok(memory_capture_event::Entity::find()
+            .filter(memory_capture_event::Column::SourceHash.eq(source_hash.to_string()))
+            .order_by_desc(memory_capture_event::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn try_claim_memory_capture_event_status(
+        &self,
+        id: &str,
+        expected_status: &str,
+        claimed_status: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let result = memory_capture_event::Entity::update_many()
+            .col_expr(
+                memory_capture_event::Column::Status,
+                Expr::value(claimed_status.to_string()),
+            )
+            .col_expr(
+                memory_capture_event::Column::UpdatedAt,
+                Expr::value(updated_at.to_string()),
+            )
+            .filter(memory_capture_event::Column::Id.eq(id.to_string()))
+            .filter(memory_capture_event::Column::Status.eq(expected_status.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    pub async fn try_update_memory_capture_event_from_status(
+        &self,
+        event: &memory_capture_event::Model,
+        expected_status: &str,
+    ) -> Result<bool> {
+        let result = memory_capture_event::Entity::update_many()
+            .col_expr(
+                memory_capture_event::Column::SourceMessageId,
+                Expr::value(event.source_message_id.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::ConversationId,
+                Expr::value(event.conversation_id.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::ProjectId,
+                Expr::value(event.project_id.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::Channel,
+                Expr::value(event.channel.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::Status,
+                Expr::value(event.status.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::CaptureKind,
+                Expr::value(event.capture_kind.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::SourceHash,
+                Expr::value(event.source_hash.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::AttemptMetadata,
+                Expr::value(event.attempt_metadata.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::ErrorHistory,
+                Expr::value(event.error_history.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::ReplayCount,
+                Expr::value(event.replay_count),
+            )
+            .col_expr(
+                memory_capture_event::Column::NextRetryAt,
+                Expr::value(event.next_retry_at.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::CompletedAt,
+                Expr::value(event.completed_at.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::CreatedAt,
+                Expr::value(event.created_at.clone()),
+            )
+            .col_expr(
+                memory_capture_event::Column::UpdatedAt,
+                Expr::value(event.updated_at.clone()),
+            )
+            .filter(memory_capture_event::Column::Id.eq(event.id.clone()))
+            .filter(memory_capture_event::Column::Status.eq(expected_status.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
     pub async fn upsert_memory_operation(&self, operation: &memory_operation::Model) -> Result<()> {
         memory_operation::Entity::insert(Self::memory_operation_active_model(operation)?)
             .on_conflict(
@@ -8422,6 +8448,17 @@ impl Storage {
             row.arguments = decrypt_storage_string(&row.arguments);
         }
         Ok(log)
+    }
+
+    /// Get a single approval request by id with decrypted arguments.
+    pub async fn get_approval_request(&self, id: &str) -> Result<Option<approval_log::Model>> {
+        let mut row = approval_log::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?;
+        if let Some(row) = &mut row {
+            row.arguments = decrypt_storage_string(&row.arguments);
+        }
+        Ok(row)
     }
 
     /// Create or refresh a pending approval request entry.

@@ -1,16 +1,23 @@
 use super::action_selection::format_recent_dialogue_for_fast_path;
 use super::*;
 use crate::storage::entities::user_preference::{
-    classify_saved_memory_sensitivity, normalize_memory_sensitivity, MemorySensitivity,
+    MemorySensitivity, classify_saved_memory_sensitivity, normalize_memory_sensitivity,
 };
+use anyhow::Context;
 
 const USER_MEMORY_CAPTURE_PENDING_STATUS: &str = "pending_consolidation";
 const USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS: &str = "processing_deferred";
 const USER_MEMORY_CAPTURE_COMPLETED_DEFERRED_STATUS: &str = "completed_deferred";
 const USER_MEMORY_CAPTURE_FAILED_DEFERRED_STATUS: &str = "failed_deferred";
+const USER_MEMORY_CAPTURE_RETIRED_STALE_PROCESSING_STATUS: &str = "retired_stale_processing";
+const USER_MEMORY_CAPTURE_FAILED_STALE_PROCESSING_STATUS: &str = "failed_stale_processing";
 const USER_MEMORY_CAPTURE_DEFERRED_BATCH_LIMIT: u64 = 16;
 const USER_MEMORY_CAPTURE_DRAIN_MAX_BATCHES: usize = 8;
 const USER_MEMORY_CAPTURE_STARTUP_BACKFILL_LIMIT: u64 = 12;
+const USER_MEMORY_CAPTURE_STALE_PROCESSING_LEASE_DEFAULT_SECS: i64 = 60 * 60;
+const USER_MEMORY_CAPTURE_STALE_PROCESSING_LEASE_MIN_SECS: i64 = 5 * 60;
+const USER_MEMORY_CAPTURE_STALE_RECOVERY_BATCH_LIMIT: u64 = 64;
+const USER_MEMORY_CAPTURE_SOURCE_HISTORY_LIMIT: u64 = 32;
 
 static USER_MEMORY_CAPTURE_DRAIN_SEMAPHORE: once_cell::sync::Lazy<
     std::sync::Arc<tokio::sync::Semaphore>,
@@ -315,11 +322,13 @@ mod saved_memory_sensitivity_tests {
 
     #[test]
     fn learned_memory_sanitizer_rejects_secret_only_values() {
-        assert!(sanitize_learned_user_memory_content_for_storage(
-            "friend_best_friend_cs_teammate_9_years",
-            "2skdjfkj2wlfrj23kr2rlm"
-        )
-        .is_none());
+        assert!(
+            sanitize_learned_user_memory_content_for_storage(
+                "friend_best_friend_cs_teammate_9_years",
+                "2skdjfkj2wlfrj23kr2rlm"
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -331,6 +340,115 @@ mod saved_memory_sensitivity_tests {
             memory_operation_learning_candidate_pattern_id(&operation),
             None
         );
+    }
+
+    fn memory_capture_event_with_status(
+        status: &str,
+        updated_at: String,
+    ) -> crate::storage::memory_capture_event::Model {
+        crate::storage::memory_capture_event::Model {
+            id: format!("memory-capture-{}", status),
+            source_message_id: Some("message-1".to_string()),
+            conversation_id: Some("conversation-1".to_string()),
+            project_id: None,
+            channel: "chat".to_string(),
+            status: status.to_string(),
+            capture_kind: "user_fact_memory_capture".to_string(),
+            source_hash: "source-key".to_string(),
+            attempt_metadata: serde_json::json!({}),
+            error_history: serde_json::json!([]),
+            replay_count: 0,
+            next_retry_at: None,
+            completed_at: None,
+            created_at: updated_at.clone(),
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn stale_processing_capture_no_longer_blocks_source_retry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-09T12:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        let stale_updated_at = (now
+            - chrono::Duration::seconds(user_memory_capture_stale_processing_lease_secs() + 1))
+        .to_rfc3339();
+        let stale_processing = memory_capture_event_with_status("processing", stale_updated_at);
+        assert!(user_memory_capture_event_is_stale_processing(
+            &stale_processing,
+            now
+        ));
+        assert!(!user_memory_capture_event_blocks_source_retry(
+            &stale_processing,
+            now
+        ));
+
+        let fresh_processing = memory_capture_event_with_status("processing", now.to_rfc3339());
+        assert!(!user_memory_capture_event_is_stale_processing(
+            &fresh_processing,
+            now
+        ));
+        assert!(user_memory_capture_event_blocks_source_retry(
+            &fresh_processing,
+            now
+        ));
+
+        let retired_stale = memory_capture_event_with_status(
+            USER_MEMORY_CAPTURE_RETIRED_STALE_PROCESSING_STATUS,
+            now.to_rfc3339(),
+        );
+        assert!(!user_memory_capture_event_blocks_source_retry(
+            &retired_stale,
+            now
+        ));
+
+        let legacy_failed_stale = memory_capture_event_with_status(
+            USER_MEMORY_CAPTURE_FAILED_STALE_PROCESSING_STATUS,
+            now.to_rfc3339(),
+        );
+        assert!(!user_memory_capture_event_blocks_source_retry(
+            &legacy_failed_stale,
+            now
+        ));
+
+        let completed = memory_capture_event_with_status("noop", now.to_rfc3339());
+        assert!(user_memory_capture_event_blocks_source_retry(
+            &completed, now
+        ));
+    }
+
+    #[test]
+    fn memory_capture_rejects_integration_setup_status_as_operational_artifact() {
+        assert!(user_memory_candidate_is_operational_artifact(
+            "linear_integration_installed",
+            "Linear integration has been scaffolded as a custom API integration using Linear's GraphQL API at https://api.linear.app with Bearer token auth via LINEAR_API_KEY. The integration was set up but is not yet fully authenticated.",
+            "knowledge",
+            "knowledge",
+        ));
+
+        assert!(!user_memory_candidate_is_operational_artifact(
+            "preferred_issue_tracker",
+            "The user prefers Linear for issue tracking.",
+            "work_preference",
+            "work_preference",
+        ));
+    }
+
+    #[test]
+    fn semantic_memory_review_parser_blocks_operational_artifact_verdict() {
+        let review = parse_user_memory_candidate_semantic_review(
+            r#"{"store":false,"confidence":0.93,"reason":"The candidate is a watcher notification configuration, not reusable memory."}"#,
+        )
+        .expect("semantic review should parse");
+        assert!(!review.store);
+        assert!(user_memory_candidate_review_should_skip(&review));
+
+        let durable = parse_user_memory_candidate_semantic_review(
+            r#"{"store":true,"confidence":0.91,"reason":"The candidate is a general durable notification preference."}"#,
+        )
+        .expect("semantic review should parse");
+        assert!(durable.store);
+        assert!(!user_memory_candidate_review_should_skip(&durable));
     }
 
     #[test]
@@ -780,6 +898,71 @@ pub(super) fn user_memory_capture_item_sensitivity(
     model_sensitivity.unwrap_or(MemorySensitivity::Sensitive)
 }
 
+fn memory_candidate_contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+pub(super) fn user_memory_candidate_is_operational_artifact(
+    key: &str,
+    value: &str,
+    kind: &str,
+    category: &str,
+) -> bool {
+    let text = format!(
+        "{} {} {} {}",
+        key.trim(),
+        value.trim(),
+        kind.trim(),
+        category.trim()
+    )
+    .to_ascii_lowercase();
+    let integration_or_runtime = memory_candidate_contains_any(
+        &text,
+        &[
+            "integration",
+            "oauth",
+            "api key",
+            "apikey",
+            "bearer token",
+            "access token",
+            "authentication",
+            "authorization",
+            "credential",
+            "endpoint",
+            "graphql api",
+            "webhook",
+            "environment variable",
+            "env var",
+        ],
+    );
+    let lifecycle_state = memory_candidate_contains_any(
+        &text,
+        &[
+            "installed",
+            "scaffolded",
+            "set up",
+            "setup",
+            "configured",
+            "authenticated",
+            "not authenticated",
+            "not yet authenticated",
+            "not yet fully authenticated",
+            "pending auth",
+            "pending authentication",
+            "requires auth",
+            "requires authentication",
+            "using bearer",
+            "with bearer",
+            "via bearer",
+            "created",
+            "updated",
+            "deployed",
+            "registered",
+        ],
+    );
+    integration_or_runtime && lifecycle_state
+}
+
 pub(super) fn user_memory_json_datetime_field(
     item: &serde_json::Value,
     field: &str,
@@ -1199,12 +1382,26 @@ pub(super) fn build_user_memory_capture_prompt(
     response_shape: &str,
 ) -> String {
     format!(
-        "Current time:\n{time_context}\n\nRecent dialogue:\n{recent_dialogue}\n\nUser message:\n{message}\n\nCurrent saved user facts:\n{saved_facts}\n\nReturn JSON only with this shape:\n{response_shape}\n\nRules:\n- Always return the full JSON object with both `memories` and `retractions` keys present as arrays. Use empty arrays when nothing applies. Never omit either key and never return `{{}}` or any abbreviated shape.\n- Extract only memories that are useful beyond this turn and beyond any task/session/work item created by this turn: profile facts, assistant preferences, work preferences, reusable project/domain memory, reusable knowledge, or durable cross-context workflow rules.\n- Decide semantically from the message and dialogue. Do not use fixed phrases, keyword matching, regular expressions, literal wording patterns, or manually predicted variants of what the user might say.\n- Classify every memory into exactly one category: profile_fact for identity, location, contact, job, relationships, and stable user details; assistant_preference for how the assistant should address, format, phrase, or interact with the user; work_preference for the user's durable analysis, source, modeling, coding, review, or workflow preferences; project_domain_memory for durable facts, assumptions, principles, and constraints that should only be reused when the current topic or project is semantically related; ephemeral_context for short-lived context that is useful only in the current conversation; knowledge for reusable non-personal knowledge.\n- Add concise `topics` for topical memories so retrieval can use semantic relevance instead of injecting every memory into every prompt. Topics must describe meaning, domain, project, or task family, not surface wording.\n- Do not store every interesting claim. For work_preference and project_domain_memory, save only explicit user preferences, durable reusable principles, or high-confidence recurring patterns, not one-off analysis details.\n- Treat the message compositionally. A single user message can contain both durable user information and a live question, request, clarification, follow-up, or correction.\n- Capture durable self-information even when the same message also asks for help, asks a question, or contains multiple clauses or intents.\n- If recent dialogue shows the assistant was missing a user fact and the current message supplies that fact, capture the supplied fact even when the message immediately continues with another request.\n- Classify each memory with sensitivity. Use prompt_safe for ordinary preferences and operating style, personal_identifier for identity/contact/location facts, sensitive for private health, finance, legal, relationship, belief, or similarly private facts, and crisis_sensitive for acute distress, self-harm risk, unsafe-place, immediate safety, or coping facts.\n- Sensitive and crisis_sensitive self-memory should still be captured when it is useful beyond this turn; sensitivity controls later prompt injection, not whether the memory may exist.\n- If the user's intent is to stop retaining a previously stored fact, preference, or constraint, emit a retraction for the matching semantic memory instead of a new memory.\n- Do not let interrogative wording, mixed intents, corrections, or extra context suppress a durable memory action the user just expressed.\n- Prefer stable semantic key naming so corrected or updated facts replace stale versions instead of forking into near-duplicate keys.\n- Permanent memories have no expiry unless later contradicted, retracted, or superseded.\n- Temporary memories must include a concrete expires_at when the message gives or strongly implies a time window.\n- Situational memories are useful now but have an uncertain end; include review_at when a later review is appropriate.\n- Use global scope only for information that is generally reusable; topic-specific domain memory should usually be project or conversation scoped when a project/conversation owns it, and otherwise must include topics.\n- Task-specific configuration, schedule details, watcher conditions, notification channels for a specific object, execution status, retries, pending setup, and tool-operation state belong to the relevant task/session/work item, not ArkMemory.\n- Set looks_sensitive=true only when the candidate is credential-like, token-like, password/private-key/auth material, or otherwise unsafe to store even as private personal memory; do not use looks_sensitive for ordinary private self-memory, health, distress, identity, or location facts.\n- If looks_sensitive=true, include a concise sensitive_reason and do not rely on redaction markers as useful memory content.\n- Do not capture one-off requests, tool output, transient errors, unsupported guesses, operational setup details, pending/retry status, object-specific task/session/watcher configuration, or sensitive credential material as memories.\n- It is okay to return empty memories and/or retractions arrays, but the keys themselves must be present.\n- Do not invent facts beyond the user message, recent dialogue, current time, or current saved facts.",
+        "Current time:\n{time_context}\n\nRecent dialogue, context only:\n{recent_dialogue}\n\nSource message, authoritative for new memory:\n{message}\n\nCurrent saved user facts:\n{saved_facts}\n\nReturn JSON only with this shape:\n{response_shape}\n\nRules:\n- Always return the full JSON object with both `memories` and `retractions` keys present as arrays. Use empty arrays when nothing applies. Never omit either key and never return `{{}}` or any abbreviated shape.\n- Extract only memories that are useful beyond this turn and beyond any task/session/work item created by this turn: profile facts, assistant preferences, work preferences, reusable project/domain memory, reusable knowledge, or durable cross-context workflow rules.\n- Treat the source message as the only authoritative source for new memory. Use recent dialogue and saved facts only to resolve references, contradictions, retractions, and scope.\n- Do not create memories from assistant-authored messages, tool outputs, status reports, completed-work summaries, or durable-work records unless the source user message explicitly states the durable fact/preference or asks to remember it.\n- Decide semantically from the source message and context. Do not use fixed phrases, keyword matching, regular expressions, literal wording patterns, or manually predicted variants of what the user might say.\n- Classify every memory into exactly one category: profile_fact for identity, location, contact, job, relationships, and stable user details; assistant_preference for how the assistant should address, format, phrase, or interact with the user; work_preference for the user's durable analysis, source, modeling, coding, review, or workflow preferences; project_domain_memory for durable facts, assumptions, principles, and constraints that should only be reused when the current topic or project is semantically related; ephemeral_context for short-lived context that is useful only in the current conversation; knowledge for reusable non-personal knowledge.\n- Add concise `topics` for topical memories so retrieval can use semantic relevance instead of injecting every memory into every prompt. Topics must describe meaning, domain, project, or task family, not surface wording.\n- Do not store every interesting claim. For work_preference and project_domain_memory, save only explicit user preferences, durable reusable principles, or high-confidence recurring patterns, not one-off analysis details.\n- Treat the source message compositionally. A single user message can contain both durable user information and a live question, request, clarification, follow-up, or correction.\n- Capture durable self-information even when the same source message also asks for help, asks a question, or contains multiple clauses or intents.\n- If recent dialogue shows the assistant was missing a user fact and the source message supplies that fact, capture the supplied fact even when the source message immediately continues with another request.\n- Classify each memory with sensitivity. Use prompt_safe for ordinary preferences and operating style, personal_identifier for identity/contact/location facts, sensitive for private health, finance, legal, relationship, belief, or similarly private facts, and crisis_sensitive for acute distress, self-harm risk, unsafe-place, immediate safety, or coping facts.\n- Sensitive and crisis_sensitive self-memory should still be captured when it is useful beyond this turn; sensitivity controls later prompt injection, not whether the memory may exist.\n- If the user's intent is to stop retaining a previously stored fact, preference, or constraint, emit a retraction for the matching semantic memory instead of a new memory.\n- Do not let interrogative wording, mixed intents, corrections, or extra context suppress a durable memory action the user just expressed.\n- Prefer stable semantic key naming so corrected or updated facts replace stale versions instead of forking into near-duplicate keys.\n- Permanent memories have no expiry unless later contradicted, retracted, or superseded.\n- Temporary memories must include a concrete expires_at when the source message gives or strongly implies a time window.\n- Situational memories are useful now but have an uncertain end; include review_at when a later review is appropriate.\n- Use global scope only for information that is generally reusable; topic-specific domain memory should usually be project or conversation scoped when a project/conversation owns it, and otherwise must include topics.\n- Task-specific configuration, schedule details, watcher conditions, notification channels for a specific object, execution status, retries, pending setup, and tool-operation state belong to the relevant task/session/work item, not ArkMemory.\n- Do not capture integration setup/install/authentication state, API endpoint setup, credential scheme, environment-variable requirements, or pending authorization status as memory; those belong to integration records, tasks, traces, or logs.\n- Set looks_sensitive=true only when the candidate is credential-like, token-like, password/private-key/auth material, or otherwise unsafe to store even as private personal memory; do not use looks_sensitive for ordinary private self-memory, health, distress, identity, or location facts.\n- If looks_sensitive=true, include a concise sensitive_reason and do not rely on redaction markers as useful memory content.\n- Do not capture one-off requests, assistant claims, tool output, transient errors, unsupported guesses, operational setup details, pending/retry status, object-specific task/session/watcher configuration, or sensitive credential material as memories.\n- It is okay to return empty memories and/or retractions arrays, but the keys themselves must be present.\n- Do not invent facts beyond the source message, recent dialogue, current time, or current saved facts.",
         time_context = time_context,
         recent_dialogue = recent_dialogue,
         message = message,
         saved_facts = saved_facts,
         response_shape = response_shape
+    )
+}
+
+pub(super) fn build_user_memory_candidate_semantic_review_prompt(
+    source_message: &str,
+    recent_dialogue: &str,
+    candidate: &serde_json::Value,
+) -> String {
+    let candidate_json = serde_json::to_string(candidate).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "Review one proposed ArkMemory candidate before it can be saved.\n\nRecent dialogue, context only:\n{recent_dialogue}\n\nSource user message, authoritative:\n{source_message}\n\nProposed memory candidate:\n{candidate_json}\n\nReturn JSON only with this shape:\n{{\"store\":false,\"confidence\":0.0,\"reason\":\"brief semantic rationale\"}}\n\nRules:\n- Decide from the user's underlying intent and the candidate's meaning, not wording, keyword presence, formatting, casing, grammar, or word order.\n- Set store=true only when the candidate is durable user memory: a reusable user fact, durable preference, operating constraint, reusable project/domain fact, or explicit memory retraction signal that should remain useful after the current task/session/work item is complete.\n- Set store=false when the candidate mainly belongs in operational state instead of ArkMemory: task state, watcher or automation configuration, scheduling, trigger/condition details, notification routing for a particular work item, integration setup/auth state, tool-run state, execution status, retry/pending state, or a one-off request.\n- A general durable preference can still be stored even if the source turn also asks for work. A work item configuration should not become memory just because it mentions a preferred tool, channel, source, or destination.\n- If the candidate would become stale when the specific requested task, watcher, automation, or setup record is changed, completed, or deleted, set store=false.\n- When the distinction is genuinely unclear, set store=true and explain the uncertainty rather than suppressing a potentially durable memory.\n- confidence must describe confidence in the store decision and must be between 0.0 and 1.0.",
+        recent_dialogue = recent_dialogue,
+        source_message = source_message,
+        candidate_json = candidate_json
     )
 }
 
@@ -1286,6 +1483,40 @@ pub(super) struct UserMemoryCaptureFocusedRecovery {
     pub(super) selected_provider: String,
     pub(super) selected_model: String,
     pub(super) selected_stage: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct UserMemoryCandidateSemanticReview {
+    pub(super) store: bool,
+    pub(super) confidence: f32,
+    pub(super) reason: Option<String>,
+}
+
+pub(super) fn parse_user_memory_candidate_semantic_review(
+    raw: &str,
+) -> Option<UserMemoryCandidateSemanticReview> {
+    let payload = extract_json_object_from_text(raw)?;
+    let store = payload.get("store").and_then(|value| value.as_bool())?;
+    let confidence = payload
+        .get("confidence")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0) as f32;
+    let reason = payload
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .and_then(|value| normalize_user_memory_text(value, 180));
+    Some(UserMemoryCandidateSemanticReview {
+        store,
+        confidence,
+        reason,
+    })
+}
+
+pub(super) fn user_memory_candidate_review_should_skip(
+    review: &UserMemoryCandidateSemanticReview,
+) -> bool {
+    !review.store
 }
 
 pub(super) fn coerce_user_memory_capture_array_field(
@@ -1511,7 +1742,7 @@ pub(super) fn build_user_memory_capture_repair_prompt(
     response_shape: &str,
 ) -> String {
     format!(
-        "The previous memory extraction response did not follow the required JSON schema.\n\nRequired JSON shape:\n{response_shape}\n\nPrevious invalid response preview:\n{invalid_response_preview}\n\nRe-run the source extraction task below. Decide semantically from the user message, dialogue, and saved facts. Do not use phrase lists, keyword rules, or exact wording checks. Return JSON only, and always include both `memories` and `retractions` arrays even when one or both are empty.\n\nSource extraction task:\n{original_prompt}",
+        "The previous memory extraction response did not follow the required JSON schema.\n\nRequired JSON shape:\n{response_shape}\n\nPrevious invalid response preview:\n{invalid_response_preview}\n\nRe-run the source extraction task below. Decide semantically from the source user message, using dialogue and saved facts only as context. Do not extract assistant-authored status, tool output, integration setup state, or completed-work records as memory. Do not use phrase lists, keyword rules, or exact wording checks. Return JSON only, and always include both `memories` and `retractions` arrays even when one or both are empty.\n\nSource extraction task:\n{original_prompt}",
         response_shape = response_shape,
         invalid_response_preview = invalid_response_preview,
         original_prompt = original_prompt
@@ -1524,7 +1755,7 @@ pub(super) fn build_user_memory_capture_empty_retry_prompt(
     response_shape: &str,
 ) -> String {
     format!(
-        "The previous memory extraction produced no durable memory operations or returned an underspecified payload.\n\nRequired JSON shape:\n{response_shape}\n\nPrevious response preview:\n{previous_response_preview}\n\nRe-evaluate the source semantically. Determine whether the user supplied any durable self-information, preferences, workflow constraints, current-state facts worth carrying forward, or retractions. Mixed-intent turns, greetings, questions, and extra context do not cancel durable memory content stated in the same turn. Return JSON only, and always include both `memories` and `retractions` arrays even when one or both are empty.\n\nSource extraction task:\n{original_prompt}",
+        "The previous memory extraction produced no durable memory operations or returned an underspecified payload.\n\nRequired JSON shape:\n{response_shape}\n\nPrevious response preview:\n{previous_response_preview}\n\nRe-evaluate the source semantically. Determine whether the user supplied any durable self-information, preferences, workflow constraints, user-authored current-state facts worth carrying forward, or retractions. Mixed-intent turns, greetings, questions, and extra context do not cancel durable memory content stated in the same turn. Do not recover assistant-authored status, tool output, integration setup state, or completed-work records as memory. Return JSON only, and always include both `memories` and `retractions` arrays even when one or both are empty.\n\nSource extraction task:\n{original_prompt}",
         response_shape = response_shape,
         previous_response_preview = previous_response_preview,
         original_prompt = original_prompt
@@ -1536,7 +1767,7 @@ pub(super) fn build_user_memory_capture_empty_verdict_prompt(
     previous_response_preview: &str,
 ) -> String {
     format!(
-        "The previous user-memory extraction ended in an empty decision.\n\nPrevious empty extraction preview:\n{previous_response_preview}\n\nReturn JSON only with this shape:\n{{\"has_durable_memory\":false,\"confidence\":0.0,\"reason\":\"brief rationale\"}}\n\nRules:\n- Set has_durable_memory=true only when the source contains durable user information worth retaining beyond this turn.\n- Durable user information includes identity, stable preferences, operating rules, workflow constraints, meaningful current-state facts, relationships, goals, or explicit retractions.\n- Decide from meaning and context. Do not use fixed phrases, literal wording checks, regular expressions, or keyword lists.\n- Mixed-intent turns still count: a self-statement remains durable even if the same message also asks a question, greets the assistant, or continues with another request.\n- Set has_durable_memory=false only when you are confident the source truly contains nothing worth storing.\n- confidence must be between 0.0 and 1.0.\n- reason should briefly describe the durable meaning you found, or why the turn truly contains nothing durable.\n\nSource extraction task:\n{original_prompt}",
+        "The previous user-memory extraction ended in an empty decision.\n\nPrevious empty extraction preview:\n{previous_response_preview}\n\nReturn JSON only with this shape:\n{{\"has_durable_memory\":false,\"confidence\":0.0,\"reason\":\"brief rationale\"}}\n\nRules:\n- Set has_durable_memory=true only when the source user message contains durable user information worth retaining beyond this turn.\n- Durable user information includes identity, stable preferences, operating rules, workflow constraints, meaningful user-authored current-state facts, relationships, goals, or explicit retractions.\n- Assistant-authored status, tool output, integration setup state, and completed-work records are not durable user memory.\n- Decide from meaning and context. Do not use fixed phrases, literal wording checks, regular expressions, or keyword lists.\n- Mixed-intent turns still count: a self-statement remains durable even if the same message also asks a question, greets the assistant, or continues with another request.\n- Set has_durable_memory=false only when you are confident the source truly contains nothing worth storing.\n- confidence must be between 0.0 and 1.0.\n- reason should briefly describe the durable meaning you found, or why the turn truly contains nothing durable.\n\nSource extraction task:\n{original_prompt}",
         previous_response_preview = previous_response_preview,
         original_prompt = original_prompt
     )
@@ -1549,7 +1780,7 @@ pub(super) fn build_user_memory_capture_focused_recovery_prompt(
     response_shape: &str,
 ) -> String {
     format!(
-        "A semantic review concluded that the previous empty extraction likely missed durable user memory.\n\nReview reason:\n{review_reason}\n\nPrevious empty extraction preview:\n{previous_response_preview}\n\nRequired JSON shape:\n{response_shape}\n\nRecover the missed durable memory operations from meaning. Decide semantically from the user message, dialogue, and saved facts. Do not use fixed phrases, exact wording checks, regular expressions, or keyword rules. If the source contains durable self-information, preferences, workflow constraints, meaningful current-state facts, or retractions, emit them. Return JSON only, and keep both `memories` and `retractions` arrays present. Only return empty arrays if you are genuinely confident there is still nothing durable to store.\n\nSource extraction task:\n{original_prompt}",
+        "A semantic review concluded that the previous empty extraction likely missed durable user memory.\n\nReview reason:\n{review_reason}\n\nPrevious empty extraction preview:\n{previous_response_preview}\n\nRequired JSON shape:\n{response_shape}\n\nRecover the missed durable memory operations from meaning. Decide semantically from the source user message, using dialogue and saved facts only as context. Do not use fixed phrases, exact wording checks, regular expressions, or keyword rules. If the source contains durable self-information, preferences, workflow constraints, meaningful user-authored current-state facts, or retractions, emit them. Do not recover assistant-authored status, tool output, integration setup state, or completed-work records as memory. Return JSON only, and keep both `memories` and `retractions` arrays present. Only return empty arrays if you are genuinely confident there is still nothing durable to store.\n\nSource extraction task:\n{original_prompt}",
         review_reason = review_reason,
         previous_response_preview = previous_response_preview,
         response_shape = response_shape,
@@ -1638,6 +1869,233 @@ pub(super) fn user_memory_capture_error_entry(
         "detail": detail.into(),
         "at": chrono::Utc::now().to_rfc3339(),
     })
+}
+
+#[derive(Debug, Clone, Default)]
+struct UserMemoryCaptureSourceRetryState {
+    previous_capture_count: u64,
+    blocks_retry: bool,
+    recovered_stale_count: usize,
+}
+
+fn user_memory_capture_event_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn user_memory_capture_status_is_in_progress(status: &str) -> bool {
+    matches!(
+        status.trim(),
+        "processing" | USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS
+    )
+}
+
+fn user_memory_capture_stale_processing_lease_secs() -> i64 {
+    std::env::var("AGENTARK_USER_MEMORY_CAPTURE_STALE_LEASE_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.max(USER_MEMORY_CAPTURE_STALE_PROCESSING_LEASE_MIN_SECS))
+        .unwrap_or(USER_MEMORY_CAPTURE_STALE_PROCESSING_LEASE_DEFAULT_SECS)
+}
+
+fn user_memory_capture_event_is_stale_processing(
+    event: &crate::storage::memory_capture_event::Model,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !user_memory_capture_status_is_in_progress(event.status.as_str()) {
+        return false;
+    }
+    let Some(updated_at) = user_memory_capture_event_timestamp(&event.updated_at)
+        .or_else(|| user_memory_capture_event_timestamp(&event.created_at))
+    else {
+        return true;
+    };
+    now.signed_duration_since(updated_at)
+        >= chrono::Duration::seconds(user_memory_capture_stale_processing_lease_secs())
+}
+
+fn user_memory_capture_event_blocks_source_retry(
+    event: &crate::storage::memory_capture_event::Model,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let status = event.status.trim();
+    if status == USER_MEMORY_CAPTURE_RETIRED_STALE_PROCESSING_STATUS
+        || status == USER_MEMORY_CAPTURE_FAILED_STALE_PROCESSING_STATUS
+    {
+        return false;
+    }
+    if user_memory_capture_status_is_in_progress(status)
+        && user_memory_capture_event_is_stale_processing(event, now)
+    {
+        return false;
+    }
+    true
+}
+
+fn user_memory_capture_push_error_history(
+    history: &serde_json::Value,
+    entry: serde_json::Value,
+) -> serde_json::Value {
+    let mut items = history.as_array().cloned().unwrap_or_default();
+    items.push(entry);
+    serde_json::Value::Array(items)
+}
+
+fn user_memory_capture_stale_recovery_metadata(
+    metadata: &serde_json::Value,
+    previous_status: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    let mut object = metadata.as_object().cloned().unwrap_or_default();
+    object.insert(
+        "previous_status".to_string(),
+        serde_json::Value::String(previous_status.to_string()),
+    );
+    object.insert(
+        "stale_recovery".to_string(),
+        serde_json::json!({
+            "previous_status": previous_status,
+            "recovered_at": now.to_rfc3339(),
+            "lease_secs": user_memory_capture_stale_processing_lease_secs(),
+        }),
+    );
+    serde_json::Value::Object(object)
+}
+
+async fn reclaim_stale_user_memory_capture_event(
+    storage: &crate::storage::Storage,
+    event: &crate::storage::memory_capture_event::Model,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !user_memory_capture_event_is_stale_processing(event, now) {
+        return false;
+    }
+    let previous_status = event.status.trim().to_string();
+    let mut recovered = event.clone();
+    recovered.updated_at = now.to_rfc3339();
+    recovered.attempt_metadata = user_memory_capture_stale_recovery_metadata(
+        &recovered.attempt_metadata,
+        &previous_status,
+        now,
+    );
+    match previous_status.as_str() {
+        USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS => {
+            recovered.status = USER_MEMORY_CAPTURE_PENDING_STATUS.to_string();
+            recovered.completed_at = None;
+            recovered.next_retry_at = None;
+            recovered.replay_count = recovered.replay_count.saturating_add(1);
+            recovered.error_history = user_memory_capture_push_error_history(
+                &recovered.error_history,
+                user_memory_capture_error_entry(
+                    "stale_processing_deferred_reclaimed",
+                    "Deferred memory capture was left in-progress and was reclaimed for retry.",
+                ),
+            );
+        }
+        "processing" => {
+            recovered.status = USER_MEMORY_CAPTURE_RETIRED_STALE_PROCESSING_STATUS.to_string();
+            recovered.completed_at = Some(now.to_rfc3339());
+            recovered.error_history = user_memory_capture_push_error_history(
+                &recovered.error_history,
+                user_memory_capture_error_entry(
+                    "stale_processing_reclaimed",
+                    "Memory capture was left in-progress and was retired so the source can be retried.",
+                ),
+            );
+        }
+        _ => return false,
+    }
+    match storage
+        .try_update_memory_capture_event_from_status(&recovered, &previous_status)
+        .await
+    {
+        Ok(true) => {
+            tracing::debug!(
+                capture_event_id = %recovered.id,
+                previous_status = %previous_status,
+                new_status = %recovered.status,
+                "Reclaimed stale user memory capture event"
+            );
+            true
+        }
+        Ok(false) => {
+            tracing::debug!(
+                capture_event_id = %event.id,
+                previous_status = %previous_status,
+                "Skipped stale user memory capture recovery because another worker changed the row first"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                capture_event_id = %event.id,
+                previous_status = %previous_status,
+                "Failed to reclaim stale user memory capture event: {}",
+                error
+            );
+            false
+        }
+    }
+}
+
+async fn user_memory_capture_source_retry_state(
+    storage: &crate::storage::Storage,
+    source_hash: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<UserMemoryCaptureSourceRetryState> {
+    let prior_events = storage
+        .list_memory_capture_events_by_source_hash(
+            source_hash,
+            USER_MEMORY_CAPTURE_SOURCE_HISTORY_LIMIT,
+        )
+        .await?;
+    let mut state = UserMemoryCaptureSourceRetryState {
+        previous_capture_count: prior_events.len() as u64,
+        ..Default::default()
+    };
+    for event in prior_events {
+        if user_memory_capture_event_is_stale_processing(&event, now) {
+            if reclaim_stale_user_memory_capture_event(storage, &event, now).await {
+                state.recovered_stale_count += 1;
+            }
+            continue;
+        }
+        if user_memory_capture_event_blocks_source_retry(&event, now) {
+            state.blocks_retry = true;
+        }
+    }
+    Ok(state)
+}
+
+async fn recover_stale_user_memory_capture_events(
+    storage: &crate::storage::Storage,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let events = match storage
+        .list_memory_capture_events_by_statuses_all_scopes(
+            &[USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS, "processing"],
+            USER_MEMORY_CAPTURE_STALE_RECOVERY_BATCH_LIMIT,
+        )
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::debug!(
+                "Failed to load stale user memory capture events for recovery: {}",
+                error
+            );
+            return 0;
+        }
+    };
+    let mut recovered = 0usize;
+    for event in events {
+        if reclaim_stale_user_memory_capture_event(storage, &event, now).await {
+            recovered += 1;
+        }
+    }
+    recovered
 }
 
 pub(super) fn user_memory_operation_evidence_refs(
@@ -2411,6 +2869,65 @@ impl UserMemoryCaptureWorker {
         None
     }
 
+    async fn review_user_memory_candidate_for_storage(
+        &self,
+        source_message: &str,
+        recent_dialogue: &str,
+        candidate_payload: &serde_json::Value,
+        channel: &str,
+        conversation_id: Option<&str>,
+    ) -> Option<UserMemoryCandidateSemanticReview> {
+        let candidate = self
+            .user_memory_capture_llm_candidates()
+            .into_iter()
+            .next()?;
+        let prompt = build_user_memory_candidate_semantic_review_prompt(
+            source_message,
+            recent_dialogue,
+            candidate_payload,
+        );
+        let memories: [PromptMemory; 0] = [];
+        let actions: [crate::actions::ActionDef; 0] = [];
+        let response = match candidate
+            .client
+            .chat_for_helper_request_limited(
+                "You are a semantic ArkMemory admission reviewer. Return strict JSON only.",
+                &prompt,
+                &memories,
+                &actions,
+                &crate::security::ModelPrivacyConfig::default(),
+                USER_FACT_MEMORY_CAPTURE_ALLOW_SENSITIVE_CONTEXT,
+                Some(600),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(
+                    "User memory semantic candidate review failed for conversation {:?}: {}",
+                    conversation_id,
+                    error
+                );
+                return None;
+            }
+        };
+        self.record_llm_usage(
+            channel,
+            "user_fact_memory_candidate_semantic_review",
+            &response,
+        )
+        .await;
+        let review = parse_user_memory_candidate_semantic_review(&response.content);
+        if review.is_none() {
+            tracing::debug!(
+                "User memory semantic candidate review returned invalid JSON for conversation {:?}. Preview: {}",
+                conversation_id,
+                user_memory_capture_response_preview(&response.content, 160)
+            );
+        }
+        review
+    }
+
     pub(super) async fn capture_user_facts_with_llm(
         &self,
         message: &str,
@@ -2429,13 +2946,26 @@ impl UserMemoryCaptureWorker {
             project_id.unwrap_or_default().trim(),
             trimmed,
         ]);
-        let capture_now = chrono::Utc::now().to_rfc3339();
-        let previous_capture_count = self
-            .storage
-            .count_memory_capture_events_by_source_hash(&source_hash)
-            .await
-            .unwrap_or(0);
-        let replay_count = previous_capture_count
+        let capture_now_dt = chrono::Utc::now();
+        let capture_now = capture_now_dt.to_rfc3339();
+        let retry_state = match user_memory_capture_source_retry_state(
+            &self.storage,
+            &source_hash,
+            capture_now_dt,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to inspect prior memory capture events for source retry: {}",
+                    error
+                );
+                UserMemoryCaptureSourceRetryState::default()
+            }
+        };
+        let replay_count = retry_state
+            .previous_capture_count
             .saturating_add(1)
             .min(i32::MAX as u64) as i32;
         let event_id = format!("memory-capture-{}", uuid::Uuid::new_v4());
@@ -2475,7 +3005,7 @@ impl UserMemoryCaptureWorker {
                 error
             );
         }
-        if previous_capture_count > 0 {
+        if retry_state.blocks_retry {
             capture_event.status = "skipped_duplicate_source".to_string();
             capture_event.completed_at = Some(chrono::Utc::now().to_rfc3339());
             capture_event.updated_at = chrono::Utc::now().to_rfc3339();
@@ -2483,6 +3013,16 @@ impl UserMemoryCaptureWorker {
                 "duplicate_source",
                 "Skipped user memory capture because the same source text was already processed in this conversation scope.",
             )]);
+            let mut metadata = capture_event
+                .attempt_metadata
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            metadata.insert(
+                "recovered_stale_prior_capture_count".to_string(),
+                serde_json::json!(retry_state.recovered_stale_count),
+            );
+            capture_event.attempt_metadata = serde_json::Value::Object(metadata);
             let _ = self
                 .storage
                 .upsert_memory_capture_event(&capture_event)
@@ -2657,6 +3197,7 @@ impl UserMemoryCaptureWorker {
         let mut applied_count = 0usize;
         let mut queued_count = 0usize;
         let mut rejected_sensitive_count = 0usize;
+        let mut semantic_rejected_count = 0usize;
         let mut seen_retractions = HashSet::new();
         for item in &retractions {
             let Some(raw_key) = item.get("key").and_then(|value| value.as_str()) else {
@@ -2769,15 +3310,29 @@ impl UserMemoryCaptureWorker {
                     }
                     Err(error) => {
                         operation.status = "queued_review".to_string();
-                        operation.review_notes = Some(format!(
+                        let auto_apply_note = format!(
                             "Auto-apply failed: {}",
                             safe_truncate(&error.to_string(), 240)
-                        ));
+                        );
+                        operation.review_notes = Some(auto_apply_note.clone());
                         operation.updated_at = chrono::Utc::now().to_rfc3339();
                         let _ = self.storage.upsert_memory_operation(&operation).await;
                         if let Err(queue_error) =
                             self.queue_memory_operation_candidate(&operation).await
                         {
+                            operation.status = "apply_failed".to_string();
+                            operation.review_notes = Some(format!(
+                                "{} Review queue failed: {}",
+                                auto_apply_note,
+                                safe_truncate(&queue_error.to_string(), 200)
+                            ));
+                            operation.apply_metadata = serde_json::json!({
+                                "auto_apply_error": safe_truncate(&error.to_string(), 240),
+                                "review_queue_error": safe_truncate(&queue_error.to_string(), 240),
+                                "failed_at": chrono::Utc::now().to_rfc3339(),
+                            });
+                            operation.updated_at = chrono::Utc::now().to_rfc3339();
+                            let _ = self.storage.upsert_memory_operation(&operation).await;
                             tracing::warn!(
                                 "Failed to queue review candidate for memory operation '{}': {}",
                                 operation.id,
@@ -2880,6 +3435,44 @@ impl UserMemoryCaptureWorker {
             )
             .to_string();
             let topics = crate::core::memory_schema::normalize_memory_topics(item.get("topics"), 8);
+            let review_payload = serde_json::json!({
+                "key": key,
+                "value": value,
+                "kind": raw_kind,
+                "category": category,
+                "topics": topics,
+                "durability": durability,
+                "scope": scope,
+                "confidence": confidence,
+                "reason": reason,
+            });
+            if let Some(review) = self
+                .review_user_memory_candidate_for_storage(
+                    &prompt_message,
+                    &recent_dialogue,
+                    &review_payload,
+                    channel,
+                    conversation_id,
+                )
+                .await
+            {
+                if user_memory_candidate_review_should_skip(&review) {
+                    semantic_rejected_count += 1;
+                    tracing::debug!(
+                        "Skipped learned user memory '{}' after semantic review: {}",
+                        key,
+                        review.reason.as_deref().unwrap_or("not durable memory")
+                    );
+                    continue;
+                }
+            }
+            if user_memory_candidate_is_operational_artifact(&key, &value, &raw_kind, &category) {
+                tracing::debug!(
+                    "Skipped learned user memory '{}' because it describes integration/runtime setup state, not durable user memory",
+                    key
+                );
+                continue;
+            }
             if crate::core::memory_schema::memory_category_is_ephemeral(&category) {
                 if scope == "global" {
                     scope = "conversation".to_string();
@@ -3055,15 +3648,29 @@ impl UserMemoryCaptureWorker {
                     }
                     Err(error) => {
                         operation.status = "queued_review".to_string();
-                        operation.review_notes = Some(format!(
+                        let auto_apply_note = format!(
                             "Auto-apply failed: {}",
                             safe_truncate(&error.to_string(), 240)
-                        ));
+                        );
+                        operation.review_notes = Some(auto_apply_note.clone());
                         operation.updated_at = chrono::Utc::now().to_rfc3339();
                         let _ = self.storage.upsert_memory_operation(&operation).await;
                         if let Err(queue_error) =
                             self.queue_memory_operation_candidate(&operation).await
                         {
+                            operation.status = "apply_failed".to_string();
+                            operation.review_notes = Some(format!(
+                                "{} Review queue failed: {}",
+                                auto_apply_note,
+                                safe_truncate(&queue_error.to_string(), 200)
+                            ));
+                            operation.apply_metadata = serde_json::json!({
+                                "auto_apply_error": safe_truncate(&error.to_string(), 240),
+                                "review_queue_error": safe_truncate(&queue_error.to_string(), 240),
+                                "failed_at": chrono::Utc::now().to_rfc3339(),
+                            });
+                            operation.updated_at = chrono::Utc::now().to_rfc3339();
+                            let _ = self.storage.upsert_memory_operation(&operation).await;
                             tracing::warn!(
                                 "Failed to queue review candidate for memory operation '{}': {}",
                                 operation.id,
@@ -3101,6 +3708,8 @@ impl UserMemoryCaptureWorker {
             "applied".to_string()
         } else if rejected_sensitive_count > 0 {
             "rejected_sensitive".to_string()
+        } else if semantic_rejected_count > 0 {
+            "noop".to_string()
         } else {
             "noop".to_string()
         };
@@ -3122,6 +3731,8 @@ impl UserMemoryCaptureWorker {
             "applied_count": applied_count,
             "queued_review_count": queued_count,
             "rejected_sensitive_count": rejected_sensitive_count,
+            "semantic_rejected_count": semantic_rejected_count,
+            "recovered_stale_prior_capture_count": retry_state.recovered_stale_count,
             "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
         });
         let _ = self
@@ -3325,10 +3936,7 @@ impl UserMemoryCaptureWorker {
                             &operation_topics,
                             explicit_target_memory_id,
                         )
-                        .await
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Memory operation did not persist a memory item.")
-                        })?;
+                        .await?;
                     self.sync_applied_memory_to_user_preferences(operation, key, value)
                         .await;
                     Ok::<String, anyhow::Error>(memory_id)
@@ -3571,9 +4179,9 @@ impl UserMemoryCaptureWorker {
         category: Option<&str>,
         topics: &[String],
         target_memory_id: Option<&str>,
-    ) -> Option<String> {
+    ) -> Result<String> {
         let Some(key) = normalize_user_fact_key(key) else {
-            return None;
+            anyhow::bail!("Memory operation has an invalid or empty key.");
         };
         let Some(sanitized_memory) = sanitize_learned_user_memory_content_for_storage(&key, value)
         else {
@@ -3581,7 +4189,9 @@ impl UserMemoryCaptureWorker {
                 "Skipped learned user memory '{}' because its candidate value looked like credential material",
                 key
             );
-            return None;
+            anyhow::bail!(
+                "Memory operation value looked like credential or secret material after sanitization."
+            );
         };
         let value = sanitized_memory.value;
         let content = sanitized_memory.content;
@@ -3598,11 +4208,14 @@ impl UserMemoryCaptureWorker {
             .map(|dt| dt <= &capture_now)
             .unwrap_or(false)
         {
-            return None;
+            anyhow::bail!("Memory operation expiry is already in the past.");
         }
         let confidence = confidence.clamp(0.0, 1.0);
         if confidence < 0.55 {
-            return None;
+            anyhow::bail!(
+                "Memory operation confidence {:.2} is below the storage threshold.",
+                confidence
+            );
         }
         let normalized_kind = normalize_user_memory_kind(kind);
         let semantic_kind = learned_user_memory_semantic_kind(Some(&key), kind);
@@ -3654,7 +4267,7 @@ impl UserMemoryCaptureWorker {
             )
             .await
         {
-            return Some(existing_id);
+            return Ok(existing_id);
         }
         let now = capture_now.to_rfc3339();
         let txn = match self
@@ -3675,7 +4288,12 @@ impl UserMemoryCaptureWorker {
                     scope,
                     error
                 );
-                return None;
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to start learned user memory transaction for '{}' (scope={}).",
+                        key, scope
+                    )
+                });
             }
         };
         let existing = match self.storage.get_experience_item_txn(&txn, &id).await {
@@ -3687,7 +4305,12 @@ impl UserMemoryCaptureWorker {
                     error
                 );
                 let _ = txn.rollback().await;
-                return None;
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to load learned user memory '{}' before upsert.",
+                        key
+                    )
+                });
             }
         };
         let mut metadata = existing
@@ -3885,7 +4508,12 @@ impl UserMemoryCaptureWorker {
                     error
                 );
                 let _ = txn.rollback().await;
-                return None;
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to write learned user memory '{}' into the experience graph.",
+                        key
+                    )
+                });
             }
             if let Err(error) = txn.commit().await {
                 tracing::warn!(
@@ -3893,9 +4521,11 @@ impl UserMemoryCaptureWorker {
                     key,
                     error
                 );
-                return None;
+                return Err(error).with_context(|| {
+                    format!("Failed to commit learned user memory update for '{}'.", key)
+                });
             }
-            return Some(id.clone());
+            return Ok(id.clone());
         }
 
         let mut insert_embedding = existing.as_ref().and_then(|item| {
@@ -3935,9 +4565,11 @@ impl UserMemoryCaptureWorker {
                             key,
                             error
                         );
-                        return None;
+                        return Err(error).with_context(|| {
+                            format!("Failed to commit learned user memory absorb for '{}'.", key)
+                        });
                     }
-                    return Some(canonical_id);
+                    return Ok(canonical_id);
                 }
                 Ok(crate::core::memory_dedup::AbsorbOutcome::Insert { embedding }) => {
                     insert_embedding = Some(embedding);
@@ -3964,7 +4596,12 @@ impl UserMemoryCaptureWorker {
                 error
             );
             let _ = txn.rollback().await;
-            return None;
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to write learned user memory '{}' into the experience graph.",
+                    key
+                )
+            });
         }
         if let Err(error) = txn.commit().await {
             tracing::warn!(
@@ -3972,9 +4609,11 @@ impl UserMemoryCaptureWorker {
                 key,
                 error
             );
-            return None;
+            return Err(error).with_context(|| {
+                format!("Failed to commit learned user memory insert for '{}'.", key)
+            });
         }
-        Some(id)
+        Ok(id)
     }
 
     pub(super) async fn retract_learned_user_memory(
@@ -5185,27 +5824,53 @@ impl Agent {
             trimmed,
         ]);
         let pending_source_hash = format!("pending:{}", semantic_capture_key);
-        if self
-            .storage
-            .count_memory_capture_events_by_source_hash(&pending_source_hash)
+        let now_dt = chrono::Utc::now();
+        match user_memory_capture_source_retry_state(&self.storage, &pending_source_hash, now_dt)
             .await
-            .unwrap_or(0)
-            > 0
         {
-            return false;
+            Ok(state) if state.previous_capture_count > 0 => return false,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to inspect pending memory capture source state: {}",
+                    error
+                );
+                if self
+                    .storage
+                    .count_memory_capture_events_by_source_hash(&pending_source_hash)
+                    .await
+                    .unwrap_or(0)
+                    > 0
+                {
+                    return false;
+                }
+            }
         }
-        if self
-            .storage
-            .count_memory_capture_events_by_source_hash(&semantic_capture_key)
+        match user_memory_capture_source_retry_state(&self.storage, &semantic_capture_key, now_dt)
             .await
-            .unwrap_or(0)
-            > 0
         {
-            return false;
+            Ok(state) if state.blocks_retry => return false,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to inspect memory capture source retry state: {}",
+                    error
+                );
+                if self
+                    .storage
+                    .count_memory_capture_events_by_source_hash(&semantic_capture_key)
+                    .await
+                    .unwrap_or(0)
+                    > 0
+                {
+                    return false;
+                }
+            }
         }
         let now = chrono::Utc::now().to_rfc3339();
+        let pending_event_id = format!("memory-capture-pending-{}", semantic_capture_key);
         let event = crate::storage::memory_capture_event::Model {
-            id: format!("memory-capture-pending-{}", uuid::Uuid::new_v4()),
+            id: pending_event_id,
             source_message_id: source_message_id.map(str::to_string),
             conversation_id: conversation_id.map(str::to_string),
             project_id: project_id.map(str::to_string),
@@ -5345,7 +6010,9 @@ impl Agent {
             .await
             .ok()?
             .into_iter()
-            .find(|message| message.id == source_message_id)
+            .find(|message| {
+                message.id == source_message_id && message.role.eq_ignore_ascii_case("user")
+            })
     }
 
     pub(crate) async fn process_deferred_user_memory_capture_candidates(&self) -> usize {
@@ -5396,6 +6063,14 @@ impl Agent {
     }
 
     async fn process_deferred_user_memory_capture_candidate_batch(&self) -> usize {
+        let recovered_stale =
+            recover_stale_user_memory_capture_events(&self.storage, chrono::Utc::now()).await;
+        if recovered_stale > 0 {
+            tracing::debug!(
+                recovered_stale,
+                "Recovered stale user memory capture event(s) before draining deferred captures"
+            );
+        }
         let events = match self
             .storage
             .list_memory_capture_events_by_statuses_all_scopes(
@@ -5414,12 +6089,40 @@ impl Agent {
             }
         };
         let worker = UserMemoryCaptureWorker::from_agent(self);
-        let mut handled = 0usize;
+        let mut handled = recovered_stale;
         for mut event in events {
-            handled += 1;
-            event.status = USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS.to_string();
-            event.updated_at = chrono::Utc::now().to_rfc3339();
-            let _ = self.storage.upsert_memory_capture_event(&event).await;
+            let claim_now = chrono::Utc::now().to_rfc3339();
+            match self
+                .storage
+                .try_claim_memory_capture_event_status(
+                    &event.id,
+                    USER_MEMORY_CAPTURE_PENDING_STATUS,
+                    USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS,
+                    &claim_now,
+                )
+                .await
+            {
+                Ok(true) => {
+                    event.status = USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS.to_string();
+                    event.updated_at = claim_now;
+                    handled += 1;
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        capture_event_id = %event.id,
+                        "Skipped deferred memory capture candidate because another worker claimed it first"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        capture_event_id = %event.id,
+                        "Failed to claim deferred memory capture candidate: {}",
+                        error
+                    );
+                    continue;
+                }
+            }
 
             let Some(source_message) = self.pending_memory_capture_source_message(&event).await
             else {

@@ -12,7 +12,6 @@ use tokio::sync::RwLock;
 
 use super::agent::QueryComplexity;
 use super::config::{ModelRole, ModelSlot};
-use super::intent::{action_intent_score, preferred_direct_action_name};
 use super::llm::LlmClient;
 use super::orchestra::SubAgentType;
 use super::planner::{PlanStepStatus, PlanSubstep};
@@ -1274,7 +1273,7 @@ impl TaskRouter {
             .count();
 
         // Aggregate
-        let mut final_response = if completed_paths == 0 {
+        let final_response = if completed_paths == 0 {
             degradation.push(DegradationNote {
                 kind: "delegation_synthesis".to_string(),
                 summary: "delegated synthesis skipped".to_string(),
@@ -1415,21 +1414,9 @@ impl TaskRouter {
             }
         };
 
-        // Safety net: delegated synthesis can occasionally omit tool calls even when
-        // sub-agents produced them. Recover the clearest direct action when available.
-        if let Some(preferred_action) = preferred_direct_action_name(message, actions) {
-            if final_response.tool_calls.is_empty() {
-                if let Some(recovered_call) = results
-                    .iter()
-                    .filter_map(|r| r.llm_response.as_ref())
-                    .flat_map(|resp| resp.tool_calls.iter())
-                    .find(|tc| tc.name == preferred_action)
-                    .cloned()
-                {
-                    final_response.tool_calls.push(recovered_call);
-                }
-            }
-        }
+        // Do not recover omitted tool calls from message/action scores here.
+        // The Semantic DAG Router owns executable intent; delegated synthesis
+        // may summarize completed sub-agent results but cannot revive actions.
 
         let total_time_ms = start.elapsed().as_millis() as u64;
         let completion_status = if degradation.is_empty() {
@@ -1646,30 +1633,10 @@ impl TaskRouter {
         primary_llm.clone()
     }
 
-    /// Keep sub-agent tool context small by passing only task-relevant actions.
-    fn select_actions_for_task(&self, task: &str, actions: &[ActionDef]) -> Vec<ActionDef> {
-        let mut scored: Vec<(f32, ActionDef)> = actions
-            .iter()
-            .map(|action| (action_intent_score(task, action), action.clone()))
-            .collect();
-
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut selected: Vec<ActionDef> = scored
-            .iter()
-            .filter(|(score, _)| *score >= 0.10)
-            .take(8)
-            .map(|(_, action)| action.clone())
-            .collect();
-
-        if selected.is_empty() {
-            selected = scored
-                .into_iter()
-                .take(8)
-                .map(|(_, action)| action)
-                .collect();
-        }
-        selected
+    /// Keep sub-agent tool context bounded without making a second routing
+    /// decision from text/action scores.
+    fn select_actions_for_task(&self, _task: &str, actions: &[ActionDef]) -> Vec<ActionDef> {
+        actions.iter().take(8).cloned().collect()
     }
 
     fn specialist_action_is_allowed(
@@ -2979,16 +2946,6 @@ impl TaskRouter {
                 for tc in &resp.tool_calls {
                     wanted_tools.insert(tc.name.clone());
                 }
-            }
-        }
-        let mut scored_actions: Vec<(f32, String)> = actions
-            .iter()
-            .map(|a| (action_intent_score(original_task, a), a.name.clone()))
-            .collect();
-        scored_actions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (idx, (score, name)) in scored_actions.into_iter().enumerate() {
-            if score >= 0.10 || idx < 6 {
-                wanted_tools.insert(name);
             }
         }
         let filtered_actions: Vec<ActionDef> = actions

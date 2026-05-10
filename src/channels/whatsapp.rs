@@ -2178,6 +2178,8 @@ mod tests {
         assert!(state.recent.len() <= MAX_RECENT_MESSAGE_IDS);
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn record_message_id_is_idempotent_for_retries() {
         let _dir = tempfile::tempdir().unwrap();

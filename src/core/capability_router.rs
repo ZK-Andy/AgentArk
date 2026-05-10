@@ -1,10 +1,11 @@
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::cell::RefCell;
 use crate::actions::ActionDef;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -12,7 +13,6 @@ use once_cell::sync::Lazy;
 const INTENT_NGRAM_WIDTH: usize = 3;
 const ACTION_PROFILE_CACHE_LIMIT: usize = 512;
 const TEXT_PROFILE_CACHE_LIMIT: usize = 4_096;
-const SCORE_CACHE_LIMIT: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ProfileKey {
@@ -20,23 +20,9 @@ struct ProfileKey {
     hash: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ScoreCacheKey {
-    request: ProfileKey,
-    action: ProfileKey,
-}
-
-#[derive(Debug)]
-struct CachedScore {
-    request_text: Arc<str>,
-    action_text: Arc<str>,
-    score: f32,
-}
-
 #[derive(Debug)]
 struct IntentTextProfile {
     source_text: Arc<str>,
-    key: ProfileKey,
     tokens: HashSet<String>,
     token_ngrams: HashMap<String, HashSet<String>>,
     text_ngrams: HashSet<String>,
@@ -44,15 +30,17 @@ struct IntentTextProfile {
 
 #[derive(Debug)]
 struct ActionIntentProfile {
+    #[cfg(test)]
     action_name: Arc<str>,
+    #[cfg(test)]
     action_version: Arc<str>,
     descriptor_text: Arc<str>,
-    key: ProfileKey,
     tokens: HashSet<String>,
     token_ngrams: HashMap<String, HashSet<String>>,
     text_ngrams: HashSet<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ActionIntentProfileScope {
     profiles: HashMap<String, Arc<ActionIntentProfile>>,
@@ -62,8 +50,8 @@ static TEXT_PROFILE_CACHE: Lazy<DashMap<ProfileKey, Arc<IntentTextProfile>>> =
     Lazy::new(DashMap::new);
 static ACTION_PROFILE_CACHE: Lazy<DashMap<ProfileKey, Arc<ActionIntentProfile>>> =
     Lazy::new(DashMap::new);
-static SCORE_CACHE: Lazy<DashMap<ScoreCacheKey, CachedScore>> = Lazy::new(DashMap::new);
 
+#[cfg(test)]
 thread_local! {
     static ACTION_PROFILE_SCOPE: RefCell<Vec<Arc<ActionIntentProfileScope>>> =
         const { RefCell::new(Vec::new()) };
@@ -256,7 +244,6 @@ fn build_text_profile(message: &str) -> Arc<IntentTextProfile> {
     let tokens = tokenize(message);
     Arc::new(IntentTextProfile {
         source_text: Arc::<str>::from(message.to_string()),
-        key: profile_key(message),
         token_ngrams: token_ngram_map(&tokens),
         text_ngrams: char_ngrams(message, INTENT_NGRAM_WIDTH),
         tokens,
@@ -280,12 +267,12 @@ fn build_action_profile(action: &ActionDef, descriptor_text: String) -> Arc<Acti
     let mut tokens = tokenize(&descriptor_text);
     schema_tokens(&action.input_schema, &mut tokens);
     tokens.extend(planner_metadata_tokens(action));
-    let key = profile_key(&descriptor_text);
     let text_ngrams = char_ngrams(&descriptor_text, INTENT_NGRAM_WIDTH);
     Arc::new(ActionIntentProfile {
+        #[cfg(test)]
         action_name: Arc::<str>::from(action.name.clone()),
+        #[cfg(test)]
         action_version: Arc::<str>::from(action.version.clone()),
-        key,
         descriptor_text: Arc::<str>::from(descriptor_text),
         token_ngrams: token_ngram_map(&tokens),
         text_ngrams,
@@ -293,6 +280,7 @@ fn build_action_profile(action: &ActionDef, descriptor_text: String) -> Arc<Acti
     })
 }
 
+#[cfg(test)]
 impl ActionIntentProfileScope {
     fn new(actions: &[ActionDef]) -> Self {
         let profiles = actions
@@ -308,8 +296,10 @@ impl ActionIntentProfileScope {
     }
 }
 
+#[cfg(test)]
 struct ActionIntentProfileScopeGuard;
 
+#[cfg(test)]
 impl Drop for ActionIntentProfileScopeGuard {
     fn drop(&mut self) {
         ACTION_PROFILE_SCOPE.with(|scope| {
@@ -318,6 +308,7 @@ impl Drop for ActionIntentProfileScopeGuard {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn with_action_intent_profiles<R>(actions: &[ActionDef], run: impl FnOnce() -> R) -> R {
     let scope = Arc::new(ActionIntentProfileScope::new(actions));
     ACTION_PROFILE_SCOPE.with(|cell| {
@@ -327,6 +318,7 @@ pub(crate) fn with_action_intent_profiles<R>(actions: &[ActionDef], run: impl Fn
     run()
 }
 
+#[cfg(test)]
 fn scoped_action_profile(action: &ActionDef) -> Option<Arc<ActionIntentProfile>> {
     ACTION_PROFILE_SCOPE.with(|cell| {
         let scopes = cell.borrow();
@@ -338,6 +330,11 @@ fn scoped_action_profile(action: &ActionDef) -> Option<Arc<ActionIntentProfile>>
             && profile.action_version.as_ref() == action.version)
             .then_some(profile)
     })
+}
+
+#[cfg(not(test))]
+fn scoped_action_profile(_action: &ActionDef) -> Option<Arc<ActionIntentProfile>> {
+    None
 }
 
 fn cached_action_profile(action: &ActionDef) -> Arc<ActionIntentProfile> {
@@ -418,28 +415,7 @@ fn score_profiles(
 pub fn score_action_intent(message: &str, action: &ActionDef) -> f32 {
     let request_profile = cached_text_profile(message);
     let action_profile = cached_action_profile(action);
-    let cache_key = ScoreCacheKey {
-        request: request_profile.key,
-        action: action_profile.key,
-    };
-    if let Some(cached) = SCORE_CACHE.get(&cache_key) {
-        if cached.request_text.as_ref() == request_profile.source_text.as_ref()
-            && cached.action_text.as_ref() == action_profile.descriptor_text.as_ref()
-        {
-            return cached.score;
-        }
-    }
-    let score = score_profiles(&request_profile, &action_profile, false).0;
-    clear_cache_if_needed(&SCORE_CACHE, SCORE_CACHE_LIMIT);
-    SCORE_CACHE.insert(
-        cache_key,
-        CachedScore {
-            request_text: Arc::clone(&request_profile.source_text),
-            action_text: Arc::clone(&action_profile.descriptor_text),
-            score,
-        },
-    );
-    score
+    score_profiles(&request_profile, &action_profile, false).0
 }
 
 #[cfg(test)]

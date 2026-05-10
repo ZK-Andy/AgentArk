@@ -1295,7 +1295,11 @@ impl Agent {
             ),
             format!(
                 "ArkEvolve: {}, {} draft candidate(s), {} pending consolidation item(s), {} pending reflection item(s), {} active pattern(s), and {} active canary run(s).",
-                if self_evolve_enabled { "enabled" } else { "paused" },
+                if self_evolve_enabled {
+                    "enabled"
+                } else {
+                    "paused"
+                },
                 learning_queue.draft_candidates,
                 learning_queue.pending_consolidation,
                 learning_queue.pending_reflection,
@@ -1309,8 +1313,7 @@ impl Agent {
             ),
             format!(
                 "ArkPulse: {} stored run(s); latest status is {}.",
-                arkpulse_total,
-                arkpulse_summary
+                arkpulse_total, arkpulse_summary
             ),
         ];
 

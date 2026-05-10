@@ -19,6 +19,7 @@ ssh = ["russh"]
 local-llm = ["llama-cpp-2"]
 tls = ["axum-server", "rcgen"]
 live-smoke-tests = []
+db-tests = []
 
 [dependencies]
 # Async runtime
@@ -170,3 +171,16 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Dev-fast: same shape as release (panic=abort, no debug bloat) but with the
+# knobs that make incremental rebuilds cheap. Used by docker-compose.dev.yml so
+# `scripts\start.bat build` reuses cargo fingerprints across rebuilds. The
+# published image still uses [profile.release]; this profile is only selected
+# by local dev compose overrides.
+[profile.dev-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+opt-level = 1
+strip = false

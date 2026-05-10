@@ -985,7 +985,9 @@ fn manifest_uses_connection_secret(manifest: &ExtensionPackManifest) -> bool {
     {
         return true;
     }
-    if value_contains_secret_template(&serde_json::to_value(&manifest.auth.exports).unwrap_or_default()) {
+    if value_contains_secret_template(
+        &serde_json::to_value(&manifest.auth.exports).unwrap_or_default(),
+    ) {
         return true;
     }
     manifest.features.iter().any(|feature| {
@@ -2890,13 +2892,11 @@ impl ExtensionPackRegistry {
             pack_id: pack.manifest.id,
             feature_id: "health.test".to_string(),
             connection_id: Some(connection.id),
-            message: Some(
-                if pack.manifest.draft {
-                    "Connection saved. This draft pack does not declare a runnable live test yet, so provider health was not verified.".to_string()
-                } else {
-                    "Connection saved. This pack does not declare a runnable live test yet, so provider health was not verified.".to_string()
-                },
-            ),
+            message: Some(if pack.manifest.draft {
+                "Connection saved. This draft pack does not declare a runnable live test yet, so provider health was not verified.".to_string()
+            } else {
+                "Connection saved. This pack does not declare a runnable live test yet, so provider health was not verified.".to_string()
+            }),
             data: None,
             error: None,
         };
@@ -2924,9 +2924,19 @@ impl ExtensionPackRegistry {
     }
 
     pub async fn delete_pack(&mut self, pack_id: &str, remove_connections: bool) -> Result<()> {
-        let Some(existing) = self.installed.remove(pack_id) else {
+        let Some(existing) = self.installed.get(pack_id).cloned() else {
             anyhow::bail!("Pack '{}' is not installed", pack_id);
         };
+        if matches!(
+            existing.source_kind,
+            ExtensionPackSourceKind::BundledRegistry
+        ) {
+            anyhow::bail!(
+                "Bundled AgentArk packs cannot be deleted. Disable the pack or remove its saved connections instead."
+            );
+        }
+        self.clear_pack_runtime_artifacts(&existing.manifest.id)?;
+        self.installed.remove(pack_id);
         let mut removed_auth_profile_ids = HashSet::new();
         if remove_connections {
             let connection_ids = self
@@ -3647,6 +3657,31 @@ impl ExtensionPackRegistry {
         })
     }
 
+    fn pack_runtime_dir(&self, pack_id: &str) -> PathBuf {
+        self.data_dir
+            .join("extension-pack-runtime")
+            .join(sanitize_pack_id(pack_id))
+    }
+
+    fn clear_pack_runtime_artifacts(&self, pack_id: &str) -> Result<()> {
+        let runtime_dir = self.pack_runtime_dir(pack_id);
+        if !runtime_dir.exists() {
+            return Ok(());
+        }
+        if !runtime_dir.is_dir() {
+            anyhow::bail!(
+                "Extension pack runtime path '{}' is not a directory",
+                runtime_dir.display()
+            );
+        }
+        std::fs::remove_dir_all(&runtime_dir).with_context(|| {
+            format!(
+                "Failed to remove extension-pack runtime directory '{}'",
+                runtime_dir.display()
+            )
+        })
+    }
+
     async fn delete_pack_auth_profiles(
         &self,
         pack_id: &str,
@@ -3700,10 +3735,7 @@ impl ExtensionPackRegistry {
                 pack_id
             );
         }
-        let runtime_dir = self
-            .data_dir
-            .join("extension-pack-runtime")
-            .join(sanitize_pack_id(pack_id));
+        let runtime_dir = self.pack_runtime_dir(pack_id);
         std::fs::create_dir_all(&runtime_dir).with_context(|| {
             format!(
                 "Failed to create extension-pack runtime directory '{}'",
@@ -4503,10 +4535,7 @@ impl ExtensionPackRegistry {
             .into_iter()
             .filter_map(|item| scalar_to_string(&item))
             .collect::<Vec<_>>();
-        let runtime_dir = self
-            .data_dir
-            .join("extension-pack-runtime")
-            .join(sanitize_pack_id(&manifest.id));
+        let runtime_dir = self.pack_runtime_dir(&manifest.id);
         std::fs::create_dir_all(&runtime_dir).with_context(|| {
             format!(
                 "Failed to create extension-pack runtime directory '{}'",
@@ -5851,17 +5880,16 @@ mod tests {
         }
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn secret_backed_external_oauth_pack_without_oauth_spec_can_be_ready() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = Storage::connect(DatabaseConfig::for_tests().expect("database config"))
             .await
             .expect("storage");
-        let mut registry = ExtensionPackRegistry::new(
-            storage,
-            dir.path().to_path_buf(),
-            dir.path().to_path_buf(),
-        );
+        let mut registry =
+            ExtensionPackRegistry::new(storage, dir.path().to_path_buf(), dir.path().to_path_buf());
         let manifest = ExtensionPackManifest {
             id: "issue_tracker".to_string(),
             name: "Issue Tracker".to_string(),
@@ -5933,17 +5961,16 @@ mod tests {
         assert_eq!(view.state, ExtensionConnectionState::Ready);
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn draft_pack_with_ready_connection_registers_runtime_actions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = Storage::connect(DatabaseConfig::for_tests().expect("database config"))
             .await
             .expect("storage");
-        let mut registry = ExtensionPackRegistry::new(
-            storage,
-            dir.path().to_path_buf(),
-            dir.path().to_path_buf(),
-        );
+        let mut registry =
+            ExtensionPackRegistry::new(storage, dir.path().to_path_buf(), dir.path().to_path_buf());
         let manifest = ExtensionPackManifest {
             id: "work_items".to_string(),
             name: "Work Items".to_string(),
@@ -6029,6 +6056,8 @@ mod tests {
         }));
     }
 
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
     #[tokio::test]
     async fn delete_pack_removes_owned_state_and_secret_namespace() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6188,6 +6217,9 @@ mod tests {
             },
         ];
         registry.persist_events().await.expect("persist events");
+        let runtime_dir = registry.pack_runtime_dir(&manifest.id);
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+        std::fs::write(runtime_dir.join("state.json"), "{}").expect("write runtime artifact");
 
         let unrelated_profile = AuthProfileControlPlane::upsert(
             &storage,
@@ -6240,6 +6272,7 @@ mod tests {
             .await
             .expect("read deleted profile")
             .is_none());
+        assert!(!runtime_dir.exists());
         assert!(
             AuthProfileControlPlane::get(&storage, &unrelated_profile.id)
                 .await
@@ -6262,5 +6295,51 @@ mod tests {
             .events
             .iter()
             .all(|event| !event.pack_id.eq_ignore_ascii_case(&manifest.id)));
+    }
+
+
+    #[cfg_attr(not(feature = "db-tests"), ignore = "requires explicit isolated Postgres test database")]
+    #[tokio::test]
+    async fn delete_pack_rejects_bundled_registry_packs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::connect(DatabaseConfig::for_tests().expect("database config"))
+            .await
+            .expect("storage");
+        let mut registry =
+            ExtensionPackRegistry::new(storage, dir.path().to_path_buf(), dir.path().to_path_buf());
+        let manifest = ExtensionPackManifest {
+            id: "bundled_issue_tracker".to_string(),
+            name: "Bundled Issue Tracker".to_string(),
+            version: "1.0.0".to_string(),
+            kind: "integration".to_string(),
+            signature: Some("bundled".to_string()),
+            draft: false,
+            features: Vec::new(),
+            ..ExtensionPackManifest::default()
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        registry.installed.insert(
+            manifest.id.clone(),
+            InstalledExtensionPack {
+                manifest: manifest.clone(),
+                trust_level: ExtensionPackTrustLevel::Trusted,
+                verification_status: "bundled".to_string(),
+                verification_detail: Some("Bundled with AgentArk.".to_string()),
+                source_kind: ExtensionPackSourceKind::BundledRegistry,
+                source_url: None,
+                enabled: true,
+                runtime_state: ExtensionPackRuntimeStateRecord::default(),
+                installed_at: now.clone(),
+                updated_at: now,
+            },
+        );
+
+        let error = registry
+            .delete_pack(&manifest.id, true)
+            .await
+            .expect_err("bundled packs should not be deletable");
+
+        assert!(error.to_string().contains("cannot be deleted"));
+        assert!(registry.installed.contains_key(&manifest.id));
     }
 }

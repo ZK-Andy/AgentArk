@@ -2128,6 +2128,14 @@ export default function SettingsPage({
     pulseTabActive || Boolean(pulsePollState) || selectedPulseEvent != null;
 
   const [modelDialogOpen, setModelDialogOpen] = useState(false);
+  const [searchProviderDialog, setSearchProviderDialog] = useState<{
+    providerId: string;
+    value: string;
+    showValue: boolean;
+  } | null>(null);
+  const [searxngDialog, setSearxngDialog] = useState<{
+    value: string;
+  } | null>(null);
   const [modelsSectionTab, setModelsSectionTab] = useState<
     "pool" | "embeddings"
   >("pool");
@@ -4506,6 +4514,37 @@ export default function SettingsPage({
   const logsCleanupInputsEnabled =
     dataCleanupEnabled && form.data_lifecycle_logs_cleanup_enabled;
 
+  const openSearchProviderDialog = (
+    provider: (typeof SEARCH_API_PROVIDER_OPTIONS)[number],
+  ) => {
+    setSearchProviderDialog({
+      providerId: provider.id,
+      value: str(form[provider.keyField], ""),
+      showValue: false,
+    });
+  };
+
+  const closeSearchProviderDialog = () => setSearchProviderDialog(null);
+
+  const submitSearchProviderDialog = () => {
+    if (!searchProviderDialog) return;
+    const provider = SEARCH_API_PROVIDER_OPTIONS.find(
+      (entry) => entry.id === searchProviderDialog.providerId,
+    );
+    if (!provider) {
+      setSearchProviderDialog(null);
+      return;
+    }
+    const trimmed = searchProviderDialog.value.trim();
+    if (!trimmed) return;
+    setSearchProviderDraft(provider, {
+      key: trimmed,
+      editing: true,
+      clear: false,
+    });
+    setSearchProviderDialog(null);
+  };
+
   const renderSearchProviderCredentialField = (
     provider: (typeof SEARCH_API_PROVIDER_OPTIONS)[number],
   ) => {
@@ -4513,127 +4552,331 @@ export default function SettingsPage({
     const editing = Boolean(form[provider.editingField]);
     const clearPending = Boolean(form[provider.clearField]);
     const pendingValue = str(form[provider.keyField], "");
-    const status = clearPending
-      ? "delete pending"
-      : configured
-        ? "configured"
-        : "not configured";
-    const disabled = configured && !editing && !clearPending;
-    const helperText = clearPending
-      ? `The saved ${provider.label} key will be removed when you save settings.`
-      : configured && !editing
-        ? `${provider.label} already has a saved key. Use Edit to replace it or Delete to remove it.`
-        : configured
-          ? pendingValue.trim()
-            ? `Save settings to replace the current ${provider.label} API key.`
-            : `Leave blank to keep the current ${provider.label} API key, or enter a replacement.`
-          : `Enter a ${provider.label} API key, then save settings.`;
+    const hasPendingNewKey = editing && pendingValue.trim().length > 0;
+    const enabled = (configured && !clearPending) || hasPendingNewKey;
+    const transientLabel: string | null = clearPending
+      ? "Delete pending"
+      : hasPendingNewKey
+        ? configured
+          ? "Replacement pending"
+          : "Pending save"
+        : null;
+
+    const handleToggle = (checked: boolean) => {
+      if (checked) {
+        if (clearPending) {
+          setSearchProviderDraft(provider, {
+            key: "",
+            editing: false,
+            clear: false,
+          });
+          return;
+        }
+        if (configured) return;
+        openSearchProviderDialog(provider);
+        return;
+      }
+      if (configured) {
+        setSearchProviderDraft(provider, {
+          key: "",
+          editing: false,
+          clear: true,
+        });
+        return;
+      }
+      setSearchProviderDraft(provider, {
+        key: "",
+        editing: false,
+        clear: false,
+      });
+    };
 
     return (
-      <Stack key={provider.id} spacing={0.75}>
-        <TextField
-          label={`${provider.label} API Key (${status})`}
-          value={disabled ? "Saved key on file" : pendingValue}
-          onChange={(e) =>
-            setSearchProviderDraft(provider, {
-              key: e.target.value,
-              editing: true,
-              clear: false,
-            })
-          }
-          fullWidth
-          size="small"
-          type={disabled ? "text" : "password"}
-          disabled={disabled}
-          placeholder={
-            configured && !editing
-              ? "Saved key on file"
-              : `Enter ${provider.label} API key`
-          }
-          helperText={helperText}
-        />
-        {configured ? (
+      <Box
+        key={provider.id}
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          gap: 1.25,
+          flexWrap: "wrap",
+          padding: "10px 12px",
+          borderRadius: "8px",
+          border: enabled
+            ? "1px solid var(--green, #78f2b0)"
+            : "1px solid var(--surface-border)",
+          background: enabled
+            ? "rgba(120, 242, 176, 0.08)"
+            : "var(--ui-rgba-255-255-255-020)",
+          boxShadow: enabled
+            ? "0 0 0 1px rgba(120, 242, 176, 0.10) inset"
+            : "none",
+          opacity: enabled ? 1 : 0.62,
+          transition:
+            "opacity 120ms ease, background-color 120ms ease, border-color 120ms ease",
+        }}
+      >
+        <Stack spacing={0.25} sx={{ flex: 1, minWidth: 200 }}>
           <Stack
             direction="row"
             spacing={1}
             useFlexGap
-            sx={{
-              flexWrap: "wrap",
-            }}
+            sx={{ alignItems: "center", flexWrap: "wrap" }}
           >
-            {!editing && !clearPending ? (
-              <Button
+            <Typography
+              variant="body2"
+              sx={{
+                fontWeight: 600,
+                color: enabled ? "text.primary" : "text.secondary",
+              }}
+            >
+              {provider.label}
+            </Typography>
+            {transientLabel ? (
+              <Chip
                 size="small"
                 variant="outlined"
-                onClick={() =>
-                  setSearchProviderDraft(provider, {
-                    key: "",
-                    editing: true,
-                    clear: false,
-                  })
-                }
-              >
-                Edit key
-              </Button>
+                label={transientLabel}
+                color="warning"
+              />
             ) : null}
-            {editing ? (
-              <Button
-                size="small"
-                variant="text"
-                onClick={() =>
-                  setSearchProviderDraft(provider, {
-                    key: "",
-                    editing: false,
-                    clear: false,
-                  })
-                }
-              >
-                Cancel edit
-              </Button>
-            ) : null}
-            {!clearPending ? (
-              <Button
-                size="small"
-                variant="text"
-                color="error"
-                onClick={() => {
-                  if (
-                    typeof window !== "undefined" &&
-                    !window.confirm(
-                      `Delete the saved ${provider.label} API key? This disables ${provider.label} search until you save a new key.`,
-                    )
-                  ) {
-                    return;
-                  }
-                  setSearchProviderDraft(provider, {
-                    key: "",
-                    editing: false,
-                    clear: true,
-                  });
-                }}
-              >
-                Delete integration
-              </Button>
-            ) : (
-              <Button
-                size="small"
-                variant="text"
-                onClick={() =>
-                  setSearchProviderDraft(provider, {
-                    key: "",
-                    editing: false,
-                    clear: false,
-                  })
-                }
-              >
-                Undo delete
-              </Button>
-            )}
           </Stack>
-        ) : null}
-      </Stack>
+          <Typography variant="caption" sx={{ color: "text.secondary" }}>
+            {clearPending
+              ? `${provider.label} will be disabled and the saved key removed on Save.`
+              : configured
+                ? hasPendingNewKey
+                  ? `Replacement key entered. Save settings to apply.`
+                  : `Saved key on file.`
+                : hasPendingNewKey
+                  ? `Key entered. Save settings to enable ${provider.label}.`
+                  : `Toggle on to add a ${provider.label} API key.`}
+          </Typography>
+        </Stack>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{ alignItems: "center", flexWrap: "wrap" }}
+        >
+          {(configured || hasPendingNewKey) && !clearPending ? (
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={() => openSearchProviderDialog(provider)}
+            >
+              {hasPendingNewKey ? "Change" : "Edit"}
+            </Button>
+          ) : null}
+          {clearPending ? (
+            <Button
+              size="small"
+              variant="text"
+              onClick={() =>
+                setSearchProviderDraft(provider, {
+                  key: "",
+                  editing: false,
+                  clear: false,
+                })
+              }
+            >
+              Undo delete
+            </Button>
+          ) : null}
+          {configured && !clearPending ? (
+            <Button
+              size="small"
+              variant="text"
+              color="error"
+              onClick={() => {
+                if (
+                  typeof window !== "undefined" &&
+                  !window.confirm(
+                    `Delete the saved ${provider.label} API key? This disables ${provider.label} search until you save a new key.`,
+                  )
+                ) {
+                  return;
+                }
+                setSearchProviderDraft(provider, {
+                  key: "",
+                  editing: false,
+                  clear: true,
+                });
+              }}
+            >
+              Delete
+            </Button>
+          ) : null}
+          <Switch
+            checked={enabled}
+            onChange={(e) => handleToggle(e.target.checked)}
+            slotProps={{
+              input: {
+                "aria-label": `Enable ${provider.label} search provider`,
+              },
+            }}
+          />
+        </Stack>
+      </Box>
     );
   };
+
+  const searchDialogProvider = searchProviderDialog
+    ? SEARCH_API_PROVIDER_OPTIONS.find(
+        (entry) => entry.id === searchProviderDialog.providerId,
+      ) ?? null
+    : null;
+  const searchDialogConfigured = searchDialogProvider
+    ? toBool(settings[searchDialogProvider.configuredField])
+    : false;
+
+  const renderSearxngCredentialRow = () => {
+    const savedUrl = str(settings.search_searxng_base_url, "").trim();
+    const pendingUrl = str(form.search_searxng_base_url, "").trim();
+    const configured = savedUrl.length > 0;
+    const enabled = pendingUrl.length > 0;
+    const clearPending = configured && pendingUrl.length === 0;
+    const hasPendingNewUrl =
+      pendingUrl.length > 0 && pendingUrl !== savedUrl;
+    const transientLabel: string | null = clearPending
+      ? "Delete pending"
+      : hasPendingNewUrl
+        ? configured
+          ? "Replacement pending"
+          : "Pending save"
+        : null;
+
+    const openDialog = () =>
+      setSearxngDialog({ value: pendingUrl || savedUrl });
+
+    const handleToggle = (checked: boolean) => {
+      if (checked) {
+        if (clearPending) {
+          setField("search_searxng_base_url", savedUrl);
+          return;
+        }
+        if (configured) return;
+        openDialog();
+        return;
+      }
+      setField("search_searxng_base_url", "");
+    };
+
+    return (
+      <Box
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          gap: 1.25,
+          flexWrap: "wrap",
+          padding: "10px 12px",
+          borderRadius: "8px",
+          border: enabled
+            ? "1px solid var(--green, #78f2b0)"
+            : "1px solid var(--surface-border)",
+          background: enabled
+            ? "rgba(120, 242, 176, 0.08)"
+            : "var(--ui-rgba-255-255-255-020)",
+          boxShadow: enabled
+            ? "0 0 0 1px rgba(120, 242, 176, 0.10) inset"
+            : "none",
+          opacity: enabled ? 1 : 0.62,
+          transition:
+            "opacity 120ms ease, background-color 120ms ease, border-color 120ms ease",
+        }}
+      >
+        <Stack spacing={0.25} sx={{ flex: 1, minWidth: 200 }}>
+          <Stack
+            direction="row"
+            spacing={1}
+            useFlexGap
+            sx={{ alignItems: "center", flexWrap: "wrap" }}
+          >
+            <Typography
+              variant="body2"
+              sx={{
+                fontWeight: 600,
+                color: enabled ? "text.primary" : "text.secondary",
+              }}
+            >
+              SearXNG (self-hosted)
+            </Typography>
+            {transientLabel ? (
+              <Chip
+                size="small"
+                variant="outlined"
+                label={transientLabel}
+                color="warning"
+              />
+            ) : null}
+          </Stack>
+          <Typography variant="caption" sx={{ color: "text.secondary" }}>
+            {clearPending
+              ? "SearXNG will be disabled and the saved URL removed on Save."
+              : configured
+                ? hasPendingNewUrl
+                  ? `Replacement URL entered (${pendingUrl}). Save settings to apply.`
+                  : `Saved: ${savedUrl}`
+                : hasPendingNewUrl
+                  ? `URL entered. Save settings to enable SearXNG.`
+                  : "Toggle on to point AgentArk at your own SearXNG instance. AgentArk will call /search?format=json against this URL."}
+          </Typography>
+        </Stack>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{ alignItems: "center", flexWrap: "wrap" }}
+        >
+          {(configured || hasPendingNewUrl) && !clearPending ? (
+            <Button size="small" variant="outlined" onClick={openDialog}>
+              {hasPendingNewUrl ? "Change" : "Edit"}
+            </Button>
+          ) : null}
+          {clearPending ? (
+            <Button
+              size="small"
+              variant="text"
+              onClick={() => setField("search_searxng_base_url", savedUrl)}
+            >
+              Undo delete
+            </Button>
+          ) : null}
+          {configured && !clearPending ? (
+            <Button
+              size="small"
+              variant="text"
+              color="error"
+              onClick={() => {
+                if (
+                  typeof window !== "undefined" &&
+                  !window.confirm(
+                    "Delete the saved SearXNG URL? This disables SearXNG search until you save a new URL.",
+                  )
+                ) {
+                  return;
+                }
+                setField("search_searxng_base_url", "");
+              }}
+            >
+              Delete
+            </Button>
+          ) : null}
+          <Switch
+            checked={enabled}
+            onChange={(e) => handleToggle(e.target.checked)}
+            slotProps={{
+              input: {
+                "aria-label": "Enable SearXNG search provider",
+              },
+            }}
+          />
+        </Stack>
+      </Box>
+    );
+  };
+
+  const searxngDialogConfigured =
+    str(settings.search_searxng_base_url, "").trim().length > 0;
 
   return (
     <Stack spacing={2}>
@@ -5355,17 +5598,7 @@ export default function SettingsPage({
                       {SEARCH_API_PROVIDER_OPTIONS.map((provider) =>
                         renderSearchProviderCredentialField(provider),
                       )}
-                      <TextField
-                        label="SearXNG Base URL (self-hosted)"
-                        value={form.search_searxng_base_url}
-                        onChange={(e) =>
-                          setField("search_searxng_base_url", e.target.value)
-                        }
-                        fullWidth
-                        size="small"
-                        placeholder="https://search.example.com"
-                        helperText="Optional - requires your own SearXNG instance. AgentArk will call /search?format=json against this URL."
-                      />
+                      {renderSearxngCredentialRow()}
                     </Stack>
                   </Box>
                 </Grid2>
@@ -6772,6 +7005,150 @@ export default function SettingsPage({
             disabled={upsertVaultSecretMutation.isPending}
           >
             {upsertVaultSecretMutation.isPending ? "Saving..." : "Save Secret"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={searchProviderDialog != null}
+        onClose={closeSearchProviderDialog}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          {searchDialogProvider
+            ? searchDialogConfigured
+              ? `Replace ${searchDialogProvider.label} API key`
+              : `Enable ${searchDialogProvider.label}`
+            : "Search provider"}
+        </DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.2} sx={{ mt: 0.5 }}>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              {searchDialogProvider
+                ? searchDialogConfigured
+                  ? `Paste a new ${searchDialogProvider.label} API key. The previous key will be overwritten when you save settings.`
+                  : `Paste your ${searchDialogProvider.label} API key. AgentArk stores it encrypted and uses it in the configured provider order.`
+                : ""}
+            </Typography>
+            <TextField
+              label="API key"
+              value={searchProviderDialog?.value ?? ""}
+              onChange={(e) =>
+                setSearchProviderDialog((prev) =>
+                  prev ? { ...prev, value: e.target.value } : prev,
+                )
+              }
+              onKeyDown={(e) => {
+                if (
+                  e.key === "Enter" &&
+                  (searchProviderDialog?.value ?? "").trim().length > 0
+                ) {
+                  e.preventDefault();
+                  submitSearchProviderDialog();
+                }
+              }}
+              fullWidth
+              autoFocus
+              size="small"
+              type={searchProviderDialog?.showValue ? "text" : "password"}
+              placeholder={
+                searchDialogProvider
+                  ? `Enter ${searchDialogProvider.label} API key`
+                  : ""
+              }
+            />
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={Boolean(searchProviderDialog?.showValue)}
+                  onChange={(e) =>
+                    setSearchProviderDialog((prev) =>
+                      prev ? { ...prev, showValue: e.target.checked } : prev,
+                    )
+                  }
+                />
+              }
+              label="Show key"
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={closeSearchProviderDialog}>Cancel</Button>
+          <Button
+            variant="contained"
+            onClick={submitSearchProviderDialog}
+            disabled={
+              !searchProviderDialog ||
+              searchProviderDialog.value.trim().length === 0
+            }
+          >
+            {searchDialogConfigured ? "Replace key" : "Save key"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={searxngDialog != null}
+        onClose={() => setSearxngDialog(null)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          {searxngDialogConfigured
+            ? "Replace SearXNG URL"
+            : "Enable SearXNG"}
+        </DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.2} sx={{ mt: 0.5 }}>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Enter the base URL of your SearXNG instance. AgentArk will call{" "}
+              <code>/search?format=json</code> against this URL.
+            </Typography>
+            <TextField
+              label="SearXNG base URL"
+              value={searxngDialog?.value ?? ""}
+              onChange={(e) =>
+                setSearxngDialog((prev) =>
+                  prev ? { ...prev, value: e.target.value } : prev,
+                )
+              }
+              onKeyDown={(e) => {
+                if (
+                  e.key === "Enter" &&
+                  (searxngDialog?.value ?? "").trim().length > 0
+                ) {
+                  e.preventDefault();
+                  if (searxngDialog) {
+                    setField(
+                      "search_searxng_base_url",
+                      searxngDialog.value.trim(),
+                    );
+                    setSearxngDialog(null);
+                  }
+                }
+              }}
+              fullWidth
+              autoFocus
+              size="small"
+              placeholder="https://search.example.com"
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSearxngDialog(null)}>Cancel</Button>
+          <Button
+            variant="contained"
+            onClick={() => {
+              if (!searxngDialog) return;
+              const trimmed = searxngDialog.value.trim();
+              if (!trimmed) return;
+              setField("search_searxng_base_url", trimmed);
+              setSearxngDialog(null);
+            }}
+            disabled={
+              !searxngDialog || searxngDialog.value.trim().length === 0
+            }
+          >
+            {searxngDialogConfigured ? "Replace URL" : "Save URL"}
           </Button>
         </DialogActions>
       </Dialog>

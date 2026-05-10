@@ -1,6 +1,71 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const SETTINGS_EMBEDDINGS_HEALTH_TIMEOUT_MS: u64 = 250;
+const SETTINGS_PROCESS_RESTART_IDLE_GRACE_SECS: u64 = 2;
+const SETTINGS_PROCESS_RESTART_MAX_DEFER_SECS: u64 = 600;
+const SETTINGS_PROCESS_RESTART_POLL_MS: u64 = 500;
+static SETTINGS_PROCESS_RESTART_PENDING: AtomicBool = AtomicBool::new(false);
+
+async fn active_chat_stream_count_for_restart(state: &AppState) -> usize {
+    let conversation_streams = state.chat_conversation_cancellations.read().await.len();
+    let task_streams = state.chat_task_cancellations.read().await.len();
+    conversation_streams.saturating_add(task_streams)
+}
+
+fn schedule_process_restart_after_chat_idle(state: AppState, reason: &'static str) -> bool {
+    if SETTINGS_PROCESS_RESTART_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+
+    crate::spawn_logged!("src/channels/http/settings_control.rs:deferred_restart", async move {
+        let started = std::time::Instant::now();
+        let max_defer =
+            std::time::Duration::from_secs(SETTINGS_PROCESS_RESTART_MAX_DEFER_SECS);
+        let poll_interval =
+            std::time::Duration::from_millis(SETTINGS_PROCESS_RESTART_POLL_MS);
+        let idle_grace =
+            std::time::Duration::from_secs(SETTINGS_PROCESS_RESTART_IDLE_GRACE_SECS);
+        let mut logged_wait = false;
+
+        loop {
+            let active = active_chat_stream_count_for_restart(&state).await;
+            if active == 0 {
+                tokio::time::sleep(idle_grace).await;
+                if active_chat_stream_count_for_restart(&state).await == 0 {
+                    break;
+                }
+                continue;
+            }
+            if !logged_wait {
+                tracing::info!(
+                    active_chat_streams = active,
+                    reason,
+                    "Process restart is waiting for active chat streams to finish"
+                );
+                logged_wait = true;
+            }
+            if started.elapsed() >= max_defer {
+                tracing::warn!(
+                    active_chat_streams = active,
+                    reason,
+                    "Process restart defer window elapsed; restarting with active stream(s)"
+                );
+                break;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        tracing::info!(reason, "Restarting process to apply settings changes");
+        std::process::exit(0);
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    });
+    true
+}
 
 /// Get current settings
 pub(super) async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
@@ -1103,6 +1168,11 @@ pub(super) async fn update_google_workspace_oauth_client_settings(
             let _ = manager.set_custom_secret(&key, Some("false".to_string()));
         }
     }
+    super::integrations::refresh_connected_action_surfaces(
+        &state,
+        "prebuilt_integration_configured",
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -4230,20 +4300,24 @@ pub(super) async fn update_settings(
             }
 
             if needs_restart {
-                tracing::info!("Telegram config changed - scheduling automatic restart in 2s");
-                crate::spawn_logged!("src/channels/http.rs:27672", async {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    tracing::info!("Restarting process to apply Telegram config changes...");
-                    std::process::exit(0); // Docker restart: unless-stopped will bring us back
-                    #[allow(unreachable_code)]
-                    Ok::<(), anyhow::Error>(())
-                });
+                let active_chat_streams = active_chat_stream_count_for_restart(&state).await;
+                let restart_queued =
+                    schedule_process_restart_after_chat_idle(state.clone(), "settings_restart");
+                let message = if active_chat_streams > 0 {
+                    "Settings saved. Restart will apply after active chat streams finish."
+                } else if restart_queued {
+                    "Settings saved. Restarting to apply channel changes..."
+                } else {
+                    "Settings saved. Restart is already pending."
+                };
                 (
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "status": "ok",
-                        "message": "Settings saved. Restarting to apply channel changes...",
-                        "restart_scheduled": true
+                        "message": message,
+                        "restart_scheduled": true,
+                        "restart_deferred": active_chat_streams > 0,
+                        "active_chat_streams": active_chat_streams
                     })),
                 )
                     .into_response()

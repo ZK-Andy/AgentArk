@@ -68,6 +68,7 @@ import {
   isValidElement,
   useCallback,
   useEffect,
+  useDeferredValue,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -168,8 +169,11 @@ const CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS = 60_000;
 const CHAT_WORKSPACE_SNAPSHOT_MAX_TOTAL_CHARS = 240_000;
 const CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS = 16000;
 const CHAT_PENDING_STREAM_STEPS_MAX = 48;
-const CHAT_STREAMING_STEPS_UI_MAX = 240;
+const CHAT_STREAMING_STEPS_UI_MAX = 120;
+const CHAT_WORKSPACE_ACTIVITY_RENDER_MAX = 60;
 const CHAT_ACTIVITY_PAYLOAD_STRING_MAX_CHARS = 1600;
+const CHAT_ACTIVITY_STREAM_STRING_MAX_CHARS = 6000;
+const CHAT_ACTIVITY_TRACE_JSON_MAX_CHARS = 4000;
 const CHAT_ACTIVITY_PAYLOAD_ARRAY_MAX_ITEMS = 80;
 const CHAT_ACTIVITY_PAYLOAD_OBJECT_MAX_KEYS = 80;
 const CHAT_ACTIVITY_PAYLOAD_DEPTH_MAX = 5;
@@ -185,7 +189,10 @@ const CHAT_REASONING_PREVIEW_FLUSH_MS = 180;
 const CHAT_REASONING_PREVIEW_MAX_CHARS = 12_000;
 const CHAT_PENDING_RUN_SNAPSHOT_FLUSH_MS = 1200;
 const CHAT_WORKSPACE_SNAPSHOT_FLUSH_MS = 300;
-const CHAT_TRACE_STATE_CACHE_MAX = 24;
+const CHAT_TRACE_STATE_CACHE_MAX = 8;
+const CHAT_TRACE_EAGER_LOAD_MAX = 2;
+const CHAT_TRACE_EAGER_LOAD_IDLE_DELAY_MS = 350;
+const CHAT_COMPUTER_TOKEN_PREVIEW_MAX_CHARS = 12_000;
 const CHAT_PROGRESS_MEMORY_MAX_CONVERSATIONS = 12;
 const CHAT_PENDING_RUN_RECOVERY_GRACE_MS = 12_000;
 const CHAT_INLINE_CONVERSATIONS_MIN_WIDTH = 1600;
@@ -449,6 +456,17 @@ function pruneRecordToAllowedKeys<T>(
 type ChatClarificationChoice = {
   label: string;
   submitText: string;
+  kind?: string;
+  approval?: {
+    id: string;
+    decision: "approve" | "reject";
+    actionName: string;
+    steps?: ChatApprovalStep[];
+  };
+};
+type ChatApprovalStep = {
+  actionName: string;
+  argumentsPreview?: unknown;
 };
 type ChatRunMetrics = {
   inputTokens?: number | null;
@@ -1875,14 +1893,56 @@ function asRecords(value: unknown): JsonRecord[] {
 
 function clarificationChoices(value: unknown): ChatClarificationChoice[] {
   return asRecords(value)
-    .map((choice) => {
+    .map<ChatClarificationChoice | null>((choice) => {
       const label = str(choice.label, "").trim();
       const submitText = str(
         choice.submit_text,
         str(choice.submitText, ""),
       ).trim();
       if (!label || !submitText) return null;
-      return { label, submitText };
+      const kind = str(choice.kind, "").trim();
+      const approval = asRecord(choice.approval);
+      const approvalId = str(approval.id, "").trim();
+      const approvalDecision = str(approval.decision, "").trim().toLowerCase();
+      const approvalActionName = str(
+        approval.action_name,
+        str(approval.actionName, ""),
+      ).trim();
+      const approvalSteps = asRecords(approval.steps)
+        .map<ChatApprovalStep | null>((step) => {
+          const actionName = str(
+            step.action_name,
+            str(step.actionName, ""),
+          ).trim();
+          if (!actionName) return null;
+          const argumentsPreview =
+            step.arguments_preview ?? step.argumentsPreview ?? undefined;
+          return {
+            actionName,
+            ...(argumentsPreview !== undefined ? { argumentsPreview } : {}),
+          };
+        })
+        .filter((step): step is ChatApprovalStep => step !== null);
+      const isToolApprovalKind =
+        kind === "direct_chat_approval" ||
+        kind === "direct_chat_chain_approval";
+      const parsedApproval: ChatClarificationChoice["approval"] =
+        isToolApprovalKind &&
+        approvalId &&
+        (approvalDecision === "approve" || approvalDecision === "reject")
+          ? {
+              id: approvalId,
+              decision: approvalDecision as "approve" | "reject",
+              actionName: approvalActionName,
+              ...(approvalSteps.length > 0 ? { steps: approvalSteps } : {}),
+            }
+          : undefined;
+      return {
+        label,
+        submitText,
+        ...(kind ? { kind } : {}),
+        ...(parsedApproval ? { approval: parsedApproval } : {}),
+      };
     })
     .filter((choice): choice is ChatClarificationChoice => choice !== null);
 }
@@ -3134,13 +3194,11 @@ function compactUnknown(value: unknown, maxLen = 2200): string {
   }
 }
 
-function fullTraceJson(value: unknown): string {
-  if (value == null) return "";
-  try {
-    return JSON.stringify(value, null, 2) || "";
-  } catch {
-    return compactUnknown(value, Number.MAX_SAFE_INTEGER);
-  }
+function fullTraceJson(
+  value: unknown,
+  maxLen = CHAT_ACTIVITY_TRACE_JSON_MAX_CHARS,
+): string {
+  return compactUnknown(value, maxLen);
 }
 
 function extractStepDetailText(step: JsonRecord, maxLen = 2200): string {
@@ -4075,7 +4133,45 @@ function ActivityPayloadDisclosure({
   );
 }
 
-function ActivityTimelineRow({
+function activityPayloadViewsEqual(
+  left: ActivityPayloadView | null,
+  right: ActivityPayloadView | null,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return (
+    left.kind === right.kind &&
+    left.badgeLabel === right.badgeLabel &&
+    left.headerLabel === right.headerLabel &&
+    left.preview === right.preview &&
+    left.body === right.body &&
+    left.lineCount === right.lineCount &&
+    (left.items?.length ?? 0) === (right.items?.length ?? 0)
+  );
+}
+
+function activityTimelineCardsRenderEqual(
+  left: ActivityTimelineCard,
+  right: ActivityTimelineCard,
+): boolean {
+  return (
+    left.id === right.id &&
+    left.index === right.index &&
+    left.stepType === right.stepType &&
+    left.rawTitle === right.rawTitle &&
+    left.tone === right.tone &&
+    left.kind === right.kind &&
+    left.label === right.label &&
+    left.detail === right.detail &&
+    left.detailFull === right.detailFull &&
+    left.summary === right.summary &&
+    left.rawDetailFull === right.rawDetailFull &&
+    left.time === right.time &&
+    activityPayloadViewsEqual(left.payloadView, right.payloadView)
+  );
+}
+
+const ActivityTimelineRow = memo(function ActivityTimelineRow({
   row,
   isActive,
   payloadExpanded,
@@ -4166,7 +4262,12 @@ function ActivityTimelineRow({
       </Box>
     </Box>
   );
-}
+}, (prev, next) =>
+  prev.isActive === next.isActive &&
+  prev.payloadExpanded === next.payloadExpanded &&
+  prev.detailed === next.detailed &&
+  activityTimelineCardsRenderEqual(prev.row, next.row),
+);
 
 function InlineActivityCard({
   row,
@@ -5096,8 +5197,84 @@ function buildRunStatusActivityStep(
   };
 }
 
+function persistedReasoningData(payload: JsonRecord): JsonRecord {
+  const nested = activityDataRecord(payload.data);
+  return Object.keys(nested).length > 0 ? nested : {};
+}
+
+function upsertPersistedReasoningStep(
+  steps: JsonRecord[],
+  indexesByStreamKey: Map<string, number>,
+  payload: JsonRecord,
+  timestamp: string,
+  fallbackDetail = "",
+): void {
+  const nested = persistedReasoningData(payload);
+  const phase = normalizeReasoningPhase(
+    payload.phase ?? nested.phase ?? "reasoning",
+  );
+  const streamKey =
+    str(payload.stream_key, str(nested.stream_key, str(payload.__streamKey, "")))
+      .trim() || `reasoning:${phase || "active"}`;
+  const existingIndex = indexesByStreamKey.get(streamKey);
+  const existingStep =
+    existingIndex == null ? null : asRecord(steps[existingIndex]);
+  const existingData = asRecord(existingStep?.data);
+  const currentText = str(
+    existingData.content_snapshot,
+    str(existingData.content, str(existingStep?.detail, "")),
+  );
+  const snapshot = str(payload.content_snapshot, str(nested.content_snapshot, ""));
+  const delta = str(payload.content_delta, str(nested.content_delta, ""));
+  const content = str(payload.content, str(nested.content, ""));
+  const detail = str(payload.detail, str(nested.detail, fallbackDetail));
+
+  let nextText = currentText;
+  if (snapshot.trim()) {
+    nextText = snapshot;
+  } else if (delta) {
+    nextText = `${currentText}${delta}`;
+  } else if (content) {
+    nextText =
+      currentText && !content.startsWith(currentText)
+        ? `${currentText}${content}`
+        : content;
+  } else if (detail.trim()) {
+    nextText = detail;
+  }
+  if (!nextText.trim()) return;
+
+  const presentation = reasoningStatusCopy(phase, nextText, payload);
+  const nextStep: JsonRecord = {
+    ...(existingStep || {}),
+    step_type: "reasoning_delta",
+    title: presentation.title,
+    detail: nextText,
+    data: {
+      ...nested,
+      ...payload,
+      kind: "reasoning_delta",
+      phase,
+      stream_key: streamKey,
+      content: nextText,
+      content_snapshot: nextText,
+      done: toBool(payload.done) || toBool(nested.done),
+    },
+    __streamKey: streamKey,
+    timestamp: timestamp || str(existingStep?.timestamp, ""),
+  };
+
+  if (existingIndex == null) {
+    indexesByStreamKey.set(streamKey, steps.length);
+    steps.push(nextStep);
+  } else {
+    steps[existingIndex] = nextStep;
+  }
+}
+
 function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
   const steps: JsonRecord[] = [];
+  const reasoningIndexesByStreamKey = new Map<string, number>();
   for (const rawEvent of events) {
     const event = asRecord(rawEvent);
     const kind = str(event.kind, "").trim().toLowerCase();
@@ -5107,6 +5284,20 @@ function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
 
     if (kind === "thinking") {
       const stepType = str(payload.step_type, "thinking").trim() || "thinking";
+      const nested = persistedReasoningData(payload);
+      const payloadKind = str(payload.kind, str(nested.kind, ""))
+        .trim()
+        .toLowerCase();
+      if (stepType === "reasoning_delta" || payloadKind === "reasoning_delta") {
+        upsertPersistedReasoningStep(
+          steps,
+          reasoningIndexesByStreamKey,
+          payload,
+          timestamp,
+          str(payload.detail, ""),
+        );
+        continue;
+      }
       steps.push({
         step_type: stepType,
         title:
@@ -5120,22 +5311,12 @@ function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
     }
 
     if (kind === "reasoning_delta") {
-      const phase = normalizeReasoningPhase(payload.phase);
-      const detail = str(
-        payload.content_snapshot,
-        str(payload.content, str(payload.content_delta, "")),
+      upsertPersistedReasoningStep(
+        steps,
+        reasoningIndexesByStreamKey,
+        payload,
+        timestamp,
       );
-      if (detail.trim()) {
-        const presentation = reasoningStatusCopy(phase, detail);
-        steps.push({
-          step_type: "reasoning_delta",
-          title: presentation.title,
-          detail,
-          data: payload,
-          __streamKey: presentation.streamKey || str(payload.stream_key, ""),
-          timestamp,
-        });
-      }
       continue;
     }
 
@@ -5238,6 +5419,51 @@ function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
     }
   }
   return sanitizeActivityStepsForUi(steps);
+}
+
+function isTraceCheckpointStep(step: JsonRecord): boolean {
+  const stepType = str(step.step_type, str(step.type, ""))
+    .trim()
+    .toLowerCase();
+  const source = str(step.source, "").trim().toLowerCase();
+  const title = str(step.title, "").trim().toLowerCase();
+  return (
+    stepType === "checkpoint" ||
+    source === "checkpoint" ||
+    title.startsWith("checkpoint:")
+  );
+}
+
+function parseTraceCheckpointRunEvent(step: JsonRecord): JsonRecord | null {
+  if (!isTraceCheckpointStep(step)) return null;
+
+  const artifacts = asRecords(step.artifacts);
+  const candidates = [
+    ...artifacts.map((artifact) => str(artifact.data, "")),
+    str(step.data, "").replace(/^Checkpoint Payload\s*/i, ""),
+    str(step.detail, ""),
+  ]
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  for (const candidate of candidates) {
+    const parsed = tryParseActivityJson(candidate);
+    const record = asRecord(parsed);
+    if (
+      str(record.kind, "").trim() &&
+      Object.keys(asRecord(record.payload)).length > 0
+    ) {
+      return record;
+    }
+  }
+  return null;
+}
+
+function buildTraceCheckpointRunSteps(rawSteps: JsonRecord[]): JsonRecord[] {
+  const events = rawSteps
+    .map(parseTraceCheckpointRunEvent)
+    .filter((event): event is JsonRecord => Boolean(event));
+  return events.length > 0 ? buildPersistedRunSteps(events) : [];
 }
 
 function isHumanReadableStatus(detail: string): boolean {
@@ -5796,7 +6022,7 @@ function sanitizeActivityPayloadForUi(
       return value ? omittedStringLabel(value) : "";
     }
     if (isStreamLikeActivityRecord(parent)) {
-      return value;
+      return compactUiString(value, CHAT_ACTIVITY_STREAM_STRING_MAX_CHARS);
     }
     return compactUiString(value);
   }
@@ -6039,6 +6265,35 @@ function stripAttachmentContextMarker(text: string): string {
     .trimEnd();
 }
 
+function looksLikeLeakedAgentPlanningTrace(text: string): boolean {
+  const normalized = (text || "").replace(/\r\n/g, "\n").trim();
+  if (!normalized) return false;
+  const lines = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length < 4) return false;
+  const lower = normalized.toLowerCase();
+  const controlSignals = [
+    "authorized actions",
+    "available action",
+    "turn plan",
+    "tool history",
+    "action scope",
+    "scope expansion",
+    "routing signal",
+    "can_request_expansion",
+    "parameters include",
+    "call the action",
+  ].filter((needle) => lower.includes(needle)).length;
+  const firstPersonOperationalLines = lines.filter((line) =>
+    /^(let me|i need to|i should|i can|i have|i don't have|wait\b|actually\b)/i.test(
+      line,
+    ),
+  ).length;
+  return controlSignals >= 2 && firstPersonOperationalLines >= 2;
+}
+
 // Defensive strip for assistant-message rendering. The agent loop uses an
 // out-of-band scope-expansion sentinel and a legacy JSON envelope; if either
 // slips into a streamed response (e.g. the iteration that produced it was
@@ -6048,6 +6303,9 @@ function stripAttachmentContextMarker(text: string): string {
 function stripAgentControlArtifacts(text: string): string {
   if (!text) return text;
   let out = text;
+  if (looksLikeLeakedAgentPlanningTrace(out)) {
+    return "This run exposed an internal planning trace instead of a final answer. Open Run Details for the trace, then retry after the install flow fix is running.";
+  }
   // 1. Scope-expansion sentinels. Drop malformed historical spellings too,
   // because old turns may stream them before the loop continues.
   out = out.replace(/[ \t]*<<<AGENT_?SCOPE_?EXPAND>>>[^\n]*/gim, "");
@@ -6820,6 +7078,33 @@ function MarkdownBody({
               >
                 {children}
               </a>
+            );
+          },
+          img: ({
+            src,
+            alt,
+          }: {
+            src?: string;
+            alt?: string;
+          }) => {
+            const normalizedSrc = normalizeOutboundHref(src);
+            const label = str(alt, "").trim();
+            if (!normalizedSrc) {
+              return label ? (
+                <span className="chat-md-image-alt">{label}</span>
+              ) : null;
+            }
+            return (
+              <img
+                className="chat-md-image"
+                src={normalizedSrc}
+                alt={label}
+                loading="lazy"
+                referrerPolicy="no-referrer"
+                onError={(event) => {
+                  event.currentTarget.style.display = "none";
+                }}
+              />
             );
           },
           pre: ({ children }: { children?: React.ReactNode }) => {
@@ -9050,7 +9335,7 @@ function ChatPageInner({
     const queued = queuedStreamingStepsRef.current;
     queuedStreamingStepsRef.current = null;
     if (!queued) return;
-    setStreamingSteps(sanitizeActivityStepsForUi(queued));
+    setStreamingSteps(queued);
   };
   const scheduleStreamingStepsFlush = () => {
     if (typeof window === "undefined") {
@@ -9062,7 +9347,7 @@ function ChatPageInner({
       streamingStepsFlushTimerRef.current = null;
       const queued = queuedStreamingStepsRef.current;
       queuedStreamingStepsRef.current = null;
-      if (queued) setStreamingSteps(sanitizeActivityStepsForUi(queued));
+      if (queued) setStreamingSteps(queued);
     }, CHAT_STREAMING_STEP_FLUSH_MS);
   };
   const setStreamingStepsNow = (next: JsonRecord[]) => {
@@ -9169,10 +9454,21 @@ function ChatPageInner({
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
-    const handleResize = () => setViewportWidth(window.innerWidth);
-    handleResize();
+    let frame = 0;
+    const syncWidth = () => {
+      frame = 0;
+      setViewportWidth(window.innerWidth);
+    };
+    const handleResize = () => {
+      if (frame !== 0) return;
+      frame = window.requestAnimationFrame(syncWidth);
+    };
+    syncWidth();
     window.addEventListener("resize", handleResize, { passive: true });
-    return () => window.removeEventListener("resize", handleResize);
+    return () => {
+      if (frame !== 0) window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", handleResize);
+    };
   }, []);
 
   useEffect(() => {
@@ -9432,6 +9728,10 @@ function ChatPageInner({
     chatCredentialPromptModeKind === "hybrid";
   const chatCredentialPromptDocsUrl = str(
     chatCredentialPrompt.docs_url,
+    "",
+  ).trim();
+  const chatCredentialPromptSettingsPath = str(
+    chatCredentialPrompt.settings_path,
     "",
   ).trim();
   const chatCredentialPromptVisible =
@@ -10063,24 +10363,41 @@ function ChatPageInner({
     traceErrorById,
   ]);
 
-  // Also load traces for prior assistant messages so their compact transcript
-  // rows remain populated after a new turn begins.
+  // Keep a small warm cache for recent assistant traces. Loading every prior
+  // trace in a long chat makes the console sluggish after a few turns.
   useEffect(() => {
     if (isStreaming || hasPendingSnapshotForConversation) return;
-    for (const message of messages) {
+    const traceIds: string[] = [];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
       if (str(message.role, "").toLowerCase() !== "assistant") continue;
       const traceId = str(message.trace_id, "").trim();
       if (!traceId) continue;
+      if (traceId === latestAssistantTraceId) continue;
       if (
         traceStepsById[traceId] ||
         traceLoadingById[traceId] ||
         traceErrorById[traceId]
       )
         continue;
-      void loadTraceForId(traceId);
+      traceIds.push(traceId);
+      if (traceIds.length >= Math.max(0, CHAT_TRACE_EAGER_LOAD_MAX - 1)) break;
     }
+    if (traceIds.length === 0) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      traceIds.forEach((traceId) => {
+        if (!cancelled) void loadTraceForId(traceId);
+      });
+    }, CHAT_TRACE_EAGER_LOAD_IDLE_DELAY_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [
     messages,
+    latestAssistantTraceId,
     isStreaming,
     hasPendingSnapshotForConversation,
     traceStepsById,
@@ -10137,7 +10454,7 @@ function ChatPageInner({
       .replace(/\b\w/g, (ch) => ch.toUpperCase());
   };
 
-  const toggleExpandedActivityPayload = (id: string) => {
+  const toggleExpandedActivityPayload = useCallback((id: string) => {
     setExpandedActivityPayloads((prev) => {
       const next = new Set(prev);
       if (next.has(id)) {
@@ -10147,7 +10464,7 @@ function ChatPageInner({
       }
       return next;
     });
-  };
+  }, []);
 
   const toggleExpandedTranscriptAction = (id: string) => {
     setExpandedTranscriptActions((prev) => {
@@ -10643,8 +10960,41 @@ function ChatPageInner({
       const payload = sanitizeChatMessagesPayloadForUi(await api.rawGet(
         `/conversations/${encodeURIComponent(id)}/messages?limit=100`,
       ));
-      queryClient.setQueryData(["chat-messages", id], payload);
-      return pickRecords(payload, "messages");
+      const previousRecords = pickRecords(
+        queryClient.getQueryData(["chat-messages", id]),
+        "messages",
+      );
+      const choicesByTrace = new Map<string, ChatClarificationChoice[]>();
+      const choicesByContent = new Map<string, ChatClarificationChoice[]>();
+      for (const record of previousRecords) {
+        const choices = clarificationChoices(record.choices);
+        if (choices.length === 0) continue;
+        const traceId = str(record.trace_id, str(record.traceId, "")).trim();
+        const content = stripAgentInternalReasoningLeaks(
+          str(record.content, ""),
+        ).trim();
+        if (traceId) choicesByTrace.set(traceId, choices);
+        if (content) choicesByContent.set(content, choices);
+      }
+      const payloadRecords = pickRecords(payload, "messages");
+      const mergedRecords = payloadRecords.map((record) => {
+        if (clarificationChoices(record.choices).length > 0) return record;
+        const traceId = str(record.trace_id, str(record.traceId, "")).trim();
+        const content = stripAgentInternalReasoningLeaks(
+          str(record.content, ""),
+        ).trim();
+        const preservedChoices =
+          (traceId ? choicesByTrace.get(traceId) : undefined) ||
+          (content ? choicesByContent.get(content) : undefined);
+        return preservedChoices && preservedChoices.length > 0
+          ? { ...record, choices: preservedChoices }
+          : record;
+      });
+      const nextPayload = Array.isArray(payload)
+        ? mergedRecords
+        : { ...asRecord(payload), messages: mergedRecords };
+      queryClient.setQueryData(["chat-messages", id], nextPayload);
+      return mergedRecords;
     },
     [queryClient],
   );
@@ -10699,6 +11049,7 @@ function ChatPageInner({
       const runId = str(obj.run_id, str(obj.runId, "")).trim();
       const traceId = str(obj.trace_id, str(obj.traceId, "")).trim();
       const modelUsed = str(obj.model_used, str(obj.model, "")).trim();
+      const choices = clarificationChoices(obj.choices);
       const timestamp = new Date().toISOString();
       queryClient.setQueryData(["chat-messages", id], (previous: unknown) => {
         const previousObj = asRecord(previous);
@@ -10725,6 +11076,7 @@ function ChatPageInner({
           timestamp,
           model_used: modelUsed || "stream",
           trace_id: traceId,
+          ...(choices.length > 0 ? { choices } : {}),
           optimistic: true,
         };
         if (Array.isArray(previous)) {
@@ -11439,9 +11791,11 @@ function ChatPageInner({
       detailFull = "";
     }
     const stableId = getStreamingStepStableKey(step);
-    const hideRawPayload =
+    const hideStructuredPayload =
       stepType === "checkpoint" || stepType === "run_status";
-    const rawDetailFull = hideRawPayload
+    const hideRawPayload =
+      hideStructuredPayload || stepType === "reasoning_delta";
+    const rawDetailFull = hideStructuredPayload
       ? ""
       : humanDetailRaw
         ? fullDetail || rawDetail
@@ -11466,7 +11820,7 @@ function ChatPageInner({
       detailFull,
       summary,
       rawDetailFull,
-      traceJson: fullTraceJson(step),
+      traceJson: hideRawPayload ? "" : fullTraceJson(step),
       payloadView,
       isHeartbeat: isHeartbeatStreamingStep(step),
       time,
@@ -11491,8 +11845,10 @@ function ChatPageInner({
       const safeDetail = rawDetail
         ? simplifyConsoleDetail(summarizeActivityDetail(rawDetail))
         : "";
-      const hideRawPayload =
+      const hideStructuredPayload =
         stepType === "checkpoint" || stepType === "run_status";
+      const hideRawPayload =
+        hideStructuredPayload || stepType === "reasoning_delta";
       return {
         id:
           stableId || `${str(record.time, "live") || "live"}-${index}-${label}`,
@@ -11505,8 +11861,8 @@ function ChatPageInner({
         detail: safeDetail,
         detailFull: "",
         summary: safeDetail,
-        rawDetailFull: hideRawPayload ? "" : rawDetail,
-        traceJson: fullTraceJson(record),
+        rawDetailFull: hideStructuredPayload ? "" : rawDetail,
+        traceJson: hideRawPayload ? "" : fullTraceJson(record),
         payloadView: hideRawPayload
           ? null
           : buildActivityPayloadViewFromSources(rawDetail, record.data),
@@ -12031,11 +12387,23 @@ function ChatPageInner({
       : Array.isArray(rec.trace)
         ? rec.trace
         : [];
+    const rawSteps = raw
+      .filter((x) => x && typeof x === "object")
+      .map((x) => normalizeActivityStepTime(asRecord(x)));
+    const checkpointRunSteps = buildTraceCheckpointRunSteps(rawSteps);
+    const sourceSteps =
+      checkpointRunSteps.length > 0
+        ? [
+            ...rawSteps.filter(
+              (step) =>
+                !isTraceCheckpointStep(step) && isMainChatReasoningStep(step),
+            ),
+            ...checkpointRunSteps,
+          ]
+        : rawSteps;
     const steps = sanitizeActivityStepsForUi(
       compressActivitySteps(
-      raw
-        .filter((x) => x && typeof x === "object")
-        .map((x) => normalizeActivityStepTime(asRecord(x))),
+        sourceSteps,
       ),
     );
     return steps.length > CHAT_STREAMING_STEPS_UI_MAX
@@ -13894,6 +14262,22 @@ function ChatPageInner({
     if (
       heartbeat &&
       next.length < CHAT_STREAMING_STEPS_UI_MAX &&
+      !next.some((row) => isHeartbeatStreamingStep(row))
+    ) {
+      return [...next, heartbeat];
+    }
+    return next;
+  };
+
+  const limitActivityStepsForRender = (steps: JsonRecord[]): JsonRecord[] => {
+    if (steps.length <= CHAT_WORKSPACE_ACTIVITY_RENDER_MAX) return steps;
+    const heartbeat = steps.find((row) => isHeartbeatStreamingStep(row));
+    const next = steps
+      .filter((row) => !isHeartbeatStreamingStep(row))
+      .slice(-CHAT_WORKSPACE_ACTIVITY_RENDER_MAX);
+    if (
+      heartbeat &&
+      next.length < CHAT_WORKSPACE_ACTIVITY_RENDER_MAX &&
       !next.some((row) => isHeartbeatStreamingStep(row))
     ) {
       return [...next, heartbeat];
@@ -16193,14 +16577,49 @@ function ChatPageInner({
 
   const submitClarificationChoice = async (
     messageKey: string,
-    submitText: string,
+    choice: ChatClarificationChoice,
+    choiceKey: string,
   ): Promise<void> => {
-    const trimmed = submitText.trim();
-    if (!trimmed || submittedClarificationChoices[messageKey]) return;
+    const trimmed = choice.submitText.trim();
+    if (!trimmed || submittedClarificationChoices[choiceKey]) return;
     setSubmittedClarificationChoices((prev) => ({
       ...prev,
-      [messageKey]: true,
+      [choiceKey]: true,
     }));
+    if (
+      (choice.kind === "direct_chat_approval" ||
+        choice.kind === "direct_chat_chain_approval") &&
+      choice.approval
+    ) {
+      try {
+        const result = asRecord(
+          await api.rawPost(
+            `/chat/tool-approvals/${encodeURIComponent(choice.approval.id)}/decision`,
+            { decision: choice.approval.decision },
+          ),
+        );
+        const response = str(result.response, "").trim();
+        if (response && conversationId) {
+          appendAssistantContentToConversationCache(conversationId, {
+            content: response,
+            model_used: "approval",
+          });
+          void queryClient.invalidateQueries({
+            queryKey: ["chat-messages", conversationId],
+          });
+        }
+      } catch (error) {
+        setSubmittedClarificationChoices((prev) => {
+          const next = { ...prev };
+          delete next[choiceKey];
+          return next;
+        });
+        setChatError(
+          error instanceof Error ? error.message : "Failed to update approval.",
+        );
+      }
+      return;
+    }
     await submitComposerMessage(trimmed, []);
   };
 
@@ -16210,37 +16629,76 @@ function ChatPageInner({
     forceDisabled = false,
   ) => {
     if (choices.length === 0) return null;
-    const disabled =
-      forceDisabled ||
-      isStreaming ||
-      Boolean(submittedClarificationChoices[messageKey]);
+    const disabled = forceDisabled || isStreaming;
+    const approvalSteps =
+      choices.find(
+        (choice) =>
+          choice.kind === "direct_chat_chain_approval" &&
+          (choice.approval?.steps?.length ?? 0) > 0,
+      )?.approval?.steps ?? [];
     return (
-      <Stack
-        direction="row"
-        spacing={0.75}
-        useFlexGap
-        sx={{
-          flexWrap: "wrap",
-          mt: 1.25,
-        }}
-      >
-        {choices.map((choice, idx) => (
-          <Button
-            key={`${messageKey}-${choice.submitText}-${idx}`}
-            size="small"
-            variant="outlined"
-            disabled={disabled}
-            onClick={() => {
-              void submitClarificationChoice(messageKey, choice.submitText);
-            }}
+      <Stack spacing={0.85} sx={{ mt: 1.25 }}>
+        {approvalSteps.length > 1 ? (
+          <Box
             sx={{
+              border: "1px solid rgba(148, 163, 184, 0.24)",
               borderRadius: 1,
-              textTransform: "none",
+              p: 1,
+              background: "rgba(15, 23, 42, 0.18)",
             }}
           >
-            {choice.label}
-          </Button>
-        ))}
+            <Typography
+              variant="caption"
+              sx={{ color: "text.secondary", display: "block", mb: 0.5 }}
+            >
+              Approval covers {approvalSteps.length} actions
+            </Typography>
+            <Stack spacing={0.4}>
+              {approvalSteps.map((step, idx) => (
+                <Typography
+                  key={`${messageKey}-approval-step-${idx}-${step.actionName}`}
+                  variant="caption"
+                  sx={{ color: "text.secondary" }}
+                >
+                  {idx + 1}. {step.actionName}
+                </Typography>
+              ))}
+            </Stack>
+          </Box>
+        ) : null}
+        <Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{
+            flexWrap: "wrap",
+          }}
+        >
+          {choices.map((choice, idx) => {
+            const choiceKey = [
+              messageKey,
+              choice.kind || "choice",
+              choice.approval?.id || choice.submitText,
+            ].join(":");
+            return (
+              <Button
+                key={`${messageKey}-${choice.submitText}-${idx}`}
+                size="small"
+                variant="outlined"
+                disabled={disabled || Boolean(submittedClarificationChoices[choiceKey])}
+                onClick={() => {
+                  void submitClarificationChoice(messageKey, choice, choiceKey);
+                }}
+                sx={{
+                  borderRadius: 1,
+                  textTransform: "none",
+                }}
+              >
+                {choice.label}
+              </Button>
+            );
+          })}
+        </Stack>
       </Stack>
     );
   };
@@ -16615,6 +17073,13 @@ function ChatPageInner({
   const visibleStreamingResponse = hasLivePendingThread
     ? stripAgentInternalReasoningLeaks(streamingResponse)
     : "";
+  const computerTokenPreview = useMemo(() => {
+    if (!visibleStreamingResponse) return "";
+    return visibleStreamingResponse.length > CHAT_COMPUTER_TOKEN_PREVIEW_MAX_CHARS
+      ? visibleStreamingResponse.slice(-CHAT_COMPUTER_TOKEN_PREVIEW_MAX_CHARS)
+      : visibleStreamingResponse;
+  }, [visibleStreamingResponse]);
+  const deferredComputerTokenPreview = useDeferredValue(computerTokenPreview);
   const interruptedRunDetail = useMemo(
     () =>
       interruptedRunDetailFromSteps(
@@ -16884,6 +17349,18 @@ function ChatPageInner({
     () => trimTrailingHeartbeatSteps(latestAssistantTraceSteps),
     [latestAssistantTraceSteps],
   );
+  const mergePersistedReasoningIntoSteps = (
+    primarySteps: JsonRecord[],
+    persistedSteps: JsonRecord[],
+  ): JsonRecord[] => {
+    if (persistedSteps.length === 0) return primarySteps;
+    const persistedReasoningSteps = persistedSteps.filter(isMainChatReasoningStep);
+    if (persistedReasoningSteps.length === 0) return primarySteps;
+    if (primarySteps.length === 0) return persistedSteps;
+    return trimTrailingHeartbeatSteps(
+      compressActivitySteps([...persistedReasoningSteps, ...primarySteps]),
+    );
+  };
   const persistedExecutionPlan = useMemo(
     () =>
       showStreamingAssistant || hasPendingSnapshotForConversation
@@ -17250,10 +17727,12 @@ function ChatPageInner({
 
   const completedWorkspaceSteps = useMemo(
     () =>
-      completedPersistedTraceSteps.length >= completedLastRunSteps.length &&
-      completedPersistedTraceSteps.length > 0
-        ? completedPersistedTraceSteps
-        : completedLastRunSteps,
+      completedLastRunSteps.length > 0
+        ? mergePersistedReasoningIntoSteps(
+            completedLastRunSteps,
+            completedPersistedTraceSteps,
+          )
+        : completedPersistedTraceSteps,
     [completedLastRunSteps, completedPersistedTraceSteps],
   );
 
@@ -17458,10 +17937,14 @@ function ChatPageInner({
     [workspaceSteps, showInterruptedRunCard],
   );
   const workspaceCards = useMemo(() => {
-    return workspaceSteps.map((step, idx) => safeBuildStepCard(step, idx));
+    return limitActivityStepsForRender(workspaceSteps).map((step, idx) =>
+      safeBuildStepCard(step, idx),
+    );
   }, [workspaceSteps]);
   const workspaceConsoleCards = useMemo(() => {
-    return workspaceConsoleSteps.map((step, idx) => safeBuildStepCard(step, idx));
+    return limitActivityStepsForRender(workspaceConsoleSteps).map((step, idx) =>
+      safeBuildStepCard(step, idx),
+    );
   }, [workspaceConsoleSteps]);
   const computerTaskProgress = useMemo(
     () =>
@@ -18363,7 +18846,7 @@ function ChatPageInner({
         snippetContent={activeWorkspaceCodeContent}
         isStreaming={isStreamingForCurrentConversation}
         startedAt={pendingSnapshotStartedAt || null}
-        tokenPreview={visibleStreamingResponse}
+        tokenPreview={deferredComputerTokenPreview}
         reasoningPreview={reasoningStream?.content || ""}
         reasoningPhase={reasoningStream?.phase || ""}
         taskProgress={computerTaskProgress}
@@ -19166,7 +19649,7 @@ function ChatPageInner({
         : null}
       <Box
         data-tour-target="chat-workspace"
-        className={`list-shell chat-shell chat-density-immersive${isDragOverChat ? " chat-shell-drop-active" : ""}`}
+        className={`list-shell chat-shell chat-density-immersive${showWorkspacePanelInline ? " chat-shell-console-open" : ""}${isDragOverChat ? " chat-shell-drop-active" : ""}`}
         sx={{
           minHeight: 0,
           display: "flex",
@@ -20168,8 +20651,19 @@ function ChatPageInner({
               </Box>
             ) : null}
             {chatCredentialPromptVisible ? (
-              <Box className="list-shell" sx={{ mt: 1 }}>
-                <Stack spacing={1.25}>
+              <Box
+                className="list-shell"
+                sx={{
+                  mt: 1,
+                  width: "min(100%, 720px)",
+                  maxWidth: "100%",
+                  alignSelf: "flex-start",
+                  borderRadius: 1.5,
+                  px: { xs: 1.25, sm: 1.5 },
+                  py: 1.25,
+                }}
+              >
+                <Stack spacing={1}>
                   <Box>
                     <Typography variant="subtitle2">
                       {str(
@@ -20188,12 +20682,45 @@ function ChatPageInner({
                         "Provide the requested credential values here so AgentArk can store them encrypted and continue."}
                     </Typography>
                   </Box>
-                  <Alert severity="warning" sx={{ py: 0.5 }}>
+                  {chatCredentialPromptSettingsPath ? (
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "text.secondary",
+                        display: "block",
+                      }}
+                    >
+                      Use this form, or open{" "}
+                      <Box
+                        component="span"
+                        sx={{
+                          color: "text.primary",
+                          fontWeight: 600,
+                        }}
+                      >
+                        {chatCredentialPromptSettingsPath}
+                      </Box>
+                      .
+                    </Typography>
+                  ) : null}
+                  <Alert
+                    severity="warning"
+                    variant="outlined"
+                    sx={{
+                      py: 0.25,
+                      px: 1,
+                      "& .MuiAlert-icon": { py: 0.25 },
+                      "& .MuiAlert-message": { py: 0.25 },
+                    }}
+                  >
                     {str(chatCredentialPrompt.warning, "").trim() ||
                       CHAT_SECRET_WARNING}
                   </Alert>
                   {chatCredentialPromptDocsUrl ? (
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary" }}
+                    >
                       Where do I get this?{" "}
                       <a
                         href={chatCredentialPromptDocsUrl}
@@ -20212,7 +20739,7 @@ function ChatPageInner({
                       finish signing in.
                     </Alert>
                   ) : null}
-                  <Grid2 container spacing={1}>
+                  <Grid2 container spacing={1} sx={{ maxWidth: 620 }}>
                     {chatCredentialPromptFields.map((field, index) => {
                       const key = str(field.key, "").trim();
                       if (!key) return null;

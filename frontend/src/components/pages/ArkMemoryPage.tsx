@@ -43,6 +43,7 @@ import {
 import { humanTs } from "./workspaceUiBits";
 
 const REFRESH_MS = 8000;
+const HEALTH_FINDINGS_PAGE_SIZE = 2;
 
 function arkmemoryHistoryEventVisible(event: JsonRecord): boolean {
   const type = str(event.event_type, "").trim();
@@ -220,6 +221,7 @@ export default function ArkMemoryPage({
   );
   const [notice, setNotice] = useState<string | null>(null);
   const [healthDetailsOpen, setHealthDetailsOpen] = useState(false);
+  const [healthPage, setHealthPage] = useState(0);
   const [captureDetailsOpen, setCaptureDetailsOpen] = useState(false);
   const invalidateArkMemory = async () => {
     await Promise.all([
@@ -344,16 +346,35 @@ export default function ArkMemoryPage({
   const pendingConsolidation =
     pendingCaptureEvents.length || num(capturePipeline.pending);
   const failedCaptureCount = num(capturePipeline.failed);
+  const healthPageCount = Math.max(
+    1,
+    Math.ceil(healthFindings.length / HEALTH_FINDINGS_PAGE_SIZE),
+  );
+  const healthDialogPage = Math.min(healthPage, healthPageCount - 1);
+  const healthStart = healthDialogPage * HEALTH_FINDINGS_PAGE_SIZE;
+  const healthEnd = Math.min(
+    healthStart + HEALTH_FINDINGS_PAGE_SIZE,
+    healthFindings.length,
+  );
+  const visibleHealthFindings = healthFindings.slice(healthStart, healthEnd);
+  const healthRangeLabel =
+    healthFindings.length > 0
+      ? `${healthStart + 1}-${healthEnd} of ${healthFindings.length}`
+      : "0 of 0";
+  const openHealthDetails = () => {
+    setHealthPage(0);
+    setHealthDetailsOpen(true);
+  };
   useEffect(() => {
     if (!showQueueTab && memoryTab === "queue") {
       setMemoryTab("current");
     }
   }, [memoryTab, showQueueTab]);
   useEffect(() => {
-    if (failedCaptureCount > 0) {
-      setHealthDetailsOpen(true);
+    if (healthPage > healthPageCount - 1) {
+      setHealthPage(Math.max(0, healthPageCount - 1));
     }
-  }, [failedCaptureCount]);
+  }, [healthPage, healthPageCount]);
   const busy =
     approveQueueMutation.isPending ||
     rejectQueueMutation.isPending ||
@@ -408,7 +429,7 @@ export default function ArkMemoryPage({
   return (
     <WorkspacePageShell spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Ark Core / ArkMemory"
+        eyebrow="ARK CORE"
         title="ArkMemory"
         description={
           <>
@@ -473,7 +494,7 @@ export default function ArkMemoryPage({
             <Button
               color="inherit"
               size="small"
-              onClick={() => setHealthDetailsOpen(true)}
+              onClick={openHealthDetails}
             >
               Review
             </Button>
@@ -484,23 +505,22 @@ export default function ArkMemoryPage({
             : `${failedCaptureCount} memory captures need attention.`}
         </Alert>
       ) : null}
-      {healthFindings.length > 0 || healthDetailsOpen ? (
-        <Accordion
-          disableGutters
-          expanded={healthDetailsOpen}
-          onChange={(_event, expanded) => setHealthDetailsOpen(expanded)}
-          className="list-shell"
-          sx={{
-            background: "transparent",
-            "&:before": { display: "none" },
-          }}
-        >
-          <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+      {healthFindings.length > 0 ? (
+        <Box className="list-shell">
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={1}
+            useFlexGap
+            sx={{
+              alignItems: { xs: "stretch", sm: "center" },
+              justifyContent: "space-between",
+            }}
+          >
             <Stack
               direction="row"
               spacing={1}
               useFlexGap
-              sx={{ alignItems: "center", flexWrap: "wrap", width: "100%" }}
+              sx={{ alignItems: "center", flexWrap: "wrap" }}
             >
               <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                 Memory Health
@@ -508,203 +528,22 @@ export default function ArkMemoryPage({
               <Chip
                 size="small"
                 variant="outlined"
-                color={healthFindings.length > 0 ? "warning" : "default"}
+                color="warning"
                 label={`${healthFindings.length} finding${
                   healthFindings.length === 1 ? "" : "s"
                 }`}
               />
             </Stack>
-          </AccordionSummary>
-          <AccordionDetails>
-            <Stack spacing={1}>
-              {healthQ.isLoading ? (
-                <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                  Loading memory health details...
-                </Typography>
-              ) : null}
-              {healthQ.error ? (
-                <Alert severity="warning">{errMessage(healthQ.error)}</Alert>
-              ) : null}
-              {!healthQ.isLoading && !healthQ.error && healthFindings.length === 0 ? (
-                <Alert severity="info">
-                  No active memory health findings are currently reported.
-                </Alert>
-              ) : null}
-              {healthFindings.map((finding, index) => {
-                const id = str(finding.id, `health-${index}`).trim();
-                const captureEventId = str(finding.capture_event_id, "").trim();
-                const status = str(finding.status, "").trim();
-                const captureKind = str(finding.capture_kind, "").trim();
-                const lastErrorCode = str(finding.last_error_code, "").trim();
-                const reviewPattern = healthReviewPattern(finding);
-                const reviewPatternLabel = healthReviewPatternLabel(reviewPattern);
-                const sourceContext = healthSourceContext(finding);
-                const sourceTime = humanTs(str(sourceContext.source_message_at, ""));
-                const sourcePreview = str(
-                  sourceContext.source_message_preview,
-                  "",
-                ).trim();
-                const sourceMessageId = str(
-                  sourceContext.source_message_id,
-                  "",
-                ).trim();
-                const sourceChars = num(sourceContext.source_message_chars, -1);
-                const isSensitiveSkip = status === "rejected_sensitive_input";
-                const created = humanTs(str(finding.created_at, ""));
-                return (
-                  <Box
-                    key={id}
-                    className="metadata-box"
-                    sx={{ borderColor: "var(--ui-rgba-255-193-7-180)" }}
-                  >
-                    <Stack spacing={0.85}>
-                      <Stack
-                        direction="row"
-                        spacing={1}
-                        useFlexGap
-                        sx={{
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <Stack
-                          direction="row"
-                          spacing={0.75}
-                          useFlexGap
-                          sx={{ alignItems: "center", flexWrap: "wrap", minWidth: 0 }}
-                        >
-                          <Chip
-                            size="small"
-                            variant="outlined"
-                            color={healthSeverityColor(finding.severity)}
-                            label={tokenLabel(finding.severity, "Review")}
-                          />
-                          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                            {healthFindingTitle(finding, index)}
-                          </Typography>
-                        </Stack>
-                        <Stack
-                          direction="row"
-                          spacing={0.75}
-                          useFlexGap
-                          sx={{ flexWrap: "wrap", justifyContent: "flex-end" }}
-                        >
-                          {isSensitiveSkip ? (
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              color="warning"
-                              disabled={busy || !id}
-                              onClick={() =>
-                                applyHealthMutation.mutate({
-                                  id,
-                                  outcome: "expected_sensitive_skip",
-                                })
-                              }
-                            >
-                              Correct skip
-                            </Button>
-                          ) : null}
-                          {isSensitiveSkip ? (
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              color="warning"
-                              disabled={busy || !id}
-                              onClick={() =>
-                                applyHealthMutation.mutate({
-                                  id,
-                                  outcome: "false_positive_safe_memory",
-                                })
-                              }
-                            >
-                              False positive
-                            </Button>
-                          ) : (
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              color="warning"
-                              disabled={busy || !id}
-                              onClick={() =>
-                                applyHealthMutation.mutate({
-                                  id,
-                                  outcome: "acknowledged",
-                                })
-                              }
-                            >
-                              Mark reviewed
-                            </Button>
-                          )}
-                        </Stack>
-                      </Stack>
-                      <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                        {healthFindingDetail(finding)}
-                      </Typography>
-                      <Box className="metadata-box">
-                        <Stack spacing={0.45}>
-                          <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                            Source: {healthSourceTitle(sourceContext)}
-                            {sourceTime.label !== "-" ? ` - ${sourceTime.label}` : ""}
-                            {sourceChars >= 0 ? ` - ${sourceChars} chars` : ""}
-                            {sourceMessageId ? ` - msg ${sourceMessageId.slice(0, 8)}` : ""}
-                          </Typography>
-                          {sourcePreview ? (
-                            <Typography
-                              variant="body2"
-                              sx={{
-                                color: "text.secondary",
-                                overflowWrap: "anywhere",
-                              }}
-                            >
-                              {sourcePreview}
-                            </Typography>
-                          ) : null}
-                        </Stack>
-                      </Box>
-                      {reviewPatternLabel ? (
-                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                          {reviewPatternLabel}
-                        </Typography>
-                      ) : null}
-                      <Stack
-                        direction="row"
-                        spacing={1}
-                        useFlexGap
-                        sx={{ flexWrap: "wrap", color: "text.secondary" }}
-                      >
-                        {status ? (
-                          <Typography variant="caption">
-                            Status: {tokenLabel(status)}
-                          </Typography>
-                        ) : null}
-                        {captureKind ? (
-                          <Typography variant="caption">
-                            Type: {tokenLabel(captureKind)}
-                          </Typography>
-                        ) : null}
-                        {lastErrorCode ? (
-                          <Typography variant="caption">
-                            Error: {tokenLabel(lastErrorCode)}
-                          </Typography>
-                        ) : null}
-                        {captureEventId ? (
-                          <Typography variant="caption">
-                            Capture: {captureEventId.slice(0, 18)}
-                          </Typography>
-                        ) : null}
-                        <Typography variant="caption" title={created.tip}>
-                          Updated: {created.label}
-                        </Typography>
-                      </Stack>
-                    </Stack>
-                  </Box>
-                );
-              })}
-            </Stack>
-          </AccordionDetails>
-        </Accordion>
+            <Button
+              size="small"
+              variant="outlined"
+              color="warning"
+              onClick={openHealthDetails}
+            >
+              Review findings
+            </Button>
+          </Stack>
+        </Box>
       ) : null}
 
       <Box className="list-shell stat-strip">
@@ -729,6 +568,366 @@ export default function ArkMemoryPage({
           ),
         )}
       </Box>
+
+      <Dialog
+        open={healthDetailsOpen}
+        onClose={() => setHealthDetailsOpen(false)}
+        maxWidth="lg"
+        fullWidth
+      >
+        <DialogTitle>Memory Health</DialogTitle>
+        <DialogContent dividers sx={{ maxHeight: "72vh" }}>
+          <Stack spacing={1}>
+            {healthQ.isLoading ? (
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                Loading memory health details...
+              </Typography>
+            ) : null}
+            {healthQ.error ? (
+              <Alert severity="warning">{errMessage(healthQ.error)}</Alert>
+            ) : null}
+            {!healthQ.isLoading && !healthQ.error && healthFindings.length === 0 ? (
+              <Alert severity="info">
+                No active memory health findings are currently reported.
+              </Alert>
+            ) : null}
+            {visibleHealthFindings.map((finding, index) => {
+              const absoluteIndex = healthStart + index;
+              const id = str(finding.id, `health-${absoluteIndex}`).trim();
+              const captureEventId = str(finding.capture_event_id, "").trim();
+              const status = str(finding.status, "").trim();
+              const findingKind = str(finding.kind, "").trim();
+              const captureKind = str(finding.capture_kind, "").trim();
+              const lastErrorCode = str(finding.last_error_code, "").trim();
+              const review = asRecord(finding.review);
+              const reviewOutcome = str(
+                finding.review_outcome,
+                str(review.outcome, ""),
+              ).trim();
+              const reviewPattern = healthReviewPattern(finding);
+              const reviewPatternLabel = healthReviewPatternLabel(reviewPattern);
+              const sourceContext = healthSourceContext(finding);
+              const sourceTime = humanTs(str(sourceContext.source_message_at, ""));
+              const sourcePreview = str(
+                sourceContext.source_message_preview,
+                "",
+              ).trim();
+              const sourceMessageId = str(
+                sourceContext.source_message_id,
+                "",
+              ).trim();
+              const sourceChars = num(sourceContext.source_message_chars, -1);
+              const isAutoReviewed = findingKind === "auto_reviewed_capture";
+              const canCorrectSensitiveSkip =
+                status === "rejected_sensitive_input" ||
+                toBool(finding.can_correct_sensitive_skip) ||
+                reviewOutcome === "expected_sensitive_skip" ||
+                reviewOutcome === "false_positive_safe_memory";
+              const created = humanTs(str(finding.created_at, ""));
+              const operation = asRecord(finding.operation);
+              const operationId = str(operation.id, str(finding.operation_id, "")).trim();
+              const operationType = str(
+                operation.operation_type,
+                str(finding.operation_type, ""),
+              ).trim();
+              const operationStatus = str(operation.status, status).trim();
+              const operationKey = str(operation.key, "").trim();
+              const operationValue = str(operation.value, "").trim();
+              const operationKind = str(operation.memory_kind, "").trim();
+              const operationScope = str(operation.scope, "").trim();
+              const operationDurability = str(operation.durability, "").trim();
+              const operationRationale = str(operation.rationale, "").trim();
+              const operationConfidence = num(operation.confidence, -1);
+              const evidenceRefs = Array.isArray(operation.evidence_refs)
+                ? operation.evidence_refs
+                    .map((value) => str(value, "").trim())
+                    .filter(Boolean)
+                : [];
+              const hasOperationDetail =
+                operationId ||
+                operationType ||
+                operationKey ||
+                operationValue ||
+                operationKind ||
+                operationScope ||
+                operationDurability ||
+                operationRationale ||
+                evidenceRefs.length > 0;
+              return (
+                <Box
+                  key={id}
+                  className="metadata-box"
+                  sx={{ borderColor: "var(--ui-rgba-255-193-7-180)" }}
+                >
+                  <Stack spacing={0.85}>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      useFlexGap
+                      sx={{
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{ alignItems: "center", flexWrap: "wrap", minWidth: 0 }}
+                      >
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          color={healthSeverityColor(finding.severity)}
+                          label={tokenLabel(finding.severity, "Review")}
+                        />
+                        {isAutoReviewed ? (
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            color="info"
+                            label="Auto-reviewed"
+                          />
+                        ) : null}
+                        {reviewOutcome ? (
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            color="default"
+                            label={tokenLabel(reviewOutcome)}
+                          />
+                        ) : null}
+                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                          {healthFindingTitle(finding, absoluteIndex)}
+                        </Typography>
+                      </Stack>
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{ flexWrap: "wrap", justifyContent: "flex-end" }}
+                      >
+                        {canCorrectSensitiveSkip ? (
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            color="warning"
+                            disabled={busy || !id}
+                            onClick={() =>
+                              applyHealthMutation.mutate({
+                                id,
+                                outcome: "expected_sensitive_skip",
+                              })
+                            }
+                          >
+                            {isAutoReviewed ? "Confirm skip" : "Correct skip"}
+                          </Button>
+                        ) : null}
+                        {canCorrectSensitiveSkip ? (
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            color="warning"
+                            disabled={busy || !id}
+                            onClick={() =>
+                              applyHealthMutation.mutate({
+                                id,
+                                outcome: "false_positive_safe_memory",
+                              })
+                            }
+                          >
+                            False positive
+                          </Button>
+                        ) : (
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            color="warning"
+                            disabled={busy || !id}
+                            onClick={() =>
+                              applyHealthMutation.mutate({
+                                id,
+                                outcome: "acknowledged",
+                              })
+                            }
+                          >
+                            Mark reviewed
+                          </Button>
+                        )}
+                      </Stack>
+                    </Stack>
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                      {healthFindingDetail(finding)}
+                    </Typography>
+                    {hasOperationDetail ? (
+                      <Box className="metadata-box">
+                        <Stack spacing={0.45}>
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "text.secondary", fontWeight: 700 }}
+                          >
+                            Operation
+                          </Typography>
+                          {operationKey || operationValue ? (
+                            <Typography
+                              variant="body2"
+                              sx={{ color: "text.secondary", overflowWrap: "anywhere" }}
+                            >
+                              {operationKey ? `${operationKey}: ` : ""}
+                              {operationValue || "No value recorded."}
+                            </Typography>
+                          ) : null}
+                          <Stack
+                            direction="row"
+                            spacing={1}
+                            useFlexGap
+                            sx={{ flexWrap: "wrap", color: "text.secondary" }}
+                          >
+                            {operationType ? (
+                              <Typography variant="caption">
+                                Type: {tokenLabel(operationType)}
+                              </Typography>
+                            ) : null}
+                            {operationStatus ? (
+                              <Typography variant="caption">
+                                Status: {tokenLabel(operationStatus)}
+                              </Typography>
+                            ) : null}
+                            {operationKind ? (
+                              <Typography variant="caption">
+                                Kind: {tokenLabel(operationKind)}
+                              </Typography>
+                            ) : null}
+                            {operationDurability ? (
+                              <Typography variant="caption">
+                                Durability: {tokenLabel(operationDurability)}
+                              </Typography>
+                            ) : null}
+                            {operationScope ? (
+                              <Typography variant="caption">
+                                Scope: {tokenLabel(operationScope)}
+                              </Typography>
+                            ) : null}
+                            {operationConfidence >= 0 ? (
+                              <Typography variant="caption">
+                                Confidence: {operationConfidence.toFixed(2)}
+                              </Typography>
+                            ) : null}
+                          </Stack>
+                          {operationRationale ? (
+                            <Typography
+                              variant="caption"
+                              sx={{ color: "text.secondary", overflowWrap: "anywhere" }}
+                            >
+                              Reason: {operationRationale}
+                            </Typography>
+                          ) : null}
+                          {operationId || evidenceRefs.length > 0 ? (
+                            <Typography
+                              variant="caption"
+                              sx={{ color: "text.secondary", overflowWrap: "anywhere" }}
+                            >
+                              {operationId ? `Operation: ${operationId}` : ""}
+                              {operationId && evidenceRefs.length > 0 ? " - " : ""}
+                              {evidenceRefs.length > 0
+                                ? `Evidence: ${evidenceRefs.join(", ")}`
+                                : ""}
+                            </Typography>
+                          ) : null}
+                        </Stack>
+                      </Box>
+                    ) : null}
+                    <Box className="metadata-box">
+                      <Stack spacing={0.45}>
+                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                          Source: {healthSourceTitle(sourceContext)}
+                          {sourceTime.label !== "-" ? ` - ${sourceTime.label}` : ""}
+                          {sourceChars >= 0 ? ` - ${sourceChars} chars` : ""}
+                          {sourceMessageId ? ` - msg ${sourceMessageId.slice(0, 8)}` : ""}
+                        </Typography>
+                        {sourcePreview ? (
+                          <Typography
+                            variant="body2"
+                            sx={{
+                              color: "text.secondary",
+                              overflowWrap: "anywhere",
+                            }}
+                          >
+                            {sourcePreview}
+                          </Typography>
+                        ) : null}
+                      </Stack>
+                    </Box>
+                    {reviewPatternLabel ? (
+                      <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                        {reviewPatternLabel}
+                      </Typography>
+                    ) : null}
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      useFlexGap
+                      sx={{ flexWrap: "wrap", color: "text.secondary" }}
+                    >
+                      {status ? (
+                        <Typography variant="caption">
+                          Finding status: {tokenLabel(status)}
+                        </Typography>
+                      ) : null}
+                      {captureKind ? (
+                        <Typography variant="caption">
+                          Capture type: {tokenLabel(captureKind)}
+                        </Typography>
+                      ) : null}
+                      {lastErrorCode ? (
+                        <Typography variant="caption">
+                          Error: {tokenLabel(lastErrorCode)}
+                        </Typography>
+                      ) : null}
+                      {captureEventId ? (
+                        <Typography variant="caption">
+                          Capture: {captureEventId.slice(0, 18)}
+                        </Typography>
+                      ) : null}
+                      <Typography variant="caption" title={created.tip}>
+                        Updated: {created.label}
+                      </Typography>
+                    </Stack>
+                  </Stack>
+                </Box>
+              );
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Typography
+            variant="caption"
+            sx={{ color: "text.secondary", mr: "auto", pl: 1 }}
+          >
+            {healthRangeLabel}
+          </Typography>
+          <Button
+            size="small"
+            disabled={healthDialogPage <= 0}
+            onClick={() => setHealthPage((page) => Math.max(0, page - 1))}
+          >
+            Previous
+          </Button>
+          <Button
+            size="small"
+            disabled={healthDialogPage >= healthPageCount - 1}
+            onClick={() =>
+              setHealthPage((page) => Math.min(healthPageCount - 1, page + 1))
+            }
+          >
+            Next
+          </Button>
+          <Button size="small" onClick={() => setHealthDetailsOpen(false)}>
+            Close
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog
         open={captureDetailsOpen}

@@ -83,8 +83,7 @@ export function WorkingView({
     return () => window.clearTimeout(id);
   }, [copied]);
 
-  const elapsedLabel =
-    persisted ? "saved" : startedAtMs !== null ? formatElapsed(now - startedAtMs) : "...";
+  const elapsedLabel = startedAtMs !== null ? formatElapsed(now - startedAtMs) : "...";
   const assistantContent =
     typeof tokenPreview === "string" && tokenPreview.length > 0
       ? tokenPreview
@@ -156,27 +155,31 @@ export function WorkingView({
         <Typography variant="subtitle1" className="cview-working-label">
           {phaseLabel || "Working..."}
         </Typography>
-        <Typography
-          variant="body2"
-          className="cview-working-elapsed"
-          aria-live="polite"
-        >
-          {elapsedLabel}
-        </Typography>
-        {previewContent ? (
-          <Tooltip title={copied ? "Copied" : "Copy thinking"} placement="top" arrow>
-            <span>
-              <IconButton
-                size="small"
-                className="cview-working-copy"
-                onClick={handleCopyPreview}
-                aria-label="Copy thinking"
-              >
-                <ContentCopyRoundedIcon fontSize="inherit" />
-              </IconButton>
-            </span>
-          </Tooltip>
-        ) : null}
+        <Box className="cview-working-actions">
+          {!persisted ? (
+            <Typography
+              variant="body2"
+              className="cview-working-elapsed"
+              aria-live="polite"
+            >
+              {elapsedLabel}
+            </Typography>
+          ) : null}
+          {previewContent ? (
+            <Tooltip title={copied ? "Copied" : "Copy thinking"} placement="top" arrow>
+              <span>
+                <IconButton
+                  size="small"
+                  className="cview-working-copy"
+                  onClick={handleCopyPreview}
+                  aria-label="Copy thinking"
+                >
+                  <ContentCopyRoundedIcon fontSize="inherit" />
+                </IconButton>
+              </span>
+            </Tooltip>
+          ) : null}
+        </Box>
       </Box>
       {detail ? (
         <Typography variant="body2" className="cview-working-detail">

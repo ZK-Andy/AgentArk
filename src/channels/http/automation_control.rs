@@ -2944,6 +2944,8 @@ pub(super) async fn resume_chat_task_stream(
             message: resume_request.message,
             channel: resume_request.channel,
             conversation_id: Some(resume_request.conversation_id),
+            user_message_already_recorded: true,
+            recorded_user_message_id: None,
             deep_research: resume_request.deep_research,
             plan_confirmation_mode: None,
             arkorbit_context: None,
@@ -3705,14 +3707,14 @@ fn chat_suggestion_execution_focus(suggestion: &ChatAutomationSuggestion) -> Str
 
 async fn choose_watch_poll_action_for_suggestion(
     agent: &Agent,
-    focus: &str,
+    _focus: &str,
 ) -> std::result::Result<String, String> {
     let actions = agent
         .runtime
         .list_enabled_actions()
         .await
         .map_err(|error| format!("Failed to load action catalog: {}", error))?;
-    actions
+    let mut data_sources = actions
         .into_iter()
         .filter(|action| {
             matches!(
@@ -3720,16 +3722,12 @@ async fn choose_watch_poll_action_for_suggestion(
                 crate::actions::PlannerActionRole::DataSource
             )
         })
-        .map(|action| {
-            let score = crate::core::intent::action_intent_score(focus, &action);
-            (score, action)
-        })
-        .max_by(|left, right| {
-            left.0
-                .partial_cmp(&right.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(_, action)| action.name)
+        .collect::<Vec<_>>();
+    data_sources.sort_by(|left, right| left.name.cmp(&right.name));
+    data_sources
+        .into_iter()
+        .next()
+        .map(|action| action.name)
         .ok_or_else(|| "No data-source action is available for watcher polling".to_string())
 }
 

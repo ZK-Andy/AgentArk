@@ -92,6 +92,23 @@ pub(super) fn notification_channel_display_name(channel: &str) -> &str {
     }
 }
 
+pub(super) fn notification_channel_not_connected_outcome(
+    channel: &str,
+) -> NotificationDispatchOutcome {
+    let channel = channel.trim().to_ascii_lowercase();
+    NotificationDispatchOutcome::pre_send_failure(
+        channel.clone(),
+        crate::channels::ChannelError::not_connected(
+            channel.clone(),
+            format!(
+                "{} delivery is not connected",
+                notification_channel_display_name(&channel)
+            ),
+        )
+        .to_string(),
+    )
+}
+
 pub(super) fn inbound_security_source_label(channel: &str) -> String {
     notification_channel_display_name(channel).to_string()
 }
@@ -1232,38 +1249,29 @@ impl Agent {
             .await;
 
         let mut attempts = Vec::new();
-        let external_requested = is_external_notification_channel(&delivery_channel);
-        if external_requested
-            && !self
+        if delivery_channel == "preferred" {
+            attempts.extend(
+                self.notify_preferred_channel_reported_with_hint(&full_message, None, true)
+                    .await,
+            );
+        } else if is_external_notification_channel(&delivery_channel) {
+            if self
                 .notification_channel_is_configured_any(&delivery_channel)
                 .await
-        {
-            attempts.push(NotificationDispatchOutcome::pre_send_failure(
-                delivery_channel.clone(),
-                crate::channels::ChannelError::not_connected(
-                    delivery_channel.clone(),
-                    format!(
-                        "{} delivery is not connected",
-                        notification_channel_display_name(&delivery_channel)
-                    ),
-                )
-                .to_string(),
-            ));
-        }
-
-        if delivery_channel != "web" && delivery_channel != "in_app" {
-            let preferred_hint = if delivery_channel == "preferred" {
-                None
+            {
+                attempts.push(
+                    self.try_send_notification_reported(&delivery_channel, &full_message)
+                        .await,
+                );
             } else {
-                Some(delivery_channel.as_str())
-            };
-            attempts.extend(
-                self.notify_preferred_channel_reported_with_hint(
-                    &full_message,
-                    preferred_hint,
-                    true,
-                )
-                .await,
+                attempts.push(notification_channel_not_connected_outcome(
+                    &delivery_channel,
+                ));
+            }
+        } else if delivery_channel != "web" && delivery_channel != "in_app" {
+            attempts.push(
+                self.try_send_notification_reported(&delivery_channel, &full_message)
+                    .await,
             );
         }
 

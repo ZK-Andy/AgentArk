@@ -36,6 +36,7 @@ mod security;
 mod sentinel;
 mod storage;
 mod workspace;
+pub(crate) mod router;
 
 #[cfg(feature = "gui")]
 mod gui;
@@ -297,11 +298,11 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         direct_user_intent: true,
         routing: None,
         routing_trusted: false,
-        intent_plan: None,
         force_agent_loop: false,
         secret_offered: None,
         attachments: Vec::new(),
         saved_user_facts_context: None,
+        recorded_user_message_id: None,
         arkorbit_context: None,
         accepted_suggestion_context: None,
     }

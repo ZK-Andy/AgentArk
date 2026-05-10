@@ -26,6 +26,12 @@ type ApprovalCard = {
   riskScore: string;
   source: string;
   createdAt: string;
+  steps: ApprovalStep[];
+};
+
+type ApprovalStep = {
+  title: string;
+  detail: string;
 };
 
 type Props = {
@@ -49,6 +55,25 @@ function str(value: unknown, fallback = ""): string {
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return fallback;
+}
+
+function approvalSteps(value: unknown): ApprovalStep[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      const record = asRecord(item);
+      const title = str(
+        record.title,
+        str(record.action_name, str(record.actionName, "")),
+      ).trim();
+      if (!title) return null;
+      const detail = str(
+        record.summary,
+        str(record.reason, str(record.description, "")),
+      ).trim();
+      return { title, detail };
+    })
+    .filter((step): step is ApprovalStep => Boolean(step));
 }
 
 function normalizeTaskStatus(status: unknown): string {
@@ -87,7 +112,8 @@ function buildApprovalCard(task: ApprovalTask): ApprovalCard | null {
     riskLevel: str(approval.risk_level, "").trim(),
     riskScore,
     source: str(approval.source, "").trim(),
-    createdAt: str(task.created_at, "").trim()
+    createdAt: str(task.created_at, "").trim(),
+    steps: approvalSteps(approval.steps)
   };
 }
 
@@ -259,6 +285,33 @@ export function ApprovalPromptOverlay({
             <Typography variant="caption" sx={{ mt: 1, display: "block", color: "var(--ui-rgba-255-215-167-720)" }}>
               Why it asked: {activeApproval.reason}
             </Typography>
+          ) : null}
+          {activeApproval.steps.length > 0 ? (
+            <Box
+              sx={{
+                mt: 1,
+                borderTop: "1px solid var(--ui-rgba-255-255-255-080)",
+                pt: 1
+              }}
+            >
+              <Typography variant="caption" sx={{ color: "var(--ui-rgba-255-219-174-720)" }}>
+                Steps
+              </Typography>
+              <Stack spacing={0.45} sx={{ mt: 0.5 }}>
+                {activeApproval.steps.map((step, index) => (
+                  <Box key={`${activeApproval.id}-step-${index}`}>
+                    <Typography variant="caption" sx={{ display: "block", color: "var(--ui-rgba-241-248-255-900)" }}>
+                      {index + 1}. {step.title}
+                    </Typography>
+                    {step.detail ? (
+                      <Typography variant="caption" sx={{ display: "block", color: "var(--ui-rgba-210-223-242-700)" }}>
+                        {step.detail}
+                      </Typography>
+                    ) : null}
+                  </Box>
+                ))}
+              </Stack>
+            </Box>
           ) : null}
         </Box>
 

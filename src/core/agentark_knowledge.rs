@@ -582,7 +582,7 @@ fn build_runtime_action_catalog_docs(actions: &[ActionDef]) -> Vec<SeedKnowledge
     let chunk_size = 16;
     for (idx, chunk) in sorted.chunks(chunk_size).enumerate() {
         let mut content = format!(
-            "Live AgentArk capability registry snapshot. If an action appears here, this {} instance can use it when the request matches and required credentials/config are present. This registry is authoritative for current capability availability; curated manual docs are supplemental explanation only.\n\n",
+            "Live AgentArk capability registry snapshot. If an action appears here, this {} instance can use it when the request matches. Required credentials/config for listed actions have already been satisfied for this snapshot. This registry is authoritative for current capability availability; curated manual docs are supplemental explanation only.\n\n",
             crate::branding::PRODUCT_NAME,
         );
         for action in chunk {
@@ -593,7 +593,7 @@ fn build_runtime_action_catalog_docs(actions: &[ActionDef]) -> Vec<SeedKnowledge
             };
             let metadata = action.planner_metadata();
             let auth = if metadata.requires_auth || action.authorization.requires_auth {
-                "requires auth/config"
+                "auth/config satisfied"
             } else {
                 "no explicit auth"
             };

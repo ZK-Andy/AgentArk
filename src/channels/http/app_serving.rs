@@ -938,6 +938,30 @@ pub(super) fn app_origin_request_allowed(
     has_proxy_header || referer_ok
 }
 
+pub(super) fn app_runtime_action_allowed_by_meta(
+    meta: &serde_json::Value,
+    action_name: &str,
+) -> bool {
+    crate::actions::app::parse_runtime_actions(meta)
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(action_name))
+}
+
+pub(super) fn app_runtime_action_is_bridge_safe(action: &crate::actions::ActionDef) -> bool {
+    let metadata = action.planner_metadata();
+    matches!(
+        metadata.role,
+        crate::actions::PlannerActionRole::DataSource
+            | crate::actions::PlannerActionRole::Inspection
+    ) && matches!(
+        metadata.side_effect_level,
+        crate::actions::PlannerSideEffectLevel::None
+    ) && action.authorization.outbound.read_only
+        && !action.authorization.outbound.outbound_write
+        && !action.authorization.outbound.public_publish
+        && !action.authorization.human_approval.required
+}
+
 pub(super) fn collapse_inline_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -2215,6 +2239,161 @@ pub(super) async fn app_scoped_llm_chat_proxy(
         .into_response()
 }
 
+pub(super) async fn app_scoped_runtime_action_proxy(
+    state: &AppState,
+    app_id: &str,
+    app_dir: &FsPath,
+    action_name: &str,
+    headers: &axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    if state.server_role == HttpServerRole::PublicApps {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "App runtime actions are available only from the local app surface."
+            })),
+        )
+            .into_response();
+    }
+    if !app_origin_request_allowed(headers, app_id, "action") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "app-scoped action proxy requires app-origin request context"
+            })),
+        )
+            .into_response();
+    }
+    let action_name = action_name.trim();
+    if action_name.is_empty()
+        || action_name.len() > 160
+        || action_name.contains('/')
+        || action_name.contains('\\')
+        || action_name.chars().any(char::is_control)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid_action" })),
+        )
+            .into_response();
+    }
+
+    let meta = match tokio::fs::read(app_dir.join(".app_meta.json")).await {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    };
+    if !app_runtime_action_allowed_by_meta(&meta, action_name) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "action_not_allowed_for_app",
+                "message": "This app did not declare access to the requested runtime action."
+            })),
+        )
+            .into_response();
+    }
+
+    let body_bytes = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response();
+        }
+    };
+    let payload: serde_json::Value = if body_bytes.is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_slice(&body_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "invalid JSON payload" })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let arguments = payload
+        .get("arguments")
+        .or_else(|| payload.get("args"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let action_def = {
+        let agent = state.agent.read().await;
+        agent.runtime.action_definition(action_name).await
+    };
+    let Some(action_def) = action_def else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown_action" })),
+        )
+            .into_response();
+    };
+    if !app_runtime_action_is_bridge_safe(&action_def) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "action_not_app_safe",
+                "message": "Only registered read-only runtime actions can be called from an app."
+            })),
+        )
+            .into_response();
+    }
+
+    let auth_context = crate::actions::ActionAuthorizationContext {
+        principal: Some(crate::actions::ActionCallerPrincipal::local_admin(
+            "app_runtime_action_proxy",
+        )),
+        surface: crate::actions::ActionExecutionSurface::Api,
+        direct_user_intent: false,
+        current_turn_is_explicit_approval: false,
+        agent_name: Some(format!("app:{}", app_id)),
+        agent_access_scope: None,
+        capability_context_id: Some(format!("app:{}", app_id)),
+    };
+    let output = {
+        let agent = state.agent.read().await;
+        agent
+            .runtime
+            .execute_action_with_context(action_name, &arguments, &auth_context)
+            .await
+    };
+
+    match output {
+        Ok(output) => {
+            let result = serde_json::from_str::<serde_json::Value>(&output)
+                .unwrap_or_else(|_| serde_json::json!({ "text": output }));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "action": action_name,
+                    "result": result
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "status": "error",
+                "action": action_name,
+                "error": error.to_string()
+            })),
+        )
+            .into_response(),
+    }
+}
+
 pub(super) fn is_local_or_private_host_for_upgrade(host: &str) -> bool {
     let h = host
         .trim()
@@ -3030,6 +3209,15 @@ pub(super) async fn serve_app_file_inner(
         return app_scoped_arxiv_search_proxy(state, app_id, &headers, clean_query.as_deref())
             .await;
     }
+    if let Some(action_name) = normalized_path.strip_prefix("__agentark/actions/") {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        return app_scoped_runtime_action_proxy(
+            state, app_id, &app_dir, action_name, &headers, body,
+        )
+        .await;
+    }
 
     let body_bytes = if is_ws_request {
         None
@@ -3718,6 +3906,62 @@ mod tests {
         assert!(rewritten.contains("APP_BASE_PATH"));
         assert!(rewritten.contains("rebaseSameOriginAppUrl"));
         assert!(rewritten.contains("fetch('/api/papers')"));
+    }
+
+    #[test]
+    fn app_runtime_action_bridge_uses_declared_action_allowlist() {
+        let meta = serde_json::json!({
+            "runtime_actions": [
+                "google_drive_search",
+                { "action": "api__reports__get-summary" }
+            ]
+        });
+
+        assert!(app_runtime_action_allowed_by_meta(
+            &meta,
+            "google_drive_search"
+        ));
+        assert!(app_runtime_action_allowed_by_meta(
+            &meta,
+            "api__reports__get-summary"
+        ));
+        assert!(!app_runtime_action_allowed_by_meta(&meta, "notify_user"));
+    }
+
+    #[test]
+    fn app_runtime_action_bridge_allows_only_read_only_data_actions() {
+        let mut read_action = crate::actions::ActionDef {
+            name: "google_drive_search".to_string(),
+            capabilities: vec!["google_workspace".to_string()],
+            authorization: crate::actions::ActionAuthorization {
+                outbound: crate::actions::ActionEgressPolicy {
+                    read_only: true,
+                    outbound_write: false,
+                    public_publish: false,
+                },
+                ..crate::actions::ActionAuthorization::default()
+            },
+            ..crate::actions::ActionDef::default()
+        };
+        assert!(app_runtime_action_is_bridge_safe(&read_action));
+
+        read_action.authorization.outbound.read_only = false;
+        assert!(!app_runtime_action_is_bridge_safe(&read_action));
+
+        let write_action = crate::actions::ActionDef {
+            name: "notify_user".to_string(),
+            capabilities: vec!["notify".to_string()],
+            authorization: crate::actions::ActionAuthorization {
+                outbound: crate::actions::ActionEgressPolicy {
+                    read_only: false,
+                    outbound_write: true,
+                    public_publish: false,
+                },
+                ..crate::actions::ActionAuthorization::default()
+            },
+            ..crate::actions::ActionDef::default()
+        };
+        assert!(!app_runtime_action_is_bridge_safe(&write_action));
     }
 }
 

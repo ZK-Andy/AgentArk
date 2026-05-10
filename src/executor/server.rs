@@ -712,7 +712,11 @@ async fn collect_stack_memory_stats() -> Result<StackMemoryStatsResponse> {
     let mut containers = Vec::new();
     let mut total_used = 0_u64;
     let mut memory_total = None::<u64>;
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         let row: DockerStatsRow =
             serde_json::from_str(line).context("Failed to decode docker stats JSON")?;
         if !container_names.iter().any(|name| name == &row.name) {
@@ -808,7 +812,9 @@ fn stack_memory_container_names() -> Vec<String> {
 fn parse_docker_memory_usage(value: &str) -> Option<(u64, Option<u64>)> {
     let mut parts = value.split('/');
     let used = parse_docker_size_bytes(parts.next()?.trim())?;
-    let limit = parts.next().and_then(|part| parse_docker_size_bytes(part.trim()));
+    let limit = parts
+        .next()
+        .and_then(|part| parse_docker_size_bytes(part.trim()));
     Some((used, limit))
 }
 

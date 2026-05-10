@@ -83,13 +83,20 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 # parallelism, or a higher number on stronger machines.
 ARG AGENTARK_BUILD_JOBS=2
 
+# Cargo profile to build with. Defaults to "release" for published images.
+# docker-compose.dev.yml overrides this to "dev-fast" so local dev rebuilds
+# skip fat-LTO and reuse incremental fingerprints. Profile name == target
+# subdirectory (cargo special-cases "release"; "dev-fast" lives at
+# target/dev-fast/...).
+ARG AGENTARK_BUILD_PROFILE=release
+
 # Build dependencies with cache mount (survives across docker builds)
 RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
-        cargo build --release; \
+        cargo build --profile "${AGENTARK_BUILD_PROFILE}"; \
     else \
-        cargo build --release -j "${AGENTARK_BUILD_JOBS}"; \
+        cargo build --profile "${AGENTARK_BUILD_PROFILE}" -j "${AGENTARK_BUILD_JOBS}"; \
     fi && \
     rm -rf src
 
@@ -99,27 +106,27 @@ ARG CACHEBUST=0
 COPY src ./src
 COPY assets ./assets
 
-# Build for release with cache mount, then copy binary out of cache.
-# We rely on cargo's fingerprint system (target/release/.fingerprint) to detect
-# source changes via the mtimes preserved by `COPY src ./src` above. Do not
-# wipe target/release/agentark or target/release/deps/agentark-* before the
-# build: that forces a full re-link on every rebuild and discards incremental
-# work that the cache mount is specifically there to preserve. After the build,
-# we assert the produced binary is at least as new as any src/ file so a
-# silently-skipped rebuild can't ship stale code.
+# Build the selected Cargo profile with cache mount, then copy binaries out of
+# cache. We rely on cargo's fingerprint system in target/<profile>/.fingerprint
+# to detect source changes via the mtimes preserved by `COPY src ./src` above.
+# Do not wipe target/<profile>/agentark or target/<profile>/deps/agentark-*
+# before the build: that forces a full re-link on every rebuild and discards
+# incremental work that the cache mount is specifically there to preserve.
+# After the build, we assert the produced binary is at least as new as any src/
+# file so a silently-skipped rebuild can't ship stale code.
 RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
-        cargo build --release --bins; \
+        cargo build --profile "${AGENTARK_BUILD_PROFILE}" --bins; \
     else \
-        cargo build --release --bins -j "${AGENTARK_BUILD_JOBS}"; \
+        cargo build --profile "${AGENTARK_BUILD_PROFILE}" --bins -j "${AGENTARK_BUILD_JOBS}"; \
     fi && \
-    if find src -type f -newer target/release/agentark -print -quit | grep -q .; then \
-        echo "ERROR: src/ files newer than target/release/agentark after build; aborting" >&2; \
+    if find src -type f -newer "target/${AGENTARK_BUILD_PROFILE}/agentark" -print -quit | grep -q .; then \
+        echo "ERROR: src/ files newer than target/${AGENTARK_BUILD_PROFILE}/agentark after build; aborting" >&2; \
         exit 1; \
     fi && \
-    cp target/release/agentark /app/agentark-bin && \
-    cp target/release/agentark_embed_server /app/agentark-embed-server-bin
+    cp "target/${AGENTARK_BUILD_PROFILE}/agentark" /app/agentark-bin && \
+    cp "target/${AGENTARK_BUILD_PROFILE}/agentark_embed_server" /app/agentark-embed-server-bin
 
 # Preload the default local embedding model for published/prebuilt images.
 # Runtime still falls back to /app/data/embeddings-cache when this cache is not present.
@@ -129,7 +136,7 @@ RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-local-embeddings-cache,target=/tmp/agentark-embeddings-cache \
     mkdir -p /app/prebuilt-embeddings-cache /tmp/agentark-embeddings-cache && \
     if [ "${AGENTARK_PREFETCH_LOCAL_EMBEDDINGS}" = "true" ]; then \
-        target/release/prefetch_embeddings /tmp/agentark-embeddings-cache && \
+        "target/${AGENTARK_BUILD_PROFILE}/prefetch_embeddings" /tmp/agentark-embeddings-cache && \
         cp -a /tmp/agentark-embeddings-cache/. /app/prebuilt-embeddings-cache/; \
     else \
         mkdir -p /app/prebuilt-embeddings-cache; \
