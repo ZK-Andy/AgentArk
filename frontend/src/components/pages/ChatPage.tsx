@@ -3558,7 +3558,9 @@ function agentLoopProgressPresentation(
   const titleFromPayload = str(payload.title, "").trim();
   const titleByPhase: Record<string, string> = {
     context: "Preparing context",
+    capability_state: "Checking capabilities",
     turn_plan: "Preparing turn plan",
+    route_decision: "Routing request",
     intent_plan: "Preparing intent plan",
     action_scope: "Selecting actions",
     model_call: "Calling model",
@@ -20229,21 +20231,21 @@ function ChatPageInner({
         gridTemplateColumns: {
           xs: "1fr",
           md: showConversationSidebarInline
-            ? "clamp(190px, 18vw, 220px) minmax(0,1fr)"
+            ? "clamp(288px, 24vw, 340px) minmax(0,1fr)"
             : "1fr",
           lg: showWorkspacePanelInline
             ? showConversationSidebarInline
-              ? "clamp(188px, 13vw, 220px) minmax(0,1fr) clamp(420px, 32vw, 640px)"
+              ? "clamp(288px, 17vw, 336px) minmax(0,1fr) clamp(420px, 32vw, 640px)"
               : "minmax(0,1fr) clamp(460px, 38vw, 720px)"
             : showConversationSidebarInline
-              ? "clamp(192px, 13vw, 224px) minmax(0,1fr)"
+              ? "clamp(296px, 20vw, 344px) minmax(0,1fr)"
               : "minmax(0,1fr)",
           xl: showWorkspacePanelInline
             ? showConversationSidebarInline
-              ? "clamp(192px, 12.5vw, 224px) minmax(0,1fr) clamp(480px, 34vw, 700px)"
+              ? "clamp(300px, 17.5vw, 348px) minmax(0,1fr) clamp(480px, 34vw, 700px)"
               : "minmax(0,1fr) clamp(520px, 40vw, 780px)"
             : showConversationSidebarInline
-              ? "clamp(196px, 12.5vw, 228px) minmax(0,1fr)"
+              ? "clamp(304px, 18vw, 360px) minmax(0,1fr)"
               : "minmax(0,1fr)",
         },
         gap: { xs: 1, md: 1.15 },

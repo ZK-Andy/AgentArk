@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -544,6 +544,7 @@ pub(super) async fn build_semantic_turn_bundle(
     active_workspace_snapshot: Option<&serde_json::Value>,
     context_ledger: &super::context_ledger::ConversationContextLedger,
     capability_snapshot: Option<&CapabilitySnapshot>,
+    capability_health: Option<&super::capability_health::CapabilityHealthSnapshot>,
     request_hints: &RequestExecutionHints,
 ) -> SemanticTurnBundle {
     let plan_result = build_semantic_turn_plan(
@@ -558,11 +559,13 @@ pub(super) async fn build_semantic_turn_bundle(
         watchers,
         active_workspace_snapshot,
         context_ledger,
+        capability_snapshot,
+        capability_health,
         request_hints,
     )
     .await;
 
-    let (plan, planner_degraded, planner_error) = match plan_result {
+    let (mut plan, mut planner_degraded, mut planner_error) = match plan_result {
         Ok(plan) => (normalize_turn_plan(plan), false, None),
         Err(error) => (
             fallback_turn_plan(message),
@@ -570,11 +573,19 @@ pub(super) async fn build_semantic_turn_bundle(
             Some(safe_truncate(&error.to_string(), 500)),
         ),
     };
+    if plan.clarification_needed && plan.requires_secret_sidecar && capability_snapshot.is_some() {
+        plan = fallback_turn_plan(message);
+        planner_degraded = true;
+        planner_error = Some(
+            "semantic planner requested secret-sidecar clarification before executable capability validation; using capability resolver so the tool layer can verify current readiness"
+                .to_string(),
+        );
+    }
     let verification = verify_turn_plan(&plan);
     let resolved_steps = if plan_can_respond_without_tools(&plan) {
         direct_response_resolved_steps(&plan)
     } else if let Some(capability_snapshot) = capability_snapshot {
-        resolve_capabilities(agent, &plan, capability_snapshot, None).await
+        resolve_capabilities(agent, &plan, capability_snapshot, capability_health).await
     } else {
         Vec::new()
     };
@@ -715,6 +726,8 @@ async fn build_semantic_turn_plan(
     watchers: &[crate::core::watcher::Watcher],
     active_workspace_snapshot: Option<&serde_json::Value>,
     context_ledger: &super::context_ledger::ConversationContextLedger,
+    capability_snapshot: Option<&CapabilitySnapshot>,
+    capability_health: Option<&super::capability_health::CapabilityHealthSnapshot>,
     request_hints: &RequestExecutionHints,
 ) -> anyhow::Result<SemanticTurnPlan> {
     let response = agent
@@ -735,6 +748,8 @@ async fn build_semantic_turn_plan(
                 watchers,
                 active_workspace_snapshot,
                 context_ledger,
+                capability_snapshot,
+                capability_health,
                 request_hints,
             ),
             &[],
@@ -762,7 +777,8 @@ Do not choose exact tool names. Emit semantic goals with capability_need, side_e
 For ordinary conversation, explanation, planning, review, or advice that does not require live/private state, durable side effects, or an external lookup, use side_effect=none, freshness=none, delivery=chat, authorization=none.
 Separate examples, transcripts, and background text from actual requested outcomes when the current turn makes that distinction.
 If a required detail blocks a specific outcome, set clarification_needed=true, goals=[], and ask only for the missing detail.
-Secrets must be represented only through requires_secret_sidecar=true and authorization=secret_sidecar; never reproduce secret values."#,
+Use current capability state when provided. Do not ask the user to connect, authenticate, or provide credentials for a requested surface when the capability state says the matching channel, integration, or action class is already ready/configured. In that case emit an executable semantic goal and let the tool layer validate the live preconditions.
+Secrets must be represented only through requires_secret_sidecar=true and authorization=secret_sidecar; never reproduce secret values. Secret-sidecar is for missing or newly requested credentials, not for using an already configured capability."#,
         product = crate::branding::PRODUCT_NAME
     )
 }
@@ -778,6 +794,8 @@ fn semantic_turn_planner_user_prompt(
     watchers: &[crate::core::watcher::Watcher],
     active_workspace_snapshot: Option<&serde_json::Value>,
     context_ledger: &super::context_ledger::ConversationContextLedger,
+    capability_snapshot: Option<&CapabilitySnapshot>,
+    capability_health: Option<&super::capability_health::CapabilityHealthSnapshot>,
     request_hints: &RequestExecutionHints,
 ) -> String {
     let recent_messages = packed_context
@@ -838,6 +856,7 @@ fn semantic_turn_planner_user_prompt(
             "recent_messages": recent_messages,
             "compacted_messages": packed_context.compacted_messages,
         },
+        "capability_state": capability_state_for_planner(capability_snapshot, capability_health),
         "runtime_state": {
             "pending_actions": pending_actions.iter().take(8).map(|action| serde_json::json!({
                 "kind": action.kind.as_pending_action_kind(),
@@ -864,6 +883,78 @@ fn semantic_turn_planner_user_prompt(
         }
     })
     .to_string()
+}
+
+fn capability_state_for_planner(
+    capability_snapshot: Option<&CapabilitySnapshot>,
+    capability_health: Option<&super::capability_health::CapabilityHealthSnapshot>,
+) -> serde_json::Value {
+    let Some(snapshot) = capability_snapshot else {
+        return serde_json::json!({
+            "available": false,
+            "policy": "Capability state was not loaded for this planning pass. Prefer executable goals and let the tool layer validate readiness instead of assuming setup is missing.",
+        });
+    };
+    let mut by_class = BTreeMap::<String, Vec<String>>::new();
+    let mut by_role = BTreeMap::<String, Vec<String>>::new();
+    let mut ready_actions = Vec::new();
+    let mut unready_examples = Vec::new();
+    for action in snapshot.actions.iter() {
+        let metadata = action.action_metadata();
+        let readiness = capability_health
+            .and_then(|health| health.entry(&action.name))
+            .map(|entry| entry.readiness.clone())
+            .unwrap_or(super::capability_health::CapabilityReadiness::Unknown);
+        let readiness_text = format!("{:?}", readiness).to_ascii_lowercase();
+        let class = format!("{:?}", metadata.integration_class).to_ascii_lowercase();
+        let role = format!("{:?}", metadata.role).to_ascii_lowercase();
+        if matches!(
+            &readiness,
+            super::capability_health::CapabilityReadiness::Ready
+                | super::capability_health::CapabilityReadiness::Degraded
+                | super::capability_health::CapabilityReadiness::Unknown
+        ) {
+            if by_class.get(&class).map_or(0, Vec::len) < 12 {
+                by_class.entry(class).or_default().push(action.name.clone());
+            }
+            if by_role.get(&role).map_or(0, Vec::len) < 12 {
+                by_role.entry(role).or_default().push(action.name.clone());
+            }
+            if ready_actions.len() < 24 {
+                ready_actions.push(serde_json::json!({
+                    "action": &action.name,
+                    "class": format!("{:?}", metadata.integration_class).to_ascii_lowercase(),
+                    "role": format!("{:?}", metadata.role).to_ascii_lowercase(),
+                    "readiness": readiness_text,
+                }));
+            }
+        } else if unready_examples.len() < 24 {
+            let entry = capability_health.and_then(|health| health.entry(&action.name));
+            unready_examples.push(serde_json::json!({
+                "action": &action.name,
+                "class": format!("{:?}", metadata.integration_class).to_ascii_lowercase(),
+                "role": format!("{:?}", metadata.role).to_ascii_lowercase(),
+                "readiness": readiness_text,
+                "missing_setup": entry
+                    .map(|entry| entry.missing_setup.iter().take(4).cloned().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            }));
+        }
+    }
+    serde_json::json!({
+        "available": true,
+        "policy": "This is current runtime readiness evidence. If a requested capability/channel/integration appears ready or configured here, plan to use it rather than asking the user to provide setup. If it appears auth/setup required, ask for the missing setup only when no alternative ready capability can satisfy the outcome.",
+        "snapshot": {
+            "generated_at": snapshot.generated_at.to_rfc3339(),
+            "cache_hit": snapshot.cache_hit,
+            "actions": snapshot.actions.len(),
+        },
+        "health": capability_health.map(|health| health.summary_for_prompt()),
+        "ready_actions_sample": ready_actions,
+        "ready_by_integration_class": by_class,
+        "ready_by_role": by_role,
+        "unready_examples": unready_examples,
+    })
 }
 
 fn normalize_turn_plan(mut plan: SemanticTurnPlan) -> SemanticTurnPlan {

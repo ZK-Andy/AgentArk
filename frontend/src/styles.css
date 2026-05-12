@@ -1879,7 +1879,7 @@ body {
 
 .chat-sidebar {
   border-radius: var(--surface-radius);
-  padding: 8px 8px 6px;
+  padding: 12px 12px 8px;
 }
 
 .chat-main-column {
@@ -7645,16 +7645,16 @@ body {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   overflow-y: auto;
-  padding: 4px 4px 8px 0;
+  padding: 4px 2px 8px 0;
 }
 
 .conversation-group {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-bottom: 12px;
+  gap: 10px;
+  margin-bottom: 14px;
 }
 
 .conversation-group-label {
@@ -7662,21 +7662,25 @@ body {
   padding: 0 6px;
   letter-spacing: 0;
   text-transform: uppercase;
-  color: var(--ui-rgba-176-181-189-640);
+  color: var(--ui-rgba-198-202-210-780);
+  font-size: 0.68rem !important;
+  font-weight: 600 !important;
 }
 
 .conversation-card {
   border-radius: 8px;
   border: 1px solid transparent;
   background: transparent;
-  padding: 8px 10px;
+  padding: 9px 8px;
+  min-height: 44px;
   cursor: pointer;
-  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+  transition: background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease, color 0.16s ease;
 }
 
 .conversation-card.active {
-  background: var(--ui-rgba-255-255-255-050);
-  border-color: var(--ui-rgba-255-255-255-100);
+  background: var(--ui-rgba-255-255-255-070);
+  border-color: var(--ui-rgba-255-255-255-140);
+  box-shadow: inset 2px 0 0 var(--teal), 0 0 0 1px var(--ui-rgba-57-208-255-045);
 }
 
 .conversation-card.conversation-card-starred {
@@ -7685,15 +7689,15 @@ body {
 }
 
 .conversation-card:hover {
-  background: var(--ui-rgba-255-255-255-035);
-  border-color: var(--ui-rgba-255-255-255-080);
+  background: var(--ui-rgba-255-255-255-055);
+  border-color: var(--ui-rgba-255-255-255-120);
 }
 
 .conversation-card-title {
-  font-weight: 500;
-  font-size: 0.84rem;
-  color: var(--ui-rgba-244-245-247-940);
-  line-height: 1.34;
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--ui-rgba-244-245-247-960);
+  line-height: 1.28;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -7709,12 +7713,12 @@ body {
    an AgentArk-green spinner; idle rows show a low-contrast dot that
    takes on the active accent when the card is the current chat. */
 .conversation-card-status {
-  flex: 0 0 18px;
-  width: 18px;
-  height: 18px;
+  flex: 0 0 14px;
+  width: 14px;
+  height: 20px;
   display: grid;
   place-items: center;
-  color: var(--ui-rgba-198-202-210-380);
+  color: var(--ui-rgba-198-202-210-500);
   transition: color 0.16s ease;
 }
 
@@ -7728,11 +7732,11 @@ body {
 }
 
 .conversation-card-status-dot {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
   border-radius: 999px;
   background: currentColor;
-  opacity: 0.55;
+  opacity: 0.7;
 }
 
 .conversation-card.active .conversation-card-status-dot {
@@ -7752,13 +7756,19 @@ body {
 
 .conversation-card-menu {
   color: var(--ui-rgba-198-202-210-780) !important;
-  opacity: 0.35;
+  opacity: 0.3;
+  width: 28px;
+  height: 28px;
+  padding: 4px !important;
   transition: opacity 0.14s ease;
 }
 
 .conversation-card-star-btn {
   color: var(--ui-rgba-198-202-210-720) !important;
-  opacity: 0.35;
+  opacity: 0.3;
+  width: 28px;
+  height: 28px;
+  padding: 4px !important;
   transition: opacity 0.14s ease, color 0.14s ease !important;
 }
 
@@ -7777,13 +7787,14 @@ body {
 }
 
 .conversation-page-indicator {
-  color: var(--ui-rgba-171-176-184-720);
+  color: var(--ui-rgba-198-202-210-760);
   letter-spacing: 0;
-  font-size: 0.68rem !important;
+  font-size: 0.72rem !important;
 }
 
 .conversation-pagination-copy {
-  color: var(--ui-rgba-171-176-184-720);
+  color: var(--ui-rgba-198-202-210-760);
+  font-size: 0.72rem !important;
 }
 
 .chat-messages {
@@ -12010,6 +12021,13 @@ select,
 
 .MuiDrawer-paper.chat-mobile-drawer-right {
   width: min(92vw, 720px) !important;
+  max-width: 100vw !important;
+  height: 100dvh !important;
+  overflow: hidden !important;
+}
+
+.MuiDrawer-paper.chat-mobile-drawer-left {
+  width: min(88vw, 340px) !important;
   max-width: 100vw !important;
   height: 100dvh !important;
   overflow: hidden !important;

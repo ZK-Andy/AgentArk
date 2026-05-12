@@ -99,6 +99,112 @@ pub(super) async fn run(
         "context",
         "Preparing context and semantic plan...",
     );
+    emit_tool_loop_progress(
+        stream_tx.as_ref(),
+        "capability_state",
+        "Loading current capability and integration readiness...",
+    );
+    let planning_capability_snapshot = match agent.load_capability_snapshot().await {
+        Ok(snapshot) => {
+            emit_tool_loop_progress_with_data(
+                stream_tx.as_ref(),
+                "capability_state",
+                "Loaded capability registry.",
+                serde_json::json!({
+                    "status": "loaded",
+                    "snapshot": snapshot.trace_payload(),
+                }),
+            );
+            emit_reasoning_summary(
+                stream_tx.as_ref(),
+                "capability_summary",
+                format!(
+                    "Capability registry loaded with {} enabled action(s); cache_hit={}.",
+                    snapshot.actions.len(),
+                    snapshot.cache_hit
+                ),
+                false,
+            );
+            Some(snapshot)
+        }
+        Err(error) => {
+            emit_tool_loop_progress_with_data(
+                stream_tx.as_ref(),
+                "capability_state",
+                "Capability registry was not available for this planning pass.",
+                serde_json::json!({
+                    "status": "degraded",
+                    "error": safe_truncate(&error.to_string(), 500),
+                }),
+            );
+            emit_reasoning_summary(
+                stream_tx.as_ref(),
+                "capability_summary",
+                format!(
+                    "Capability registry unavailable for this planning pass: {}.",
+                    safe_truncate(&error.to_string(), 240)
+                ),
+                true,
+            );
+            None
+        }
+    };
+    let planning_capability_health = match planning_capability_snapshot.as_ref() {
+        Some(snapshot) => match agent.load_capability_health_snapshot(snapshot).await {
+            Ok(health) => {
+                emit_tool_loop_progress_with_data(
+                    stream_tx.as_ref(),
+                    "capability_state",
+                    "Loaded capability health.",
+                    serde_json::json!({
+                        "status": "loaded",
+                        "health": health.summary_for_prompt(),
+                    }),
+                );
+                emit_reasoning_summary(
+                    stream_tx.as_ref(),
+                    "capability_summary",
+                    format!(
+                        "Capability health loaded. Configured notification channels: {}.",
+                        health
+                            .summary_for_prompt()
+                            .get("configured_notification_channels")
+                            .and_then(|value| serde_json::to_string(value).ok())
+                            .unwrap_or_else(|| "[]".to_string())
+                    ),
+                    true,
+                );
+                Some(health)
+            }
+            Err(error) => {
+                emit_tool_loop_progress_with_data(
+                    stream_tx.as_ref(),
+                    "capability_state",
+                    "Capability health was not available for this planning pass.",
+                    serde_json::json!({
+                        "status": "degraded",
+                        "error": safe_truncate(&error.to_string(), 500),
+                    }),
+                );
+                emit_reasoning_summary(
+                    stream_tx.as_ref(),
+                    "capability_summary",
+                    format!(
+                        "Capability health unavailable for this planning pass: {}.",
+                        safe_truncate(&error.to_string(), 240)
+                    ),
+                    true,
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    emit_tool_loop_progress(
+        stream_tx.as_ref(),
+        "turn_plan",
+        "Building semantic turn plan...",
+    );
     let mut semantic_turn = super::semantic_turn::build_semantic_turn_bundle(
         agent,
         channel,
@@ -111,11 +217,38 @@ pub(super) async fn run(
         &watchers,
         active_workspace_snapshot.as_ref(),
         &context_ledger,
-        None,
+        planning_capability_snapshot.as_ref(),
+        planning_capability_health.as_ref(),
         &request_hints,
     )
     .await;
     let execution_policy = turn_execution_policy(&semantic_turn);
+    emit_tool_loop_progress_with_data(
+        stream_tx.as_ref(),
+        "turn_plan",
+        "Semantic turn plan ready.",
+        serde_json::json!({
+            "status": if semantic_turn.verification.accepted { "accepted" } else { "needs_repair" },
+            "summary": safe_truncate(&semantic_turn.plan.turn_summary, 400),
+            "goal_count": semantic_turn.plan.goals.len(),
+            "clarification_needed": semantic_turn.plan.clarification_needed,
+            "requires_secret_sidecar": semantic_turn.plan.requires_secret_sidecar,
+            "verification": &semantic_turn.verification,
+            "resolved_steps": &semantic_turn.resolved_steps,
+        }),
+    );
+    emit_reasoning_summary(
+        stream_tx.as_ref(),
+        "planner_summary",
+        format!(
+            "Semantic plan: {} goal(s), clarification_needed={}, secret_sidecar={}, accepted={}.",
+            semantic_turn.plan.goals.len(),
+            semantic_turn.plan.clarification_needed,
+            semantic_turn.plan.requires_secret_sidecar,
+            semantic_turn.verification.accepted
+        ),
+        true,
+    );
     if semantic_turn_represents_new_executable_intent(&semantic_turn) {
         agent
             .retire_pending_direct_chat_approvals_for_new_intent(&conversation_key, message)
@@ -123,6 +256,22 @@ pub(super) async fn run(
     }
 
     if semantic_turn.verification.must_clarify {
+        emit_tool_loop_progress_with_data(
+            stream_tx.as_ref(),
+            "route_decision",
+            "Route needs user input before execution.",
+            serde_json::json!({
+                "status": "needs_input",
+                "reason": "semantic_turn_requires_clarification",
+                "question": &semantic_turn.plan.clarification_question,
+            }),
+        );
+        emit_reasoning_summary(
+            stream_tx.as_ref(),
+            "router_summary",
+            "Router stopped for user input because the verified semantic plan still requires clarification.",
+            true,
+        );
         let response = semantic_turn
             .plan
             .clarification_question
@@ -162,6 +311,22 @@ pub(super) async fn run(
     }
 
     if turn_can_answer_without_tools(&semantic_turn) {
+        emit_tool_loop_progress_with_data(
+            stream_tx.as_ref(),
+            "route_decision",
+            "Route can answer without tools.",
+            serde_json::json!({
+                "status": "direct_response",
+                "reason": "all_goals_are_conversational",
+                "goal_count": semantic_turn.plan.goals.len(),
+            }),
+        );
+        emit_reasoning_summary(
+            stream_tx.as_ref(),
+            "router_summary",
+            "Router selected direct response because every verified goal is conversational and requires no live/private state or side effect.",
+            true,
+        );
         return answer_without_tools(
             agent,
             channel,
@@ -175,7 +340,7 @@ pub(super) async fn run(
             &semantic_turn,
             &execution_policy,
             &context_ledger,
-            None,
+            planning_capability_snapshot.as_ref(),
             stream_tx,
         )
         .await;
@@ -186,10 +351,16 @@ pub(super) async fn run(
         "context",
         "Resolving available actions...",
     );
-    let capability_snapshot = agent.load_capability_snapshot().await?;
-    let capability_health = agent
-        .load_capability_health_snapshot(&capability_snapshot)
-        .await?;
+    let capability_snapshot = match planning_capability_snapshot {
+        Some(snapshot) => snapshot,
+        None => agent.load_capability_snapshot().await?,
+    };
+    let capability_health = match planning_capability_health {
+        Some(health) => health,
+        None => agent
+            .load_capability_health_snapshot(&capability_snapshot)
+            .await?,
+    };
     super::semantic_turn::resolve_semantic_turn_capabilities(
         agent,
         &mut semantic_turn,
@@ -197,6 +368,25 @@ pub(super) async fn run(
         Some(&capability_health),
     )
     .await;
+    emit_tool_loop_progress_with_data(
+        stream_tx.as_ref(),
+        "route_decision",
+        "Resolved tool-capable route.",
+        serde_json::json!({
+            "status": "tool_loop",
+            "resolved_steps": &semantic_turn.resolved_steps,
+            "capability_health": capability_health.summary_for_prompt(),
+        }),
+    );
+    emit_reasoning_summary(
+        stream_tx.as_ref(),
+        "router_summary",
+        format!(
+            "Router selected tool execution with {} resolved step(s).",
+            semantic_turn.resolved_steps.len()
+        ),
+        true,
+    );
     let actions = capability_snapshot.actions.as_ref();
     let authorization = crate::actions::ActionAuthorizationContext {
         principal: request_hints.caller_principal.clone(),
@@ -240,6 +430,29 @@ pub(super) async fn run(
         &native_actions,
         Some(&semantic_turn),
         &execution_policy,
+    );
+    emit_tool_loop_progress_with_data(
+        stream_tx.as_ref(),
+        "action_scope",
+        "Selected action scope for this turn.",
+        serde_json::json!({
+            "tool_directory_actions": turn_actions.iter().map(|action| action.name.clone()).collect::<Vec<_>>(),
+            "native_schema_actions": native_actions.iter().map(|action| action.name.clone()).collect::<Vec<_>>(),
+            "include_action_schemas": include_action_schemas,
+            "policy": &execution_policy,
+            "model_schedule": &model_schedule,
+        }),
+    );
+    emit_reasoning_summary(
+        stream_tx.as_ref(),
+        "action_scope_summary",
+        format!(
+            "Action scope selected: {} directory card(s), {} native schema(s), model_role={:?}.",
+            turn_actions.len(),
+            native_actions.len(),
+            selected_model_role
+        ),
+        true,
     );
     let prompt_fragments =
         prompt_fragment_selection_for_turn(agent, message, &turn_actions, &request_hints).await;
@@ -304,6 +517,34 @@ pub(super) async fn run(
         } else {
             &[]
         };
+        emit_tool_loop_progress_with_data(
+            stream_tx.as_ref(),
+            "model_call",
+            format!("Calling model for tool decision, iteration {}.", iteration),
+            serde_json::json!({
+                "iteration": iteration,
+                "model_role": &selected_model_role,
+                "candidate_count": selected_model_candidates.len(),
+                "prompt_chars": user_prompt.chars().count(),
+                "available_tool_cards": turn_actions.len(),
+                "native_tool_schemas": native_actions.iter().map(|action| action.name.clone()).collect::<Vec<_>>(),
+                "timeout_ms": timeout_ms,
+            }),
+        );
+        emit_reasoning_summary(
+            stream_tx.as_ref(),
+            "model_summary",
+            format!(
+                "Iteration {}: calling {:?} for tool selection with {} candidate model(s), {} tool card(s), {} native schema(s), prompt_chars={}. ",
+                iteration,
+                selected_model_role,
+                selected_model_candidates.len(),
+                turn_actions.len(),
+                native_actions.len(),
+                user_prompt.chars().count()
+            ),
+            false,
+        );
         let response = match agent
             .supervised_internal_chat_detailed_with_stream(
                 channel,
@@ -352,6 +593,41 @@ pub(super) async fn run(
 
         let mut parsed =
             super::agent_loop::parse_agent_loop_tool_calls(&response, &allowed_action_names);
+        emit_tool_loop_progress_with_data(
+            stream_tx.as_ref(),
+            "model_call",
+            format!(
+                "Model response parsed: {} tool call(s), {} rejected request(s).",
+                parsed.calls.len(),
+                parsed.rejected.len()
+            ),
+            serde_json::json!({
+                "iteration": iteration,
+                "content_chars": response.content.chars().count(),
+                "tool_calls": parsed.calls.iter().map(|call| serde_json::json!({
+                    "name": &call.name,
+                    "arguments": canonical_json_value(&call.arguments),
+                })).collect::<Vec<_>>(),
+                "rejected_tools": &parsed.rejected,
+            }),
+        );
+        emit_reasoning_summary(
+            stream_tx.as_ref(),
+            "model_summary",
+            format!(
+                "Iteration {}: model response parsed into {} tool call(s) [{}] and {} rejected request(s). ",
+                iteration,
+                parsed.calls.len(),
+                parsed
+                    .calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                parsed.rejected.len()
+            ),
+            true,
+        );
         let tool_call_count_before_dedup = parsed.calls.len();
         if tool_call_count_before_dedup > 1 {
             parsed.calls = deduplicate_tool_calls(parsed.calls);
@@ -838,6 +1114,28 @@ async fn answer_without_tools(
     );
     let timeout_ms =
         super::agent_loop::agent_loop_timeout_ms(user_prompt.len(), 0, 1, false).min(180_000);
+    emit_tool_loop_progress_with_data(
+        stream_tx.as_ref(),
+        "model_call",
+        "Calling model for direct response.",
+        serde_json::json!({
+            "model_role": ModelRole::Primary,
+            "candidate_count": agent.llm_candidates_for_role(&ModelRole::Primary).len(),
+            "prompt_chars": user_prompt.chars().count(),
+            "timeout_ms": timeout_ms,
+        }),
+    );
+    emit_reasoning_summary(
+        stream_tx.as_ref(),
+        "model_summary",
+        format!(
+            "Calling {:?} for direct response with {} candidate model(s), prompt_chars={}. ",
+            ModelRole::Primary,
+            agent.llm_candidates_for_role(&ModelRole::Primary).len(),
+            user_prompt.chars().count()
+        ),
+        false,
+    );
     let response = match agent
         .supervised_internal_chat_detailed_with_stream(
             channel,
@@ -851,7 +1149,7 @@ async fn answer_without_tools(
             &[],
             timeout_ms,
             super::agent_loop::agent_loop_max_candidates(),
-            stream_tx,
+            stream_tx.clone(),
             false,
         )
         .await
@@ -883,6 +1181,25 @@ async fn answer_without_tools(
     };
 
     let final_text = response.content.trim();
+    emit_tool_loop_progress_with_data(
+        stream_tx.as_ref(),
+        "model_call",
+        "Direct response model call completed.",
+        serde_json::json!({
+            "content_chars": response.content.chars().count(),
+            "empty": final_text.is_empty(),
+        }),
+    );
+    emit_reasoning_summary(
+        stream_tx.as_ref(),
+        "model_summary",
+        format!(
+            "Direct response model call completed: content_chars={}, empty={}.",
+            response.content.chars().count(),
+            final_text.is_empty()
+        ),
+        true,
+    );
     if final_text.is_empty() {
         return Ok(super::agent_loop::agent_loop_processed_message(
             "I could not produce a response for this turn.".to_string(),
@@ -2738,16 +3055,85 @@ fn emit_tool_loop_progress(
     step: &str,
     content: impl Into<String>,
 ) {
+    emit_tool_loop_progress_with_data(stream_tx, step, content, serde_json::Value::Null);
+}
+
+fn emit_reasoning_summary(
+    stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    phase: &str,
+    content: impl Into<String>,
+    done: bool,
+) {
+    let Some(tx) = stream_tx else {
+        return;
+    };
+    let mut phase = phase.trim().to_ascii_lowercase();
+    if phase.is_empty() {
+        phase = "framework_summary".to_string();
+    } else if !phase.contains("summary") {
+        phase.push_str("_summary");
+    }
+    let raw_content = content.into();
+    let redacted = crate::security::redact_secret_input(&raw_content).text;
+    let content = safe_truncate(redacted.trim(), 2_000);
+    if !content.is_empty() {
+        queue_stream_event(
+            tx,
+            StreamEvent::ReasoningDelta {
+                phase: phase.clone(),
+                content_delta: content,
+                done: false,
+            },
+        );
+    }
+    if done {
+        queue_stream_event(
+            tx,
+            StreamEvent::ReasoningDelta {
+                phase,
+                content_delta: String::new(),
+                done: true,
+            },
+        );
+    }
+}
+
+fn emit_tool_loop_progress_with_data(
+    stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    step: &str,
+    content: impl Into<String>,
+    data: serde_json::Value,
+) {
     if let Some(tx) = stream_tx {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "kind".to_string(),
+            serde_json::Value::String("agent_loop_progress".to_string()),
+        );
+        payload.insert(
+            "phase".to_string(),
+            serde_json::Value::String(step.to_string()),
+        );
+        payload.insert(
+            "status".to_string(),
+            serde_json::Value::String("progress".to_string()),
+        );
+        if !data.is_null() {
+            if let Some(object) = data.as_object() {
+                for (key, value) in object {
+                    if !payload.contains_key(key) {
+                        payload.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            payload.insert("details".to_string(), data);
+        }
         queue_stream_event(
             tx,
             StreamEvent::ToolProgress {
                 name: "agent_turn_loop".to_string(),
                 content: content.into(),
-                payload: Some(serde_json::json!({
-                    "phase": step,
-                    "status": "progress",
-                })),
+                payload: Some(serde_json::Value::Object(payload)),
             },
         );
     }
