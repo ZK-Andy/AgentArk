@@ -9,124 +9,121 @@ export type AgentCognitionLoopProps = {
   traceCount: number;
   selfEvolveEnabled: boolean;
   learningQueueCount: number;
+  /** True while AgentArk has work in progress — lights the ACT stage. */
+  running?: boolean;
 };
+
+// "Synaptic field" cortex: the AgentArk logo is the brain at dead centre,
+// six cognition stages orbit it on a ring, eight capability dendrites orbit
+// further out, and travelling pulses ride the synapses. All geometry is
+// hand-laid in a 1060x610 viewBox centred at (530, 305) — the centre matches
+// the box's exact midpoint so the HTML logo overlay at 50%/50% lines up.
+const CX = 530;
+const CY = 305;
 
 type StageNode = {
   id: CognitionStageId;
   number: string;
   title: string;
-  detail: string;
   x: number;
   y: number;
+  // label anchor + position
   lx: number;
   ly: number;
+  anchor: "start" | "middle" | "end";
 };
 
-// Organic hexagon ring centred at (280, 195) inside a 560x404 viewBox.
+// Stage ring r=148: top, then clockwise.
 const STAGES: StageNode[] = [
-  { id: "observe", number: "01", title: "Observe", detail: "Reading runtime, memory, tasks, and signals", x: 200, y: 95, lx: 200, ly: 60 },
-  { id: "understand", number: "02", title: "Understand", detail: "Extracting patterns from traces and context", x: 360, y: 95, lx: 360, ly: 60 },
-  { id: "plan", number: "03", title: "Plan", detail: "Choosing actions, approvals, and next moves", x: 445, y: 195, lx: 445, ly: 159 },
-  { id: "act", number: "04", title: "Act", detail: "Running tools, skills, apps, and automations", x: 360, y: 295, lx: 360, ly: 338 },
-  { id: "reflect", number: "05", title: "Reflect", detail: "Reviewing outcomes, risks, and regressions", x: 200, y: 295, lx: 200, ly: 338 },
-  { id: "learn", number: "06", title: "Learn", detail: "Updating memory and reusable routines", x: 115, y: 195, lx: 115, ly: 159 },
+  { id: "observe", number: "01", title: "OBSERVE", x: 530, y: 157, lx: 530, ly: 125, anchor: "middle" },
+  { id: "understand", number: "02", title: "UNDERSTAND", x: 658, y: 231, lx: 681, ly: 241, anchor: "start" },
+  { id: "plan", number: "03", title: "PLAN", x: 658, y: 379, lx: 681, ly: 371, anchor: "start" },
+  { id: "act", number: "04", title: "ACT", x: 530, y: 453, lx: 530, ly: 495, anchor: "middle" },
+  { id: "reflect", number: "05", title: "REFLECT", x: 402, y: 379, lx: 379, ly: 371, anchor: "end" },
+  { id: "learn", number: "06", title: "LEARN", x: 402, y: 231, lx: 379, ly: 241, anchor: "end" },
 ];
 
-// Cycle order (drawn with flow arrows) + a few chords for the web mesh.
-const CYCLE: Array<[CognitionStageId, CognitionStageId]> = [
-  ["observe", "understand"],
-  ["understand", "plan"],
-  ["plan", "act"],
-  ["act", "reflect"],
-  ["reflect", "learn"],
-  ["learn", "observe"],
+// Spokes: stage -> cortex core. They stop well short of the logo face so the
+// signal appears to dive underneath the brain.
+const SPOKES: Record<CognitionStageId, string> = {
+  observe: "M 530,178 C 528,205 529,227 530,249",
+  understand: "M 640,242 C 619,251 597,263 579,277",
+  plan: "M 640,368 C 619,359 597,347 579,333",
+  act: "M 530,432 C 532,405 531,383 530,361",
+  reflect: "M 420,368 C 441,359 463,347 481,333",
+  learn: "M 420,242 C 441,251 463,263 481,277",
+};
+
+// Faint inter-stage web (hexagram chords bowed outward) + junction specks.
+const CHORDS = [
+  "M 530,157 Q 633,251 658,379",
+  "M 658,231 Q 637,363 530,453",
+  "M 658,379 Q 530,433 402,379",
+  "M 530,453 Q 423,363 402,231",
+  "M 402,379 Q 427,251 530,157",
+  "M 402,231 Q 530,201 658,231",
 ];
-const CHORDS: Array<[CognitionStageId, CognitionStageId]> = [
-  ["observe", "act"],
-  ["understand", "reflect"],
-  ["plan", "learn"],
+const JUNCTIONS: Array<[number, number]> = [
+  [530, 216],
+  [614, 260],
+  [447, 260],
+  [616, 353],
+  [445, 353],
+  [530, 406],
 ];
 
-function nodeById(id: CognitionStageId): StageNode {
-  return STAGES.find((s) => s.id === id) ?? STAGES[0];
-}
+type CapabilityNode = {
+  key: string;
+  code: string;
+  sub: string;
+  x: number;
+  y: number;
+  anchor: "start" | "end";
+  dendrite: string;
+};
 
-// Bow applied to the drawn cycle edges AND the packet's motion path — shared so
-// the packet rides exactly on the visible curves.
-const CYCLE_BOW = 24;
+// Capability orbit r=262 (nodes), dendrites curve to the stage ring.
+const CAPABILITIES: CapabilityNode[] = [
+  { key: "memory", code: "MEM", sub: "memories", x: 430, y: 63, anchor: "end", dendrite: "M 436,69 C 465,97 491,121 514,141" },
+  { key: "skills", code: "SKL", sub: "skills", x: 630, y: 63, anchor: "start", dendrite: "M 624,69 C 595,97 569,121 546,141" },
+  { key: "apps", code: "APP", sub: "apps", x: 772, y: 205, anchor: "start", dendrite: "M 764,206 C 733,200 695,199 669,213" },
+  { key: "integrations", code: "INT", sub: "integrations", x: 772, y: 405, anchor: "start", dendrite: "M 764,404 C 733,410 695,411 669,397" },
+  { key: "trace", code: "TRC", sub: "traces", x: 630, y: 547, anchor: "start", dendrite: "M 624,541 C 597,517 567,489 546,470" },
+  { key: "evolve", code: "EVO", sub: "self-evolve", x: 430, y: 547, anchor: "end", dendrite: "M 436,541 C 463,517 493,489 514,470" },
+  { key: "learning", code: "LRN", sub: "queued learnings", x: 288, y: 405, anchor: "end", dendrite: "M 296,403 C 327,395 355,387 380,382" },
+  { key: "pulse", code: "PLS", sub: "pulse", x: 288, y: 205, anchor: "end", dendrite: "M 296,207 C 327,215 355,223 380,230" },
+];
 
-// Seconds for one full orbit of the packet. Must stay equal to the durations of
-// `nw-cog-orbit` and `nw-cog-node-glow` in neural-web.css — the rim flash
-// delays below are fractions of this period.
-const ORBIT_DURATION_S = 7;
+// Reach synapses: the field stretches toward the surrounding telemetry
+// columns and fades out — decorative, alignment-agnostic.
+const REACH = [
+  "M 383,279 C 305,265 215,251 60,243",
+  "M 383,331 C 305,345 215,359 60,367",
+  "M 677,279 C 755,265 845,251 1000,243",
+  "M 677,331 C 755,345 845,359 1000,367",
+  "M 426,553 C 393,577 357,595 316,608",
+  "M 634,553 C 667,577 703,595 744,608",
+];
 
-function cycleControlPoint(a: StageNode, b: StageNode, bow: number): { cx: number; cy: number } {
-  const mx = (a.x + b.x) / 2;
-  const my = (a.y + b.y) / 2;
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const len = Math.hypot(dx, dy) || 1;
-  return { cx: mx + (-dy / len) * bow, cy: my + (dx / len) * bow };
-}
-
-// One continuous path tracing the full cycle (same bow as the drawn cycle edges,
-// so motion-driven packets ride exactly on the visible curves). Static — STAGES
-// and CYCLE are module constants — so compute it once.
-const CYCLE_RING_PATH: string = (() => {
-  let d = "";
-  CYCLE.forEach(([aId, bId], i) => {
-    const a = nodeById(aId);
-    const b = nodeById(bId);
-    const { cx, cy } = cycleControlPoint(a, b, CYCLE_BOW);
-    if (i === 0) d += `M${a.x},${a.y} `;
-    d += `Q${cx.toFixed(1)},${cy.toFixed(1)} ${b.x},${b.y} `;
-  });
-  return d.trim();
-})();
-
-// Arc-length fraction of the ring at which the packet ARRIVES at each stage.
-// The packet moves at constant speed (linear offset-distance), and the ring's
-// segments have different lengths, so arrivals are NOT at uniform i/6 marks —
-// the rim flash delays must come from real geometry or the "packet lands,
-// node lights up" beat drifts by up to ~0.25s per node. Quadratic beziers
-// have no closed-form length; sample them once at module scope.
-const STAGE_ARRIVAL_FRACTIONS: Record<CognitionStageId, number> = (() => {
-  const segmentLengths = CYCLE.map(([aId, bId]) => {
-    const a = nodeById(aId);
-    const b = nodeById(bId);
-    const { cx, cy } = cycleControlPoint(a, b, CYCLE_BOW);
-    const STEPS = 64;
-    let length = 0;
-    let prevX = a.x;
-    let prevY = a.y;
-    for (let s = 1; s <= STEPS; s += 1) {
-      const t = s / STEPS;
-      const u = 1 - t;
-      const x = u * u * a.x + 2 * u * t * cx + t * t * b.x;
-      const y = u * u * a.y + 2 * u * t * cy + t * t * b.y;
-      length += Math.hypot(x - prevX, y - prevY);
-      prevX = x;
-      prevY = y;
-    }
-    return length;
-  });
-  const total = segmentLengths.reduce((sum, len) => sum + len, 0) || 1;
-  const fractions = {} as Record<CognitionStageId, number>;
-  let cumulative = 0;
-  CYCLE.forEach(([aId], i) => {
-    fractions[aId] = cumulative / total;
-    cumulative += segmentLengths[i];
-  });
-  return fractions;
-})();
-
-// Quadratic curve between two nodes, bowed perpendicular to the chord for an organic feel.
-function edgePath(aId: CognitionStageId, bId: CognitionStageId, bow: number): string {
-  const a = nodeById(aId);
-  const b = nodeById(bId);
-  const { cx, cy } = cycleControlPoint(a, b, bow);
-  return `M${a.x},${a.y} Q${cx.toFixed(1)},${cy.toFixed(1)} ${b.x},${b.y}`;
-}
+// Travelling pulses ride CSS offset-path (not SMIL: Chrome pauses SMIL
+// timelines in hidden tabs, and CSS animations are also what our
+// prefers-reduced-motion rules govern).
+type Pulse = { path: string; cls: string; dur: number; delay: number };
+const PULSES: Pulse[] = [
+  { path: SPOKES.observe, cls: "nw-syn-pulse--mint", dur: 2.6, delay: -0.4 },
+  { path: SPOKES.plan, cls: "nw-syn-pulse--mint", dur: 2.8, delay: -1.2 },
+  { path: SPOKES.reflect, cls: "nw-syn-pulse--mint", dur: 3.0, delay: -1.9 },
+  { path: CAPABILITIES[0].dendrite, cls: "nw-syn-pulse--violet", dur: 4.2, delay: -0.6 },
+  { path: CAPABILITIES[2].dendrite, cls: "nw-syn-pulse--violet", dur: 4.8, delay: -2.4 },
+  { path: CAPABILITIES[4].dendrite, cls: "nw-syn-pulse--violet", dur: 4.4, delay: -1.5 },
+  { path: CAPABILITIES[6].dendrite, cls: "nw-syn-pulse--violet", dur: 5.0, delay: -3.1 },
+  { path: REACH[0], cls: "nw-syn-pulse--ice", dur: 5.2, delay: -1.1 },
+  { path: REACH[3], cls: "nw-syn-pulse--ice", dur: 5.4, delay: -3.4 },
+  { path: REACH[5], cls: "nw-syn-pulse--ice", dur: 4.6, delay: -2.2 },
+  // Orbiters on the stage ring and capability orbit.
+  { path: `M ${CX},157 A 148 148 0 1 1 ${CX - 0.01},157 Z`, cls: "nw-syn-pulse--mint", dur: 12, delay: -3 },
+  { path: `M ${CX},43 A 262 262 0 1 1 ${CX - 0.01},43 Z`, cls: "nw-syn-pulse--violet", dur: 24, delay: -8 },
+];
 
 export function AgentCognitionLoop({
   latencyMs,
@@ -137,196 +134,169 @@ export function AgentCognitionLoop({
   traceCount,
   selfEvolveEnabled,
   learningQueueCount,
+  running = false,
 }: AgentCognitionLoopProps) {
-  // Surface metrics as satellite nodes wired into the nearest stage.
-  const surfaces: Array<{
-    key: string;
-    label: string;
-    value: string;
-    x: number;
-    y: number;
-    near: CognitionStageId;
-  }> = [
-    { key: "memory", label: "MEM", value: `${memoryCount}`, x: 48, y: 80, near: "observe" },
-    { key: "evolve", label: "EVO", value: selfEvolveEnabled ? "ON" : "OFF", x: 40, y: 195, near: "learn" },
-    { key: "learning", label: "LRN", value: `${learningQueueCount}`, x: 48, y: 312, near: "learn" },
-    { key: "skills", label: "SKL", value: `${skillCount}`, x: 512, y: 80, near: "understand" },
-    { key: "pulse", label: "PLS", value: latencyMs == null ? "-" : `${Math.round(latencyMs)}ms`, x: 520, y: 195, near: "plan" },
-    { key: "trace", label: "TRC", value: `${traceCount}`, x: 512, y: 312, near: "plan" },
-    { key: "apps", label: "APP", value: `${appCount}`, x: 280, y: 34, near: "observe" },
-    { key: "integrations", label: "INT", value: `${integrationCount}`, x: 280, y: 368, near: "act" },
-  ];
+  const values: Record<string, { value: string; dim: boolean }> = {
+    memory: { value: `${memoryCount}`, dim: memoryCount === 0 },
+    skills: { value: `${skillCount}`, dim: skillCount === 0 },
+    apps: { value: `${appCount}`, dim: appCount === 0 },
+    integrations: { value: `${integrationCount}`, dim: integrationCount === 0 },
+    trace: { value: `${traceCount}`, dim: traceCount === 0 },
+    evolve: { value: selfEvolveEnabled ? "ON" : "OFF", dim: !selfEvolveEnabled },
+    learning: { value: `${learningQueueCount}`, dim: learningQueueCount === 0 },
+    pulse: {
+      value: latencyMs == null ? "-" : `${Math.round(latencyMs)}ms`,
+      dim: latencyMs == null,
+    },
+  };
+
+  const activeStage: CognitionStageId = running ? "act" : "observe";
+  const activeWord = running ? "FIRING" : "WATCHING";
+  const active = STAGES.find((s) => s.id === activeStage) ?? STAGES[0];
 
   return (
-    <div className="nw-cog">
-      <svg
-        className="nw-cog-svg"
-        viewBox="0 0 560 404"
-        preserveAspectRatio="xMidYMid meet"
-        role="img"
-        aria-label="Agent cognition loop — neural graph"
-      >
-        <defs>
-          <filter id="cogGlow" x="-40%" y="-40%" width="180%" height="180%">
-            <feGaussianBlur stdDeviation="3" result="b" />
-            <feMerge>
-              <feMergeNode in="b" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-          <marker
-            id="cogArrow"
-            viewBox="0 0 10 10"
-            refX="8"
-            refY="5"
-            markerWidth="5.5"
-            markerHeight="5.5"
-            orient="auto-start-reverse"
-          >
-            <path d="M0 0 L10 5 L0 10 z" fill="#7ce7ff" />
-          </marker>
-        </defs>
+    <div className="nw-syn">
+      <div className="nw-syn-stage">
+        {/* Cropped tighter than the drawn geometry on purpose: the reach
+            synapses run off-canvas toward the telemetry columns, and the
+            crop keeps the cortex large inside its grid cell. 530 stays the
+            horizontal midpoint (150 + 760/2) so the logo overlay at 50%/50%
+            still lands on the nucleus. */}
+        <svg
+          className="nw-syn-svg"
+          viewBox="150 0 760 610"
+          preserveAspectRatio="xMidYMid meet"
+          role="img"
+          aria-label="Agent cognition loop — synaptic cortex"
+        >
+          {/* concentric dendrite rings */}
+          <circle className="nw-syn-ring nw-syn-ring--a" cx={CX} cy={CY} r={78} />
+          <circle className="nw-syn-ring nw-syn-ring--b" cx={CX} cy={CY} r={96} />
+          <circle className="nw-syn-ring nw-syn-ring--b" cx={CX} cy={CY} r={118} />
+          <circle className="nw-syn-ring nw-syn-ring--stage" cx={CX} cy={CY} r={148} />
+          <circle className="nw-syn-ring nw-syn-ring--cap" cx={CX} cy={CY} r={262} />
 
-        {/* satellite connectors */}
-        <g className="nw-cog-connectors" stroke="rgba(124,231,255,0.16)" strokeWidth={1} strokeDasharray="2 3" fill="none">
-          {surfaces.map((s) => {
-            const n = nodeById(s.near);
-            return <line key={`con-${s.key}`} x1={s.x} y1={s.y} x2={n.x} y2={n.y} />;
-          })}
-        </g>
-
-        {/* chords (web mesh) */}
-        <g className="nw-cog-chords" fill="none" stroke="rgba(124,231,255,0.16)" strokeWidth={1.2} strokeDasharray="5 6">
-          {CHORDS.map(([a, b], i) => (
-            <path key={`chord-${i}`} d={edgePath(a, b, 0)} />
-          ))}
-        </g>
-
-        {/* cycle edges with flow direction */}
-        <g className="nw-cog-cycle" fill="none" stroke="rgba(124,231,255,0.5)" strokeWidth={1.6} filter="url(#cogGlow)">
-          {CYCLE.map(([a, b], i) => (
-            <path key={`cyc-${i}`} d={edgePath(a, b, 24)} markerEnd="url(#cogArrow)" />
-          ))}
-        </g>
-
-        {/* energy streaming around the ring — dashed overlay on the exact cycle
-            curves. No blur filter (would re-rasterize every frame); just an
-            animated stroke-dashoffset, which the compositor handles cheaply. */}
-        <path
-          className="nw-cog-flow"
-          d={CYCLE_RING_PATH}
-          fill="none"
-          stroke="#9af0ff"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-        />
-
-        {/* satellite nodes */}
-        {surfaces.map((s, i) => (
-          <g key={`sat-${s.key}`}>
-            <circle
-              className="nw-cog-sat"
-              style={{ animationDelay: `${(i % 5) * 0.45}s` }}
-              cx={s.x}
-              cy={s.y}
-              r={5}
-              fill="rgba(124,231,255,0.14)"
-              stroke="rgba(124,231,255,0.42)"
-              strokeWidth={1}
-            />
-            <text
-              x={s.x}
-              y={s.y + 17}
-              textAnchor="middle"
-              fontFamily="'JetBrains Mono', monospace"
-              fontSize={8}
-              fill="rgba(213,216,223,0.7)"
-            >
-              {s.label}{" "}
-              <tspan fill="#7ce7ff" fontWeight={700}>
-                {s.value}
-              </tspan>
-            </text>
+          {/* faint inter-stage web */}
+          <g className="nw-syn-chords">
+            {CHORDS.map((d, i) => (
+              <path key={`chord-${i}`} d={d} />
+            ))}
           </g>
-        ))}
+          <g className="nw-syn-junctions">
+            {JUNCTIONS.map(([x, y], i) => (
+              <circle key={`j-${i}`} cx={x} cy={y} r={1.3} />
+            ))}
+          </g>
 
-        {/* stage nodes — each rim flashes exactly when the packet arrives:
-            delay = the stage's arc-length fraction of the orbit period. */}
-        {STAGES.map((s) => {
-          const glowDelay = `${(STAGE_ARRIVAL_FRACTIONS[s.id] * ORBIT_DURATION_S).toFixed(3)}s`;
-          return (
-            <g key={s.id}>
+          {/* reach synapses toward the surrounding telemetry */}
+          <g className="nw-syn-reach">
+            {REACH.map((d, i) => (
+              <path key={`reach-${i}`} d={d} />
+            ))}
+          </g>
+
+          {/* stage -> core spokes */}
+          <g className="nw-syn-spokes">
+            {STAGES.map((s) => (
+              <path key={`spoke-${s.id}`} d={SPOKES[s.id]} />
+            ))}
+          </g>
+
+          {/* capability dendrites */}
+          <g className="nw-syn-dendrites">
+            {CAPABILITIES.map((c) => (
+              <path key={`den-${c.key}`} d={c.dendrite} />
+            ))}
+          </g>
+
+          {/* travelling pulses */}
+          <g aria-hidden="true">
+            {PULSES.map((p, i) => (
               <circle
-                className="nw-cog-node-rim"
-                style={{ animationDelay: glowDelay }}
-                cx={s.x}
-                cy={s.y}
-                r={25}
-                fill="none"
-                stroke="#7ce7ff"
-                strokeWidth={1.6}
+                key={`pulse-${i}`}
+                className={`nw-syn-pulse ${p.cls}`}
+                r={2.1}
+                style={{
+                  offsetPath: `path("${p.path}")`,
+                  animationDuration: `${p.dur}s`,
+                  animationDelay: `${p.delay}s`,
+                }}
               />
-              <circle
-                cx={s.x}
-                cy={s.y}
-                r={25}
-                fill="rgba(10,14,18,0.92)"
-                stroke="rgba(124,231,255,0.55)"
-                strokeWidth={1.4}
-              />
-              <text
-                x={s.x}
-                y={s.y}
-                textAnchor="middle"
-                dominantBaseline="central"
-                fontFamily="'JetBrains Mono', monospace"
-                fontSize={12}
-                fontWeight={700}
-                fill="rgba(124,231,255,0.82)"
-              >
-                {s.number}
-              </text>
-              <text
-                x={s.lx}
-                y={s.ly}
-                textAnchor="middle"
-                fontFamily="'JetBrains Mono', monospace"
-                fontSize={9.5}
-                fontWeight={600}
-                letterSpacing="0.08em"
-                fill="#d8f5ff"
-              >
-                {s.title.toUpperCase()}
-              </text>
-            </g>
-          );
-        })}
+            ))}
+          </g>
 
-        {/* light packet orbiting the loop. CSS offset-path (not SMIL): SMIL
-            runs on the SVG's own timeline, which Chrome pauses while the tab
-            is hidden — CSS animations keep wall-clock phase — so the packet
-            drifted out of sync with the rim flashes after every tab switch.
-            One clock for both keeps "packet lands -> node lights" locked.
-            Drawn after the stage nodes so the packet visibly travels ONTO
-            each disc as the rim fires. Halo + core pair, no SVG filter. */}
-        <g className="nw-cog-packet" aria-hidden="true">
-          <circle
-            r={7}
-            fill="rgba(124,231,255,0.18)"
-            style={{ offsetPath: `path("${CYCLE_RING_PATH}")` }}
-          />
-          <circle
-            r={2.6}
-            fill="#cdf6ff"
-            style={{ offsetPath: `path("${CYCLE_RING_PATH}")` }}
-          />
-        </g>
-      </svg>
+          {/* active-stage halos (under the node discs) */}
+          <circle className="nw-syn-halo nw-syn-halo--outer" cx={active.x} cy={active.y} r={29} />
+          <circle className="nw-syn-halo" cx={active.x} cy={active.y} r={22} />
 
-      <div className="nw-cog-caption">
-        <span className="nw-cog-caption-num">01-06</span>
-        <span className="nw-cog-caption-title">Live loop</span>
-        <span className="nw-cog-caption-detail">Observe, understand, plan, act, reflect, learn</span>
+          {/* stage nodes */}
+          {STAGES.map((s) => {
+            const isActive = s.id === activeStage;
+            return (
+              <g key={s.id}>
+                <circle
+                  className={`nw-syn-stg${isActive ? " nw-syn-stg--act" : ""}`}
+                  cx={s.x}
+                  cy={s.y}
+                  r={15}
+                />
+                <text
+                  className={`nw-syn-stgnum${isActive ? " nw-syn-stgnum--act" : ""}`}
+                  x={s.x}
+                  y={s.y + 3.5}
+                  textAnchor="middle"
+                >
+                  {s.number}
+                </text>
+                <text
+                  className={`nw-syn-stgname${isActive ? " nw-syn-stgname--act" : ""}`}
+                  x={s.lx}
+                  y={s.ly}
+                  textAnchor={s.anchor}
+                >
+                  {s.title}
+                </text>
+              </g>
+            );
+          })}
+          <text
+            className="nw-syn-stgsub"
+            x={active.lx}
+            y={active.id === "observe" ? active.ly - 14 : active.ly + 15}
+            textAnchor={active.anchor}
+          >
+            {activeWord}
+          </text>
+
+          {/* capability dendrite nodes */}
+          {CAPABILITIES.map((c) => {
+            const v = values[c.key];
+            const textX = c.anchor === "end" ? c.x - 16 : c.x + 16;
+            return (
+              <g key={c.key} className={v.dim ? "nw-syn-cap nw-syn-cap--dim" : "nw-syn-cap"}>
+                <circle className="nw-syn-capn" cx={c.x} cy={c.y} r={6} />
+                <circle className="nw-syn-capcore" cx={c.x} cy={c.y} r={1.8} />
+                <text className="nw-syn-capval" x={textX} y={c.y - 2} textAnchor={c.anchor}>
+                  {c.code} · {v.value}
+                </text>
+                <text className="nw-syn-capsub" x={textX} y={c.y + 11} textAnchor={c.anchor}>
+                  {c.sub}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+
+        {/* cortex aura + fade mask + the brain itself (clean — no frame) */}
+        <div className="nw-syn-aura" aria-hidden="true" />
+        <div className="nw-syn-coremask" aria-hidden="true" />
+        <img className="nw-syn-logo" src="/logo.svg" alt="" aria-hidden="true" />
+      </div>
+
+      <div className="nw-syn-caption">
+        <span className="nw-syn-caption-num">01-06</span>
+        <span className="nw-syn-caption-title">Cognition loop</span>
+        <span className="nw-syn-caption-detail">Observe, understand, plan, act, reflect, learn</span>
       </div>
     </div>
   );

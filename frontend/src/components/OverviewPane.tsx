@@ -34,21 +34,7 @@ import { buildCumulativeSavedTokenSparkValues } from "./overviewArkDistillSpark"
 import { useUiStore } from "../store/uiStore";
 import { ActivityFeed } from "./ActivityFeed";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
-import {
-  FocusCard,
-  type FocusState,
-  NeuralPanel,
-  SuggestedStepCard,
-  RuntimeActivityCard,
-  RuntimeHealthCard,
-  ToolActivityCard,
-  AgentCognitionLoop,
-  ReflectionNotesCard,
-  RecentLearningsCard,
-  MemoryStateCard,
-  ActiveMissionsCard,
-  SafetyGuardrailsCard,
-} from "./missionControl";
+import { AgentCognitionLoop } from "./missionControl";
 import type {
   AutonomyActionExecutionResponse,
   BackgroundSessionSummary,
@@ -237,6 +223,31 @@ function sparklinePoints(values: number[], width = 132, height = 30): string {
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(" ");
+}
+
+// Compact status badge for activity-stream rows: collapses verbose statuses
+// into HUD-sized words and picks the warn/crit tint.
+function traceStatusBadge(status: string): { label: string; cls: string } {
+  const s = String(status || "").toLowerCase();
+  if (s.includes("fail") || s.includes("error") || s.includes("timed_out") || s.includes("denied")) {
+    return { label: "FAIL", cls: " nw-syn-trow-st--crit" };
+  }
+  if (
+    s.includes("needs") ||
+    s.includes("warning") ||
+    s.includes("issue") ||
+    s.includes("not_configured") ||
+    s.includes("pending")
+  ) {
+    return { label: String(status || "").toUpperCase().slice(0, 10), cls: " nw-syn-trow-st--warn" };
+  }
+  if (s.includes("running") || s.includes("progress") || s.includes("active") || s.includes("live")) {
+    return { label: "LIVE", cls: "" };
+  }
+  if (s.includes("done") || s.includes("completed") || s.includes("ok") || s.includes("success")) {
+    return { label: "OK", cls: "" };
+  }
+  return { label: String(status || "-").toUpperCase().slice(0, 10), cls: "" };
 }
 
 function MetricSparkline({ values }: { values: number[] }) {
@@ -925,54 +936,6 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
   const arkDistillSavedCostLabel = formatSmallCurrency(
     arkDistillTotals?.estimated_prompt_cost_saved_usd
   );
-  const arkDistillSeries = arkDistillAnalytics?.arkdistill?.series ?? [];
-  const arkDistillSparkValues = buildCumulativeSavedTokenSparkValues(
-    arkDistillSeries,
-    {
-      start: arkDistillAnalytics?.range?.since,
-      end: arkDistillAnalytics?.range?.until,
-      bucket: arkDistillAnalytics?.range?.bucket,
-    }
-  );
-  const arkDistillShowSpark =
-    arkDistillHasData && arkDistillSparkValues.length >= 2;
-  const arkDistillFocusBody = (
-    <div className="nw-focus-metric">
-      {arkDistillHasData && arkDistillSavingsPercent != null ? (
-        <>
-          <div className="nw-focus-metric-value">
-            {arkDistillSavingsPercent.toFixed(1)}%
-          </div>
-          <div className="nw-focus-metric-detail">
-            {formatCompactNumber(arkDistillSavedTokens)} tokens · {arkDistillSavedCostLabel}
-          </div>
-        </>
-      ) : (
-        <>
-          <div className="nw-focus-metric-value nw-focus-metric-value--waiting">
-            Waiting for data
-          </div>
-          <div className="nw-focus-metric-detail">
-            ArkDistill savings appear after distilled tool results land.
-          </div>
-        </>
-      )}
-      <div className="nw-focus-spark-shell">
-        <ArkDistillSpark values={arkDistillShowSpark ? arkDistillSparkValues : []} />
-        <div className="nw-focus-spark-caption">
-          <span>30d ago</span>
-          <span>now</span>
-        </div>
-      </div>
-    </div>
-  );
-  const focusTitle = "ArkDistill Saved";
-
-  const focusState: FocusState = arkDistillAnalyticsQ.error
-    ? "issue"
-    : agentPaused
-      ? "paused"
-      : "ready";
   const missionPlanSteps = useMemo(() => {
     const recommended = (briefingQ.data?.recommended_actions || briefingQ.data?.recommended_skills || [])[0];
     return [
@@ -1003,6 +966,41 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
       },
     ];
   }, [briefingQ.data, currentTask, serverStatus, showActivityFeed, traces.length]);
+  const activeMissionCount = useMemo(() => {
+    const running = tasks.filter((task) => {
+      const status = String(task?.status || "").toLowerCase();
+      return status.includes("progress") || status.includes("running");
+    }).length;
+    return running + activeBackgroundSessions.length;
+  }, [activeBackgroundSessions.length, tasks]);
+  const recentTraces = useMemo(() => {
+    const all = Array.isArray(traces) ? traces.slice() : [];
+    all.sort((a, b) => {
+      const aTs = a.started_at || "";
+      const bTs = b.started_at || "";
+      if (aTs === bTs) return 0;
+      return aTs < bTs ? 1 : -1;
+    });
+    return all.slice(0, 4);
+  }, [traces]);
+  const topOpportunity = briefingQ.data?.top_opportunities?.[0];
+  const topRisk = briefingQ.data?.top_risks?.[0];
+  const reflectionNote =
+    str(topOpportunity?.summary || topOpportunity?.detail || topOpportunity?.title, "").trim() ||
+    str(topRisk?.summary || topRisk?.detail || topRisk?.title, "").trim() ||
+    str(traces[0]?.message_preview, "").trim() ||
+    "No reflection note has landed yet.";
+  const recommendedNext = (briefingQ.data?.recommended_actions || briefingQ.data?.recommended_skills || [])[0];
+  const briefingSignal =
+    str(recommendedNext?.title || recommendedNext?.summary, "").trim() ||
+    str(topRisk?.title || topRisk?.summary, "").trim() ||
+    "No new briefing signals this cycle.";
+  const nextCheckpoint =
+    missionPlanSteps.find((step) => step.state !== "done")?.label ?? "All steps complete";
+  const memoryPressurePct =
+    typeof memoryPressureValue === "number" && Number.isFinite(memoryPressureValue)
+      ? Math.max(0, Math.min(100, memoryPressureValue))
+      : null;
   return (
     <Box
       data-tour-target="overview-dashboard"
@@ -1015,213 +1013,284 @@ export function OverviewPane({ navigateToView, serverStatus, serverError }: Prop
       ) : null}
 
       <div className="nw-frame">
-        <section className="nw-dashboard">
-          <div className="nw-dashboard-statusbar nw-dashboard-statusbar--split" aria-label="Mission status summary">
-            <div className="nw-status-pills">
-              <div className="nw-status-pill">
-                <span className="nw-status-glyph">
-                  <LockRoundedIcon fontSize="inherit" />
-                </span>
-                <strong>Local only</strong>
-              </div>
-              <div className="nw-status-pill">
-                <span className="nw-status-glyph">
-                  <AutoAwesomeRoundedIcon fontSize="inherit" />
-                </span>
-                <strong>{showActivityFeed ? "Reflection active" : "Reflection ready"}</strong>
-              </div>
-              <div className="nw-status-pill">
-                <span className="nw-status-glyph">
-                  <MemoryRoundedIcon fontSize="inherit" />
-                </span>
-                <strong>{serverStatus?.status?.memory_entries ?? 0} memories</strong>
-              </div>
-              <div className="nw-status-pill">
-                <span className={`nw-status-glyph${serverError ? " nw-status-glyph--warn" : ""}`}>
-                  {serverError ? <WarningAmberRoundedIcon fontSize="inherit" /> : <CheckCircleRoundedIcon fontSize="inherit" />}
-                </span>
-                <strong>{serverError ? "Runtime check" : "Runtime ready"}</strong>
-              </div>
-            </div>
-            <div className="nw-status-metrics">
-              <div className="nw-status-cell nw-status-cell--model">
-                <span>Model</span>
-                <strong title={modelDisplay}>{modelDisplay}</strong>
-              </div>
-              <div className="nw-status-cell">
-                <span>Memory pressure</span>
-                <div className="nw-metric-inline">
-                  <strong>{formatCompactPercent(memoryPressureValue)}</strong>
-                  <MetricSparkline values={memoryPressureHistory} />
-                </div>
-              </div>
-              <div className="nw-status-cell">
-                <span>Latency</span>
-                <div className="nw-metric-inline">
-                  <strong>{serverStatus?.rtt_ms != null ? `${Math.round(serverStatus.rtt_ms)}ms` : serverError ? "Check" : "Ready"}</strong>
-                  <MetricSparkline values={latencyHistory} />
-                </div>
-              </div>
-              <div className="nw-status-cell">
-                <span>Uptime</span>
-                <strong>{formatCompactUptime(runtimeHealth?.uptime_seconds)}</strong>
-              </div>
-            </div>
+        <section className="nw-dashboard nw-dashboard--syn">
+          <div className="nw-syn-top" aria-label="Mission status summary">
+            <span className="nw-syn-top-kicker">Mission Control</span>
+            <span className={`nw-syn-cycle${serverError ? " nw-syn-cycle--warn" : ""}`}>
+              <i className={`nw-syn-lamp${serverError ? " nw-syn-lamp--amber" : ""}`} />
+              {serverError ? (
+                <>RUNTIME · <b>CHECK</b></>
+              ) : currentTask ? (
+                <>CYCLE · STAGE 04 <b>ACT</b></>
+              ) : (
+                <>CYCLE · STAGE 01 <b>OBSERVE</b></>
+              )}
+            </span>
           </div>
 
-          <div className="nw-dashboard-main nw-dashboard-main--mission mission-grid">
-            <aside className="nw-dashboard-stack nw-dashboard-stack--left left-stack" aria-label="Mission objective and plan">
-              <FocusCard
-                state={focusState}
-                title={focusTitle}
-                body={arkDistillFocusBody}
-              />
-              <NeuralPanel title="Autonomous Plan" tag={currentTask ? "RUNNING" : "READY"} tagTone={currentTask ? "cyan" : "good"}>
-                <div className="nw-plan-list">
-                  {missionPlanSteps.map((step, index) => (
-                    <div className={`nw-plan-step nw-plan-step--${step.state}`} key={`${step.label}-${index}`}>
-                      <div className="nw-plan-index">{index + 1}</div>
-                      <div className="nw-plan-copy">
-                        <div className="nw-plan-title">{step.label}</div>
-                        <div className="nw-plan-detail">{step.detail}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </NeuralPanel>
-              <SuggestedStepCard
-                prompts={heroPrompts}
-                briefing={briefingQ.data}
-                recentRuns={traces}
-                onOpenActivity={() => setActivityOpen(true)}
-                onGoChat={() => navigateToView("chat")}
-                onRunBriefing={() => runBriefingMutation.mutate()}
-                onExecuteAction={handleExecuteSuggestedAction}
-                briefingLoading={runBriefingMutation.isPending}
-                executing={executeActionMutation.isPending}
-              />
-            </aside>
-
-            <div className="nw-dashboard-primary nw-dashboard-primary--mission center-stack">
-              <section className="nw-dashboard-graph-panel nw-dashboard-loop-panel" aria-label="Agent cognition loop">
-                <div className="nw-panel-h nw-dashboard-graph-header">
-                  <div>
-                    <div className="nw-panel-title">Agent Cognition Loop</div>
-                    <div className="nw-panel-muted">
-                      Continuous cycle of reasoning, action, and self-improvement.
-                    </div>
-                  </div>
-                  <div className="nw-chip-row">
-                    <span className={`nw-chip${serverError ? " nw-chip--warn" : ""}`}>
-                      <span className="nw-chip-dot" />
-                      {serverError ? "Needs check" : "Live"}
+          <div className="nw-syn-grid">
+            <aside className="nw-syn-col" aria-label="Mission objective and plan">
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">Mission</span>
+                <span className="nw-syn-rule" />
+                <span className={`nw-syn-state${currentTask ? " nw-syn-state--run" : ""}`}>
+                  {currentTask ? "RUNNING" : "READY"}
+                </span>
+              </div>
+              <div className="nw-syn-plan">
+                {missionPlanSteps.map((step, index) => (
+                  <div
+                    className={`nw-syn-step nw-syn-step--${step.state}`}
+                    key={`${step.label}-${index}`}
+                    title={step.detail}
+                  >
+                    <span className="nw-syn-step-dot" />
+                    <span className="nw-syn-step-ix">{String(index + 1).padStart(2, "0")}</span>
+                    <span className="nw-syn-step-t">{step.label}</span>
+                    <span className="nw-syn-step-state">
+                      {step.state === "done"
+                        ? "DONE"
+                        : step.state === "active"
+                          ? "RUNNING"
+                          : step.state === "ready"
+                            ? "READY"
+                            : "QUEUED"}
                     </span>
                   </div>
+                ))}
+              </div>
+
+              <div className="nw-syn-div" />
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">ArkDistill saved</span>
+                <span className="nw-syn-rule" />
+              </div>
+              {arkDistillHasData && arkDistillSavingsPercent != null ? (
+                <>
+                  <div className="nw-syn-stat-vrow">
+                    <span className="nw-syn-stat-v nw-syn-stat-v--mint">
+                      {formatCompactNumber(arkDistillSavedTokens)}
+                    </span>
+                    <span className="nw-syn-stat-lab">Tokens</span>
+                    <span className="nw-syn-stat-tail">{arkDistillSavedCostLabel}</span>
+                  </div>
+                  <div className="nw-syn-meter">
+                    <i style={{ width: `${Math.max(2, Math.min(100, arkDistillSavingsPercent))}%` }} />
+                  </div>
+                  <div className="nw-syn-msub">
+                    <span>
+                      prompt-cache <b>{arkDistillSavingsPercent.toFixed(1)}%</b>
+                    </span>
+                    <span>30 days</span>
+                  </div>
+                </>
+              ) : (
+                <p className="nw-syn-copy">ArkDistill savings appear after distilled tool results land.</p>
+              )}
+
+              <div className="nw-syn-div" />
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">Core readouts</span>
+                <span className="nw-syn-rule" />
+              </div>
+              <div style={{ marginTop: 6 }}>
+                <div className="nw-syn-kv">
+                  <span className="nw-syn-kv-k">Model</span>
+                  <span className="nw-syn-kv-v" title={modelDisplay}>{modelDisplay}</span>
                 </div>
-                <div className="nw-dashboard-graph">
-                  <AgentCognitionLoop
-                    memoryCount={serverStatus?.status?.memory_entries ?? 0}
-                    skillCount={serverStatus?.status?.skills_loaded ?? serverStatus?.status?.actions_loaded ?? 0}
-                    appCount={automationCounts.apps}
-                    integrationCount={automationCounts.integrations}
-                    traceCount={traces.length}
-                    selfEvolveEnabled={Boolean(evolutionStatus.self_evolve_enabled)}
-                    learningQueueCount={learningQueueTotal}
-                    latencyMs={serverStatus?.rtt_ms ?? null}
-                  />
+                <div className="nw-syn-kv">
+                  <span className="nw-syn-kv-k">Uptime</span>
+                  <span className="nw-syn-kv-v">{formatCompactUptime(runtimeHealth?.uptime_seconds)}</span>
                 </div>
-              </section>
-              <RuntimeActivityCard traces={traces} onOpenActivity={() => setActivityOpen(true)} />
+                <div className="nw-syn-kv">
+                  <span className="nw-syn-kv-k">Latency</span>
+                  <span className="nw-syn-kv-v">
+                    {serverStatus?.rtt_ms != null ? `${Math.round(serverStatus.rtt_ms)}ms` : "-"}
+                  </span>
+                </div>
+                <div className="nw-syn-kv">
+                  <span className="nw-syn-kv-k">Mem pressure</span>
+                  <span className="nw-syn-kv-v nw-syn-kv-v--mint">
+                    {formatCompactPercent(memoryPressureValue)}
+                  </span>
+                </div>
+                <div className="nw-syn-kv">
+                  <span className="nw-syn-kv-k">Active missions</span>
+                  <span className="nw-syn-kv-v">{activeMissionCount}</span>
+                </div>
+              </div>
+              <div className="nw-syn-foot">
+                Next checkpoint · <b>{nextCheckpoint}</b>
+              </div>
+            </aside>
+
+            <div className="nw-syn-center" aria-label="Agent cognition loop">
+              <AgentCognitionLoop
+                memoryCount={serverStatus?.status?.memory_entries ?? 0}
+                skillCount={serverStatus?.status?.skills_loaded ?? serverStatus?.status?.actions_loaded ?? 0}
+                appCount={automationCounts.apps}
+                integrationCount={automationCounts.integrations}
+                traceCount={traces.length}
+                selfEvolveEnabled={Boolean(evolutionStatus.self_evolve_enabled)}
+                learningQueueCount={learningQueueTotal}
+                latencyMs={serverStatus?.rtt_ms ?? null}
+                running={Boolean(currentTask)}
+              />
             </div>
 
-            <div className="nw-dashboard-stack nw-dashboard-stack--right right-stack" aria-label="Mission telemetry">
-              <div className="nw-dashboard-right-row nw-dashboard-right-row--signals right-two">
-                <ReflectionNotesCard
-                  briefing={briefingQ.data}
-                  traces={traces}
-                />
-                <RecentLearningsCard briefing={briefingQ.data} />
+            <aside className="nw-syn-col" aria-label="Mission telemetry">
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">Signals</span>
+                <span className="nw-syn-rule" />
+                <i className="nw-syn-lamp nw-syn-lamp--violet" />
               </div>
-              <div className="nw-dashboard-right-row nw-dashboard-right-row--posture right-three">
-                <MemoryStateCard
-                  memoryCount={serverStatus?.status?.memory_entries ?? 0}
-                  health={runtimeHealth}
-                />
-                <ActiveMissionsCard
-                  tasks={tasks}
-                  sessions={activeBackgroundSessions}
-                />
-                <SafetyGuardrailsCard
-                  securityLogs={securityLogs}
-                  hasLlmConfigured={hasLlmConfigured}
-                />
+
+              <div className="nw-syn-shead" style={{ marginTop: 16 }}>
+                <span className="nw-syn-kicker">ArkSentinel</span>
+                <span className="nw-syn-rule" />
               </div>
-              <div className="nw-dashboard-right-row nw-dashboard-right-row--runtime right-two">
-                <RuntimeHealthCard
-                  health={runtimeHealth}
-                  rttMs={serverStatus?.rtt_ms ?? null}
-                />
-                <ToolActivityCard events={traceEvents} />
+              <div className="nw-syn-stat-vrow">
+                <span className="nw-syn-stat-v">{securityLogs.length}</span>
+                <span className="nw-syn-stat-lab">{securityLogs.length === 1 ? "Alert" : "Alerts"}</span>
+                <span className={`nw-syn-stat-tail${securityLogs.length > 0 ? " nw-syn-stat-tail--warn" : ""}`}>
+                  {securityLogs.length > 0 ? "REVIEW" : "GUARDRAILS ACTIVE"}
+                </span>
               </div>
-              {showActiveSessionsPanel ? (
-                <Box className="overview-inline-note overview-inline-note--sessions nw-dashboard-sessions nw-dashboard-right-row nw-dashboard-right-row--sessions">
-                  <Stack spacing={1}>
-                    <Stack
-                      direction={{ xs: "column", sm: "row" }}
-                      spacing={1}
-                      sx={{
-                        alignItems: { xs: "flex-start", sm: "center" },
-                        justifyContent: "space-between",
-                      }}
-                    >
-                      <Box>
-                        <Typography variant="overline" className="overview-inline-note__kicker">
-                          Active Sessions
-                        </Typography>
-                        <Typography variant="body2" sx={{ color: "text.primary", fontWeight: 600 }}>
-                          {`${activeBackgroundSessions.length} background session${activeBackgroundSessions.length === 1 ? "" : "s"} need supervision.`}
-                        </Typography>
-                      </Box>
-                      <Button variant="outlined" size="small" onClick={() => navigateToView("status")}>
-                        Open
-                      </Button>
-                    </Stack>
-                    <Stack spacing={0.75}>
-                      {activeBackgroundSessions.slice(0, 2).map((session) => (
-                        <Stack
-                          key={session.id}
-                          direction="row"
-                          spacing={0.75}
-                          sx={{
-                            alignItems: "center",
-                            px: 0.9,
-                            py: 0.75,
-                            borderRadius: 2,
-                            background: "var(--ui-rgba-255-255-255-030)",
-                            border: "1px solid var(--ui-rgba-255-255-255-080)",
-                          }}
+              <p className="nw-syn-copy">
+                {securityLogs.length > 0 ? (
+                  `Latest severity ${String(securityLogs[0]?.severity || "review").toUpperCase()}.`
+                ) : (
+                  <>
+                    <em>ArkSentinel</em> is watching the perimeter — no policy breaches this cycle.
+                  </>
+                )}
+              </p>
+
+              <div className="nw-syn-div" />
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">Memory</span>
+                <span className="nw-syn-rule" />
+              </div>
+              <div className="nw-syn-stat-vrow">
+                <span className="nw-syn-stat-v nw-syn-stat-v--mint">
+                  {serverStatus?.status?.memory_entries ?? 0}
+                </span>
+                <span className="nw-syn-stat-lab">Entries</span>
+                <span className="nw-syn-stat-tail">
+                  {memoryPressurePct != null && memoryPressurePct > 80 ? "PRESSURE" : "HEALTHY"}
+                </span>
+              </div>
+              <div className="nw-syn-meter">
+                <i style={{ width: `${Math.max(2, memoryPressurePct ?? 0)}%` }} />
+              </div>
+              <div className="nw-syn-msub">
+                <span>
+                  pressure <b>{formatCompactPercent(memoryPressureValue)}</b>
+                </span>
+                <span>
+                  headroom <b>{memoryPressurePct == null ? "-" : `${Math.round(100 - memoryPressurePct)}%`}</b>
+                </span>
+              </div>
+
+              <div className="nw-syn-div" />
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">Runtime</span>
+                <span className="nw-syn-rule" />
+              </div>
+              <div className="nw-syn-stat-vrow">
+                <span className={`nw-syn-stat-v nw-syn-stat-v--sm${serverError ? "" : " nw-syn-stat-v--mint"}`}>
+                  {serverError ? "CHECK" : "OK"}
+                </span>
+                <span className="nw-syn-stat-lab">
+                  {serverError ? "Attention needed" : "All loops nominal"}
+                </span>
+              </div>
+              <p className="nw-syn-copy">
+                {serverError
+                  ? "The runtime needs a check — the status pulse failed."
+                  : "The runtime is steady — every cognition loop returned nominal this sweep."}
+              </p>
+
+              <div className="nw-syn-div" />
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">Supervision</span>
+                <span className="nw-syn-rule" />
+              </div>
+              {activeBackgroundSessions.length > 0 ? (
+                <div className="nw-syn-supv">
+                  <div className="nw-syn-supv-h">
+                    <i className="nw-syn-lamp nw-syn-lamp--amber" />
+                    {activeBackgroundSessions.length} SESSION{activeBackgroundSessions.length === 1 ? "" : "S"} FLAGGED
+                  </div>
+                  <p>
+                    {activeBackgroundSessions.length === 1
+                      ? "1 background session needs supervision before it can continue."
+                      : `${activeBackgroundSessions.length} background sessions need supervision before they can continue.`}
+                  </p>
+                  <button type="button" className="nw-syn-supv-act" onClick={() => navigateToView("status")}>
+                    Review session{activeBackgroundSessions.length === 1 ? "" : "s"} -&gt;
+                  </button>
+                </div>
+              ) : (
+                <p className="nw-syn-copy">No background sessions need review.</p>
+              )}
+            </aside>
+          </div>
+
+          <div className="nw-syn-bottom">
+            <section aria-label="Intel">
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">Intel</span>
+                <span className="nw-syn-rule" />
+                <i className="nw-syn-lamp" />
+              </div>
+              <div className="nw-syn-intel-grid">
+                <div className="nw-syn-note">
+                  <div className="nw-syn-note-tag nw-syn-note-tag--mint">Reflection</div>
+                  <p>{reflectionNote}</p>
+                </div>
+                <div className="nw-syn-note">
+                  <div className="nw-syn-note-tag nw-syn-note-tag--violet">Signal</div>
+                  <p>{briefingSignal}</p>
+                </div>
+              </div>
+            </section>
+            <section aria-label="Activity stream">
+              <div className="nw-syn-shead">
+                <span className="nw-syn-kicker">Activity stream</span>
+                <span className="nw-syn-rule" />
+                <span className="nw-syn-state">TRC · {traces.length}</span>
+              </div>
+              <div className="nw-syn-rows">
+                {recentTraces.length === 0 ? (
+                  <p className="nw-syn-copy">No recent runs landed yet.</p>
+                ) : (
+                  recentTraces.map((trace) => {
+                    const badge = traceStatusBadge(trace.status);
+                    return (
+                      <div className="nw-syn-trow" key={trace.id}>
+                        <span className="nw-syn-trow-tag" title={trace.channel}>
+                          {humanizeMachineLabel(trace.channel, "run")}
+                        </span>
+                        <span className="nw-syn-trow-d" title={trace.message_preview}>
+                          {trace.message_preview || "(no preview)"}
+                        </span>
+                        <span className={`nw-syn-trow-st${badge.cls}`}>{badge.label}</span>
+                        <span
+                          className="nw-syn-trow-tm"
+                          title={formatUiRelativeDateTimeMeta(trace.started_at).tip}
                         >
-                          <Chip size="small" label={humanizeStatusLabel(session.status)} color={automationStatusColor(session.status)} />
-                          <Box sx={{ minWidth: 0, flex: 1 }}>
-                            <Typography variant="body2" noWrap sx={{ fontWeight: 600 }} title={session.title}>
-                              {session.title}
-                            </Typography>
-                            <Typography
-                              variant="caption"
-                              noWrap
-                              title={session.live_summary}
-                              sx={{ color: "text.secondary" }}
-                            >
-                              {session.live_summary}
-                            </Typography>
-                          </Box>
-                        </Stack>
-                      ))}
-                    </Stack>
-                  </Stack>
-                </Box>
-              ) : null}
-            </div>
+                          {formatUiRelativeDateTimeMeta(trace.started_at).label}
+                        </span>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+              <button type="button" className="nw-syn-more" onClick={() => setActivityOpen(true)}>
+                Activity feed -&gt;
+              </button>
+            </section>
           </div>
         </section>
 

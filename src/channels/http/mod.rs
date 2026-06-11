@@ -2482,6 +2482,7 @@ pub async fn serve(
             "/documents/{id}",
             axum::routing::delete(delete_document_endpoint),
         )
+        .route("/documents/{id}/download", get(download_document_endpoint))
         .route("/documents/{id}/search", get(search_document_endpoint))
         // ArkOrbit (per-user limitless canvas) routes
         .route(

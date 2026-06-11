@@ -35,6 +35,14 @@ pub struct Model {
     pub prompt_version: Option<String>,
     #[sea_orm(nullable)]
     pub model_slot: Option<String>,
+    #[sea_orm(nullable)]
+    pub tokens_in: Option<i64>,
+    #[sea_orm(nullable)]
+    pub tokens_out: Option<i64>,
+    #[sea_orm(nullable)]
+    pub wall_ms: Option<i64>,
+    #[sea_orm(nullable)]
+    pub est_cost_microusd: Option<i64>,
     pub success_state: String,
     pub correction_state: String,
     #[sea_orm(nullable)]

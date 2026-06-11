@@ -17,10 +17,7 @@ pub const TOOL_STRATEGY_PROFILE_CANARY_KEY: &str = "tool_strategy_profile_canary
 pub const TOOL_STRATEGY_CANARY_STATE_KEY: &str = "tool_strategy_canary_state_v1";
 pub const TOOL_STRATEGY_PROFILE_BASELINE_SNAPSHOT_KEY: &str =
     "tool_strategy_profile_baseline_snapshot_v1";
-pub const ROUTING_COMPLEXITY_POLICY_CANARY_KEY: &str = "routing_complexity_policy_canary_v1";
 pub const ROUTING_COMPLEXITY_CANARY_STATE_KEY: &str = "routing_complexity_policy_canary_state_v1";
-pub const ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY: &str =
-    "routing_complexity_policy_baseline_snapshot_v1";
 pub const PROMPT_PROFILE_CANARY_SAFETY_EVENTS_KEY: &str = "prompt_profile_canary_safety_events_v1";
 pub const SELF_EVOLVE_LAST_RESULT_KEY: &str = "self_evolve_last_result_v1";
 pub const APP_DEPLOY_ACCESS_GUARD_DEFAULT_KEY: &str = "app_deploy_access_guard_default_v1";
@@ -97,6 +94,14 @@ pub struct ReplayVersionMetrics {
     pub successes: usize,
     pub success_rate: f64,
     pub p95_latency_ms: Option<i64>,
+    /// Measured from experience-run evidence (Phase-1 columns). None = no
+    /// evidence for that dimension in this arm's samples.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_tokens_per_turn: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p95_wall_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_cost_microusd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,6 +121,52 @@ pub struct ReplayEvaluationResult {
     pub reasons: Vec<PromotionGateReason>,
 }
 
+/// Versioned snapshot history (ring, newest first) alongside the legacy
+/// single-slot baseline snapshot — so consecutive promotions never make
+/// earlier states unrecoverable.
+pub const PROMPT_SNAPSHOT_RING_CAP: usize = 10;
+
+pub fn prompt_snapshot_ring_key(baseline_snapshot_key: &str) -> String {
+    format!("{}_ring_v1", baseline_snapshot_key)
+}
+
+pub async fn push_prompt_snapshot_ring(
+    storage: &crate::storage::Storage,
+    baseline_snapshot_key: &str,
+    snapshot: &[u8],
+) {
+    let ring_key = prompt_snapshot_ring_key(baseline_snapshot_key);
+    let mut ring: Vec<serde_json::Value> = match storage.get(&ring_key).await {
+        Ok(Some(raw)) => serde_json::from_slice(&raw).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let snapshot_value: serde_json::Value =
+        serde_json::from_slice(snapshot).unwrap_or(serde_json::Value::Null);
+    let version = snapshot_value
+        .get("version")
+        .and_then(|version| version.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    // Same version re-pushed (e.g. repeated activations) keeps one entry.
+    ring.retain(|entry| {
+        entry.get("version").and_then(|entry| entry.as_str()) != Some(version.as_str())
+    });
+    ring.insert(
+        0,
+        serde_json::json!({
+            "version": version,
+            "saved_at": chrono::Utc::now().to_rfc3339(),
+            "snapshot": snapshot_value,
+        }),
+    );
+    ring.truncate(PROMPT_SNAPSHOT_RING_CAP);
+    if let Ok(bytes) = serde_json::to_vec(&ring) {
+        if let Err(error) = storage.set(&ring_key, &bytes).await {
+            tracing::warn!(error = %error, "failed to persist prompt snapshot ring");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptProfileCanarySafetyEvent {
     pub id: String,
@@ -123,6 +174,8 @@ pub struct PromptProfileCanarySafetyEvent {
     pub surface: String,
     pub surface_label: String,
     pub status: String,
+    #[serde(default)]
+    pub auto_reverted: bool,
     pub review_status: String,
     #[serde(default)]
     pub reviewed_at: Option<String>,
@@ -685,6 +738,9 @@ fn compute_trace_prompt_telemetry_metrics(
         successes,
         success_rate: round4(success_rate),
         p95_latency_ms,
+        avg_tokens_per_turn: None,
+        p95_wall_ms: None,
+        avg_cost_microusd: None,
     }
 }
 
@@ -865,6 +921,9 @@ fn compute_metrics(
         successes,
         success_rate: round4(success_rate),
         p95_latency_ms,
+        avg_tokens_per_turn: None,
+        p95_wall_ms: None,
+        avg_cost_microusd: None,
     }
 }
 
@@ -881,11 +940,41 @@ fn compute_experience_metrics(
     } else {
         successes as f64 / samples as f64
     };
+    let token_values = rows
+        .iter()
+        .filter_map(|row| {
+            row.tokens_in
+                .zip(row.tokens_out)
+                .map(|(tokens_in, tokens_out)| (tokens_in + tokens_out) as f64)
+        })
+        .collect::<Vec<_>>();
+    let mut wall_values = rows
+        .iter()
+        .filter_map(|row| row.wall_ms)
+        .collect::<Vec<_>>();
+    let cost_values = rows
+        .iter()
+        .filter_map(|row| row.est_cost_microusd.map(|cost| cost as f64))
+        .collect::<Vec<_>>();
+    let avg_tokens_per_turn = (!token_values.is_empty())
+        .then(|| round4(token_values.iter().sum::<f64>() / token_values.len() as f64));
+    let p95_wall_ms = if wall_values.is_empty() {
+        None
+    } else {
+        wall_values.sort_unstable();
+        let rank = ((wall_values.len() as f64 - 1.0) * 0.95).round() as usize;
+        wall_values.get(rank).copied()
+    };
+    let avg_cost_microusd = (!cost_values.is_empty())
+        .then(|| round4(cost_values.iter().sum::<f64>() / cost_values.len() as f64));
     ReplayVersionMetrics {
         samples,
         successes,
         success_rate: round4(success_rate),
         p95_latency_ms: None,
+        avg_tokens_per_turn,
+        p95_wall_ms,
+        avg_cost_microusd,
     }
 }
 
@@ -959,6 +1048,10 @@ mod tests {
             policy_version: None,
             prompt_version: Some(prompt_version.to_string()),
             model_slot: None,
+            tokens_in: None,
+            tokens_out: None,
+            wall_ms: None,
+            est_cost_microusd: None,
             success_state: success_state.to_string(),
             correction_state: correction_state.to_string(),
             outcome_summary: None,

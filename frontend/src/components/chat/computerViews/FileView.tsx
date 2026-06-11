@@ -1,17 +1,24 @@
 // File view for source_read / source_write / file_edit etc.
 // Renders syntax-colored file content when it is available.
 
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Box from "@mui/material/Box";
 import IconButton from "@mui/material/IconButton";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import ContentCopyRounded from "@mui/icons-material/ContentCopyRounded";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import type { ChatStepCard } from "../types";
 import { extractFilePath } from "../dispatch";
 import { surfacePayloads } from "../surface";
-import { guessCodeLanguage, renderCodeBlockLines } from "../codeHighlight";
+import {
+  guessCodeLanguage,
+  renderCodeBlockLines,
+  type CodeLanguage,
+} from "../codeHighlight";
+import { shouldRenderFileAsMarkdown } from "./filePreviewMode";
 
 export interface FileViewProps {
   card: ChatStepCard;
@@ -175,8 +182,8 @@ function formatBytes(value: number): string {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function languageLabel(path: string, body: string): string {
-  switch (guessCodeLanguage(path, body)) {
+function languageLabel(language: CodeLanguage): string {
+  switch (language) {
     case "markup":
       return "HTML";
     case "css":
@@ -200,6 +207,31 @@ function languageLabel(path: string, body: string): string {
   }
 }
 
+const FILE_MARKDOWN_REMARK_PLUGINS = [remarkGfm];
+
+const FILE_MARKDOWN_COMPONENTS: Components = {
+  a({ href, children }) {
+    return (
+      <a href={href || ""} target="_blank" rel="noopener noreferrer">
+        {children}
+      </a>
+    );
+  },
+  img({ src, alt }) {
+    return (
+      <img
+        src={src || ""}
+        alt={alt || ""}
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        onError={(event) => {
+          event.currentTarget.style.display = "none";
+        }}
+      />
+    );
+  },
+};
+
 function FileViewInner({
   card,
   snippetPath,
@@ -210,17 +242,31 @@ function FileViewInner({
     (snippetPath && snippetPath.trim()) || extractFilePath(card) || card.label;
   const body = pickContent(card, path, snippetPath, snippetContent);
   const byteCount = useMemo(() => new Blob([body || ""]).size, [body]);
-  const highlightedLines = useMemo(
-    () => renderCodeBlockLines(body, { fileName: path }),
+  const detectedLanguage = useMemo(
+    () => guessCodeLanguage(path, body),
     [body, path],
   );
+  const renderAsMarkdown = useMemo(
+    () => shouldRenderFileAsMarkdown(path, body),
+    [body, path],
+  );
+  const highlightedLines = useMemo(
+    () => (renderAsMarkdown ? [] : renderCodeBlockLines(body, { fileName: path })),
+    [body, path, renderAsMarkdown],
+  );
   const meta = body
-    ? `${languageLabel(path, body)} / ${formatBytes(byteCount)}`
+    ? `${languageLabel(detectedLanguage)} / ${formatBytes(byteCount)}`
     : (card.kind || "").toLowerCase();
   const [copied, setCopied] = useState(false);
-  const preRef = useRef<HTMLPreElement | null>(null);
+  const bodyRef = useRef<HTMLPreElement | HTMLDivElement | null>(null);
   const followTailRef = useRef(true);
   const previousPathRef = useRef(path);
+  const setBodyNode = useCallback(
+    (node: HTMLPreElement | HTMLDivElement | null) => {
+      bodyRef.current = node;
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!copied) return;
@@ -241,14 +287,14 @@ function FileViewInner({
   // near the bottom or a new live file stream begins.
   useEffect(() => {
     if (!live || !followTailRef.current) return;
-    const node = preRef.current;
+    const node = bodyRef.current;
     if (!node) return;
     node.scrollTop = node.scrollHeight;
   }, [body, live]);
 
   function handleBodyScroll() {
     if (!live) return;
-    const node = preRef.current;
+    const node = bodyRef.current;
     if (!node) return;
     const distanceFromBottom =
       node.scrollHeight - node.scrollTop - node.clientHeight;
@@ -302,18 +348,38 @@ function FileViewInner({
         </span>
       </Box>
       {body ? (
-        <pre
-          ref={preRef}
-          className="code-viewer-pre cview-file-body"
-          onScroll={handleBodyScroll}
-        >
-          <code>{highlightedLines}</code>
-          {live ? (
-            <span className="cview-file-caret" aria-hidden="true">
-              |
-            </span>
-          ) : null}
-        </pre>
+        renderAsMarkdown ? (
+          <Box
+            ref={setBodyNode}
+            className="cview-file-body cview-file-markdown chat-markdown"
+            onScroll={handleBodyScroll}
+          >
+            <ReactMarkdown
+              remarkPlugins={FILE_MARKDOWN_REMARK_PLUGINS}
+              components={FILE_MARKDOWN_COMPONENTS}
+            >
+              {body}
+            </ReactMarkdown>
+            {live ? (
+              <span className="cview-file-caret" aria-hidden="true">
+                |
+              </span>
+            ) : null}
+          </Box>
+        ) : (
+          <pre
+            ref={setBodyNode}
+            className="code-viewer-pre cview-file-body"
+            onScroll={handleBodyScroll}
+          >
+            <code>{highlightedLines}</code>
+            {live ? (
+              <span className="cview-file-caret" aria-hidden="true">
+                |
+              </span>
+            ) : null}
+          </pre>
+        )
       ) : (
         <Typography variant="body2" className="cview-file-empty">
           {live

@@ -400,7 +400,7 @@ export default function MemoryPage({
         outcome,
       }),
     onSuccess: async () => {
-      setNotice("Memory health finding marked reviewed.");
+      setNotice("Memory health finding updated.");
       await invalidateMemory();
     },
   });
@@ -670,6 +670,11 @@ export default function MemoryPage({
                 toBool(finding.can_correct_sensitive_skip) ||
                 reviewOutcome === "expected_sensitive_skip" ||
                 reviewOutcome === "false_positive_safe_memory";
+              const reviewActionLabel =
+                str(
+                  finding.review_action_label,
+                  toBool(finding.dismissible) ? "Dismiss" : "Mark reviewed",
+                ).trim() || "Mark reviewed";
               const created = humanTs(str(finding.created_at, ""));
               const operation = asRecord(finding.operation);
               const operationId = str(operation.id, str(finding.operation_id, "")).trim();
@@ -799,7 +804,7 @@ export default function MemoryPage({
                               })
                             }
                           >
-                            Mark reviewed
+                            {reviewActionLabel}
                           </Button>
                         )}
                       </Stack>

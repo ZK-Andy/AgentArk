@@ -283,7 +283,7 @@ pub(super) async fn load_live_prompt_replay_evaluation(
 ) -> Option<crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult> {
     let state = prompt_canary_state.filter(|state| state.enabled)?;
     let runs = storage
-        .list_recent_experience_runs_any_scope(PROMPT_REPLAY_EVAL_SAMPLE_LIMIT)
+        .list_recent_experience_runs_for_canary_eval(PROMPT_REPLAY_EVAL_SAMPLE_LIMIT)
         .await
         .ok()?;
     Some(
@@ -305,7 +305,7 @@ pub(super) async fn load_live_metadata_prompt_replay_evaluation(
 ) -> Option<crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult> {
     let state = canary_state.filter(|state| state.enabled)?;
     let runs = storage
-        .list_recent_experience_runs_any_scope(PROMPT_REPLAY_EVAL_SAMPLE_LIMIT)
+        .list_recent_experience_runs_for_canary_eval(PROMPT_REPLAY_EVAL_SAMPLE_LIMIT)
         .await
         .ok()?;
     Some(
@@ -3613,6 +3613,12 @@ async fn promote_prompt_canary_to_baseline(
         .set(surface.baseline_snapshot_key, &rollback_snapshot)
         .await
         .with_context(|| format!("Failed to snapshot current {}.", surface.label))?;
+    crate::core::self_evolve::strategy_runtime::push_prompt_snapshot_ring(
+        storage,
+        surface.baseline_snapshot_key,
+        &rollback_snapshot,
+    )
+    .await;
     storage
         .set(surface.profile_key, &candidate)
         .await
@@ -4210,14 +4216,7 @@ pub(super) async fn build_evolution_settings_response(
         && learning_enabled;
     let learning_queue = storage.learning_queue_counts().await.unwrap_or_default();
     let readiness_policy = crate::core::runtime::readiness::load_readiness_policy(storage).await;
-    let routing_rollback_available = storage
-        .get(
-            crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
-        )
-        .await
-        .ok()
-        .flatten()
-        .is_some();
+    let routing_rollback_available = false;
     let prompt_rollback_available = storage
         .get(crate::core::self_evolve::PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY)
         .await
@@ -5097,6 +5096,53 @@ pub(super) async fn build_evolution_dev_response(
         prompt_rollback_available,
     );
     let prompt_insights = build_prompt_insights(&prompt_metrics, prompt_canary_state.as_ref());
+    // Canary-judge outputs for the UI: the stable-promotion recommendation
+    // and the versioned snapshot history (versions only — snapshots stay in
+    // storage).
+    let prompt_stable_recommendation = storage
+        .get(PROMPT_CANARY_STABLE_RECOMMENDED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok());
+    let prompt_snapshot_history = {
+        let ring_key = crate::core::self_evolve::strategy_runtime::prompt_snapshot_ring_key(
+            crate::core::self_evolve::PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+        );
+        match storage.get(&ring_key).await {
+            Ok(Some(raw)) => serde_json::from_slice::<Vec<serde_json::Value>>(&raw)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "version": entry.get("version").cloned().unwrap_or(serde_json::Value::Null),
+                        "saved_at": entry.get("saved_at").cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    // Usage-mined ArkEvolve candidates (persisted rows): everything the user
+    // can see or act on, newest first, bounded.
+    let usage_candidates = storage
+        .list_evolve_opportunities_by_status(
+            &[
+                "surfaced",
+                "approved",
+                "testing",
+                "deployed",
+                "dismissed",
+                "reverted",
+            ],
+            60,
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| serde_json::to_value(&row).unwrap_or_else(|_| serde_json::json!({})))
+        .collect::<Vec<_>>();
+    let usage_opportunities = usage_candidates.clone();
     let specialist_prompt_canary_state = load_canary_state_by_key(
         storage,
         crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
@@ -5212,6 +5258,10 @@ pub(super) async fn build_evolution_dev_response(
         prompt_telemetry_summary,
         arkdistill_context_summary,
         prompt_optimization_opportunities,
+        usage_candidates,
+        usage_opportunities,
+        prompt_stable_recommendation,
+        prompt_snapshot_history,
     }
 }
 
@@ -6063,6 +6113,415 @@ fn gepa_auto_readiness_blocker_message(blocker: &str) -> String {
     }
 }
 
+const CANARY_JUDGE_MIN_SAMPLES_PER_ARM: usize = 20;
+/// Success-rate drop (absolute) that counts as a regression.
+const CANARY_JUDGE_REGRESSION_SUCCESS_DROP: f64 = 0.02;
+/// Measured-dimension blowup ratio (tokens / latency / cost) vs baseline that
+/// counts as a regression.
+const CANARY_JUDGE_REGRESSION_RATIO: f64 = 1.5;
+const CANARY_SAFETY_EVENTS_CAP: usize = 20;
+pub(super) const PROMPT_CANARY_STABLE_RECOMMENDED_KEY: &str =
+    "evolve_prompt_canary_stable_recommended_v1";
+
+fn evolve_candidate_scan_message(
+    summary: &crate::core::self_evolve::opportunities::MiningPassSummary,
+) -> String {
+    if let Some(reason) = summary.skipped_reason.as_deref() {
+        format!("ArkEvolve scan skipped: {}.", reason)
+    } else if summary.drafts_mined == 0 {
+        "ArkEvolve scan finished: no candidate signals in the current usage window yet. It needs more honest-labeled runs or repeated learning evidence.".to_string()
+    } else if summary.surfaced == 0 {
+        format!(
+            "ArkEvolve scan finished: {} signal(s) checked, but none were useful enough to show. {} judged not useful.",
+            summary.drafts_mined, summary.rejected
+        )
+    } else {
+        format!(
+            "ArkEvolve scan finished: {} candidate(s) ready for review, {} judged not useful (from {} signal(s)).",
+            summary.surfaced, summary.rejected, summary.drafts_mined
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PromptCanaryEvalSource {
+    PromptVersion,
+    ExperienceMetadata(&'static str),
+    TraceTelemetry(&'static str),
+}
+
+#[derive(Clone, Copy)]
+struct PromptCanaryJudgeSurface {
+    surface: &'static str,
+    label: &'static str,
+    trace_kind: &'static str,
+    eval_source: PromptCanaryEvalSource,
+}
+
+const PROMPT_CANARY_JUDGE_SURFACES: &[PromptCanaryJudgeSurface] = &[
+    PromptCanaryJudgeSurface {
+        surface: "prompt",
+        label: "Prompt bundle",
+        trace_kind: "experience",
+        eval_source: PromptCanaryEvalSource::PromptVersion,
+    },
+    PromptCanaryJudgeSurface {
+        surface: "specialist_prompt",
+        label: "Specialist prompt bundle",
+        trace_kind: "experience",
+        eval_source: PromptCanaryEvalSource::ExperienceMetadata("specialist_prompt_version"),
+    },
+    PromptCanaryJudgeSurface {
+        surface: "prompt_fragment",
+        label: "Prompt fragment bundle",
+        trace_kind: "trace_prompt_telemetry",
+        eval_source: PromptCanaryEvalSource::TraceTelemetry("prompt_fragment_version"),
+    },
+];
+
+/// Background canary judge for every prompt-evolution surface. Pure
+/// statistics over honest-labeled runs or trace telemetry (no model calls):
+/// auto-reverts multidimensional regressions, recommends stable promotion on
+/// sustained wins (promotion itself stays manual), and writes measured results
+/// into opportunity value ledgers.
+async fn run_prompt_canary_judge_tick(storage: &crate::storage::Storage) {
+    for surface in PROMPT_CANARY_JUDGE_SURFACES {
+        run_prompt_canary_judge_surface_tick(storage, *surface).await;
+    }
+}
+
+async fn run_prompt_canary_judge_surface_tick(
+    storage: &crate::storage::Storage,
+    judge_surface: PromptCanaryJudgeSurface,
+) {
+    let Ok(surface) = prompt_runtime_surface(judge_surface.surface) else {
+        return;
+    };
+    let Ok(canary) = load_prompt_canary_state_for_surface(storage, &surface).await else {
+        return;
+    };
+    if !canary.enabled {
+        return;
+    }
+    let Some(eval) = evaluate_prompt_canary_judge_surface(storage, &canary, judge_surface).await
+    else {
+        return;
+    };
+    if !eval.eligible {
+        return;
+    }
+
+    let dimensions = canary_regression_dimensions(&eval);
+    let regressed = !dimensions.is_empty();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let measured_patch = serde_json::json!({
+        "measured": {
+            "surface": judge_surface.surface,
+            "judged_at": now,
+            "baseline": eval.baseline,
+            "candidate": eval.candidate,
+            "success_gain": eval.success_gain,
+            "wins": eval.wins,
+            "losses": eval.losses,
+            "p_value": eval.p_value,
+        }
+    });
+
+    if regressed {
+        match rollback_prompt_baseline_for_surface(storage, judge_surface.surface).await {
+            Ok(_) => {
+                tracing::warn!(
+                    surface = %judge_surface.surface,
+                    candidate = %eval.candidate_version,
+                    dimensions = ?dimensions,
+                    "canary judge auto-reverted a regressing prompt-surface canary"
+                );
+                let event =
+                    crate::core::self_evolve::strategy_runtime::PromptProfileCanarySafetyEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        trace_kind: judge_surface.trace_kind.to_string(),
+                        surface: judge_surface.surface.to_string(),
+                        surface_label: judge_surface.label.to_string(),
+                        status: "auto_reverted".to_string(),
+                        auto_reverted: true,
+                        review_status: "pending".to_string(),
+                        reviewed_at: None,
+                        title: format!(
+                            "ArkEvolve auto-reverted a {} canary",
+                            judge_surface.label
+                        ),
+                        summary: format!(
+                            "ArkEvolve detected a regression in {} on real usage and restored the previous {}.",
+                            dimensions.join(", "),
+                            judge_surface.label
+                        ),
+                        baseline_version: eval.baseline_version.clone(),
+                        candidate_version: eval.candidate_version.clone(),
+                        baseline_samples: eval.baseline.samples,
+                        candidate_samples: eval.candidate.samples,
+                        baseline_success_rate: eval.baseline.success_rate,
+                        candidate_success_rate: eval.candidate.success_rate,
+                        success_delta: eval.success_gain,
+                        wins: eval.wins,
+                        losses: eval.losses,
+                        regression_p_value: eval.p_value,
+                        min_success_gain: canary.min_success_gain,
+                        max_sign_test_p_value: canary.max_sign_test_p_value,
+                        created_at: now.clone(),
+                    };
+                let mut events = load_prompt_canary_safety_events(storage).await;
+                events.insert(0, event);
+                events.truncate(CANARY_SAFETY_EVENTS_CAP);
+                if let Err(error) = store_prompt_canary_safety_events(storage, &events).await {
+                    tracing::warn!(error = %error, "failed to store canary safety event");
+                }
+                update_prompt_opportunity_lifecycle(
+                    storage,
+                    judge_surface.surface,
+                    measured_patch,
+                    Some(("reverted", "auto-reverted after measured regression")),
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "canary judge failed to auto-revert");
+            }
+        }
+        return;
+    }
+
+    if eval.promote {
+        let recommendation = serde_json::json!({
+            "recommended": true,
+            "recommended_at": now,
+            "surface": judge_surface.surface,
+            "evaluation": &eval,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&recommendation) {
+            if let Err(error) = storage
+                .set(PROMPT_CANARY_STABLE_RECOMMENDED_KEY, &bytes)
+                .await
+            {
+                tracing::warn!(error = %error, "failed to record stable recommendation");
+            }
+        }
+        tracing::info!(
+            surface = %judge_surface.surface,
+            candidate = %eval.candidate_version,
+            "canary judge recommends stable promotion (manual approval required)"
+        );
+    }
+    update_prompt_opportunity_lifecycle(storage, judge_surface.surface, measured_patch, None).await;
+}
+
+async fn evaluate_prompt_canary_judge_surface(
+    storage: &crate::storage::Storage,
+    canary: &crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+    surface: PromptCanaryJudgeSurface,
+) -> Option<crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult> {
+    match surface.eval_source {
+        PromptCanaryEvalSource::PromptVersion => {
+            let runs = storage
+                .list_recent_experience_runs_for_canary_eval(PROMPT_REPLAY_EVAL_SAMPLE_LIMIT)
+                .await
+                .ok()?;
+            Some(
+                crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_prompt_version(
+                    &runs,
+                    &canary.baseline_version,
+                    &canary.candidate_version,
+                    CANARY_JUDGE_MIN_SAMPLES_PER_ARM,
+                    canary.min_success_gain,
+                    canary.max_sign_test_p_value,
+                ),
+            )
+        }
+        PromptCanaryEvalSource::ExperienceMetadata(metadata_key) => {
+            let runs = storage
+                .list_recent_experience_runs_for_canary_eval(PROMPT_REPLAY_EVAL_SAMPLE_LIMIT)
+                .await
+                .ok()?;
+            Some(
+                crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_metadata_version(
+                    &runs,
+                    metadata_key,
+                    &canary.baseline_version,
+                    &canary.candidate_version,
+                    CANARY_JUDGE_MIN_SAMPLES_PER_ARM,
+                    canary.min_success_gain,
+                    canary.max_sign_test_p_value,
+                ),
+            )
+        }
+        PromptCanaryEvalSource::TraceTelemetry(metadata_key) => {
+            let traces = storage
+                .list_execution_trace_summaries(None, PROMPT_REPLAY_EVAL_SAMPLE_LIMIT, 0)
+                .await
+                .ok()?;
+            Some(
+                crate::core::self_evolve::strategy_runtime::evaluate_trace_prompt_telemetry_canary_by_version(
+                    &traces,
+                    metadata_key,
+                    &canary.baseline_version,
+                    &canary.candidate_version,
+                    CANARY_JUDGE_MIN_SAMPLES_PER_ARM,
+                    canary.min_success_gain,
+                    canary.max_sign_test_p_value,
+                ),
+            )
+        }
+    }
+}
+
+fn canary_regression_dimensions(
+    eval: &crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
+) -> Vec<&'static str> {
+    let mut dimensions = Vec::new();
+    if eval.candidate.success_rate + CANARY_JUDGE_REGRESSION_SUCCESS_DROP
+        < eval.baseline.success_rate
+        && eval.losses > eval.wins
+    {
+        dimensions.push("success rate");
+    }
+    let ratio_regression = |baseline: Option<f64>, candidate: Option<f64>| {
+        matches!(
+            (baseline, candidate),
+            (Some(base), Some(cand)) if base > 0.0 && cand > base * CANARY_JUDGE_REGRESSION_RATIO
+        )
+    };
+    if ratio_regression(
+        eval.baseline.avg_tokens_per_turn,
+        eval.candidate.avg_tokens_per_turn,
+    ) {
+        dimensions.push("tokens per turn");
+    }
+    if ratio_regression(
+        eval.baseline.p95_wall_ms.map(|value| value as f64),
+        eval.candidate.p95_wall_ms.map(|value| value as f64),
+    ) || ratio_regression(
+        eval.baseline.p95_latency_ms.map(|value| value as f64),
+        eval.candidate.p95_latency_ms.map(|value| value as f64),
+    ) {
+        dimensions.push("latency");
+    }
+    if ratio_regression(
+        eval.baseline.avg_cost_microusd,
+        eval.candidate.avg_cost_microusd,
+    ) {
+        dimensions.push("cost");
+    }
+    dimensions
+}
+
+/// Move prompt-surface opportunities through testing and merge measured
+/// canary results into their value ledgers.
+async fn update_prompt_opportunity_lifecycle(
+    storage: &crate::storage::Storage,
+    surface_name: &str,
+    measured_patch: serde_json::Value,
+    terminal: Option<(&str, &str)>,
+) {
+    let normalized_surface = prompt_runtime_surface(surface_name)
+        .map(|surface| surface.surface.to_string())
+        .unwrap_or_else(|_| surface_name.trim().to_string());
+    let Ok(opportunities) = storage
+        .list_evolve_opportunities_by_status(&["approved", "testing"], 30)
+        .await
+    else {
+        return;
+    };
+    for opportunity in opportunities.iter().filter(|opportunity| {
+        prompt_surface_matches_target(&normalized_surface, &opportunity.target_surface)
+    }) {
+        let _ = storage
+            .merge_evolve_opportunity_ledger(&opportunity.id, measured_patch.clone())
+            .await;
+        append_prompt_opportunity_value_ledger(
+            storage,
+            &opportunity.id,
+            &normalized_surface,
+            &measured_patch,
+        )
+        .await;
+        match terminal {
+            Some((status, note)) => {
+                let _ = storage
+                    .update_evolve_opportunity_status(
+                        &opportunity.id,
+                        status,
+                        Some(serde_json::json!({
+                            "useful": true,
+                            "reason": note,
+                            "judged_at": chrono::Utc::now().to_rfc3339(),
+                        })),
+                        None,
+                    )
+                    .await;
+            }
+            None if opportunity.status == "approved" => {
+                let _ = storage
+                    .update_evolve_opportunity_status(&opportunity.id, "testing", None, None)
+                    .await;
+            }
+            None => {}
+        }
+    }
+}
+
+fn prompt_surface_matches_target(surface: &str, target_surface: &str) -> bool {
+    match surface {
+        "prompt" => target_surface.starts_with("prompt_bundle"),
+        "specialist_prompt" => {
+            target_surface.starts_with("specialist_prompt")
+                || target_surface.starts_with("specialist_prompt_bundle")
+        }
+        "prompt_fragment" => {
+            target_surface == "prompt_fragment" || target_surface.starts_with("prompt_fragment:")
+        }
+        _ => false,
+    }
+}
+
+async fn append_prompt_opportunity_value_ledger(
+    storage: &crate::storage::Storage,
+    opportunity_id: &str,
+    surface: &str,
+    value: &serde_json::Value,
+) {
+    let phase = if value.get("realized").is_some() {
+        "realized"
+    } else if value.get("measured").is_some() {
+        "measured"
+    } else {
+        "observed"
+    };
+    let rendered = serde_json::to_string(value).unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    let entry = crate::storage::entities::evolve_value_ledger::Model {
+        id: format!(
+            "evolve-value-{}-{}-{}",
+            opportunity_id,
+            phase,
+            crate::core::self_evolve::opportunities::stable_content_hash(&rendered)
+        ),
+        opportunity_id: opportunity_id.to_string(),
+        phase: phase.to_string(),
+        value_json: value.clone(),
+        source_ref: Some(format!("prompt_surface:{surface}")),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    if let Err(error) = storage.append_evolve_value_ledger_entry(&entry).await {
+        tracing::warn!(
+            error = %error,
+            opportunity_id,
+            phase,
+            "failed to append prompt opportunity value ledger entry"
+        );
+    }
+}
+
 async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
     let agent = {
         let agent = state.agent.read().await;
@@ -6116,6 +6575,28 @@ async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
         save_gepa_auto_skip(&storage, auto_state, now, "waiting_for_quiet_time", 0, None).await;
         return Ok(());
     }
+
+    // Opportunity mining shares the quiet-time gate but keeps its own shorter
+    // cooldown: a mining pass is one bounded helper-model call, unlike a full
+    // GEPA run, and must not be starved by the GEPA cooldown below.
+    let mining_summary =
+        crate::core::self_evolve::opportunities::maybe_run_opportunity_mining_pass(
+            &storage, &agent.llm, false,
+        )
+        .await;
+    if mining_summary.ran {
+        tracing::info!(
+            surfaced = mining_summary.surfaced,
+            rejected = mining_summary.rejected,
+            drafts = mining_summary.drafts_mined,
+            "opportunity mining pass completed"
+        );
+    }
+
+    // Canary judge: pure statistics over honest-labeled runs (no model
+    // calls). Auto-reverts regressions, recommends stable on sustained wins,
+    // feeds opportunity value ledgers.
+    run_prompt_canary_judge_tick(&storage).await;
 
     if let Some(last_activity_at) = gepa_auto_latest_activity_at(&auto_state) {
         let cooldown_until = last_activity_at + chrono::Duration::hours(GEPA_AUTO_COOLDOWN_HOURS);
@@ -6245,184 +6726,17 @@ pub(super) fn spawn_gepa_auto_loop(
 }
 
 async fn run_guided_routing_optimization(
-    state: &AppState,
-    storage: &crate::storage::Storage,
+    _state: &AppState,
+    _storage: &crate::storage::Storage,
 ) -> std::result::Result<String, String> {
-    let enabled = storage
-        .get(crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| String::from_utf8(raw).ok())
-        .map(|s| !s.trim().eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-        && crate::core::knowledge::learning::load_learning_enabled(storage).await;
-    if !enabled {
-        return Err("Evolve is off. Turn on Self-evolve before running optimization.".to_string());
-    }
-
-    let llm = {
-        let agent = state.agent.read().await;
-        agent.llm.clone()
-    };
-    let current_policy_raw = storage
-        .get(crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY)
-        .await
-        .map_err(|error| format!("Failed to load current routing policy: {}", error))?;
-    let config = crate::core::self_evolve::PolicyEvolutionConfig {
-        project_root: resolve_project_root(),
-        ..Default::default()
-    };
-    let engine = crate::core::self_evolve::PolicyEvolutionEngine::new(config, llm);
-    let result = engine
-        .evolve_routing_policy(
-            "Improve AgentArk turn-routing accuracy from recent typed turn evidence. Keep accuracy and safety ahead of token, latency, and cost savings.",
-            current_policy_raw.as_deref(),
-        )
-        .await
-        .map_err(|error| format!("Optimization failed: {}", error))?;
-
-    let mut promotion_mode = "none";
-    let mut canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState> =
-        None;
-    let mut replay_result: Option<
-        crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
-    > = None;
-
-    if result.promoted {
-        if let Some(policy_json) = result.promoted_policy.as_ref() {
-            let candidate_serialized = serde_json::to_vec(policy_json)
-                .map_err(|error| format!("Failed to encode candidate policy: {}", error))?;
-            if let Some(existing_baseline) = current_policy_raw.as_ref() {
-                storage
-                    .set(
-                        crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
-                        existing_baseline,
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!("Failed to snapshot current routing policy: {}", error)
-                    })?;
-            }
-
-            let baseline_version = storage
-                .get(
-                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                )
-                .await
-                .ok()
-                .flatten()
-                .and_then(|raw| {
-                    serde_json::from_slice::<
-                        crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
-                    >(&raw)
-                    .ok()
-                    .map(|state| state.baseline_version)
-                })
-                .unwrap_or_else(|| "routing-policy-default-v1".to_string());
-            let candidate_version = format!("routing-candidate-{}", result.lineage_entry_id);
-
-            storage
-                .set(
-                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY,
-                    &candidate_serialized,
-                )
-                .await
-                .map_err(|error| format!("Failed to save candidate routing policy: {}", error))?;
-            let state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
-                enabled: true,
-                baseline_version,
-                candidate_version,
-                rollout_percent: 20,
-                min_samples_per_version: 25,
-                min_success_gain: 0.03,
-                max_sign_test_p_value: 0.10,
-                activated_at: Some(chrono::Utc::now().to_rfc3339()),
-            };
-            let state_bytes = serde_json::to_vec(&state)
-                .map_err(|error| format!("Failed to encode canary state: {}", error))?;
-            storage
-                .set(
-                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                    &state_bytes,
-                )
-                .await
-                .map_err(|error| format!("Failed to activate routing canary: {}", error))?;
-            canary_state = Some(state.clone());
-            promotion_mode = "canary";
-
-            if let Ok(logs) = storage
-                .list_operational_logs_by_event("tool_call", 4_000)
-                .await
-            {
-                let replay_eval =
-                    crate::core::self_evolve::strategy_runtime::evaluate_canary_by_policy_version(
-                        &logs,
-                        &state.baseline_version,
-                        &state.candidate_version,
-                        state.min_samples_per_version,
-                        state.min_success_gain,
-                        state.max_sign_test_p_value,
-                    );
-                if replay_eval.promote {
-                    promotion_mode = "canary";
-                }
-                replay_result = Some(replay_eval);
-            }
-        }
-    }
-
-    let mut value = serde_json::to_value(&result)
-        .map_err(|error| format!("Failed to serialize optimization result: {}", error))?;
-    if let serde_json::Value::Object(obj) = &mut value {
-        obj.insert("mode".to_string(), serde_json::json!("policy"));
-        obj.insert(
-            "promotion_applied".to_string(),
-            serde_json::json!(promotion_mode != "none"),
-        );
-        obj.insert(
-            "apply_promotion_requested".to_string(),
-            serde_json::json!(true),
-        );
-        obj.insert(
-            "promotion_mode".to_string(),
-            serde_json::json!(promotion_mode),
-        );
-        obj.insert(
-            "canary_state".to_string(),
-            serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
-        );
-        obj.insert(
-            "replay_evaluation".to_string(),
-            serde_json::to_value(&replay_result).unwrap_or(serde_json::Value::Null),
-        );
-    }
-    if let Ok(bytes) = serde_json::to_vec(&value) {
-        let _ = storage
-            .set(
-                crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_LAST_RESULT_KEY,
-                &bytes,
-            )
-            .await;
-    }
-
-    if !result.success {
-        return Ok(format!(
-            "Optimization ran but could not finish: {}",
-            result.error.as_deref().unwrap_or("unknown error")
-        ));
-    }
-    if promotion_mode == "canary" {
-        return Ok(format!(
-            "Optimization found a routing improvement and started a 20% canary. Accuracy changed from {:.0}% to {:.0}%.",
-            result.baseline_accuracy * 100.0,
-            result.best_candidate_accuracy * 100.0,
-        ));
-    }
-    Ok(format!(
-        "Optimization checked {} routing candidates. No candidate beat the current behavior, so nothing changed.",
-        result.evaluated_candidates
-    ))
+    // RETIRED (2026-06-10): this guided pass evolved RoutingComplexityPolicy,
+    // which the live router never reads, against a canary feed with no
+    // production writer. ArkEvolve candidates replaced it.
+    Err(
+        "Routing-policy optimization is retired: its output was never consumed by the live \
+         router. Review ArkEvolve candidates on the Evolve page instead."
+            .to_string(),
+    )
 }
 
 pub(super) async fn run_evolution_dev_action(
@@ -6506,6 +6820,275 @@ pub(super) async fn run_evolution_dev_action(
                 Ok(message) => message,
                 Err(error) => {
                     return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        .into_response();
+                }
+            }
+        }
+        "scan_evolve_candidates" | "mine_opportunities" => {
+            let agent = {
+                let agent = state.agent.read().await;
+                agent.clone()
+            };
+            // Explicit user invocation bypasses the cooldown, never the
+            // single-flight guard or the bounded window.
+            let summary =
+                crate::core::self_evolve::opportunities::maybe_run_opportunity_mining_pass(
+                    &storage, &agent.llm, true,
+                )
+                .await;
+            evolve_candidate_scan_message(&summary)
+        }
+        "approve_evolve_candidate" | "approve_opportunity" => {
+            let Some(opportunity_id) = request
+                .proposal_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "proposal_id is required for approve_evolve_candidate.".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            let Some(opportunity) = (match storage.get_evolve_opportunity(opportunity_id).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to load candidate: {}", error),
+                        }),
+                    )
+                        .into_response();
+                }
+            }) else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "Candidate not found.".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            if opportunity.status != "surfaced" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "Candidate is '{}'; only surfaced candidates can be approved.",
+                            opportunity.status
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+            let agent = {
+                let agent = state.agent.read().await;
+                agent.clone()
+            };
+            let request_text = format!(
+                "Optimize the {} surface for this user activity segment: {}. Evidence: {}. Expected benefit: {}.",
+                opportunity.target_surface,
+                opportunity.segment_label,
+                opportunity.evidence_json,
+                opportunity.expected_benefit_json,
+            );
+            let opportunity_context = serde_json::json!({
+                "opportunity_id": opportunity.id,
+                "miner_key": opportunity.miner_key,
+                "segment_label": opportunity.segment_label,
+                "target_surface": opportunity.target_surface,
+                "evidence": opportunity.evidence_json,
+                "expected_benefit": opportunity.expected_benefit_json,
+                "holdout_run_ids": opportunity.holdout_run_ids_json,
+            });
+            match agent
+                .queue_gepa_prompt_optimization_run(
+                    &opportunity.id,
+                    &request_text,
+                    GEPA_AUTO_QUIET_WINDOW_SECS,
+                    Some(opportunity_context),
+                )
+                .await
+            {
+                Ok(job_path) => {
+                    if let Err(error) = storage
+                        .update_evolve_opportunity_status(
+                            &opportunity.id,
+                            "approved",
+                            None,
+                            Some(&job_path),
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %error, "failed to record opportunity approval");
+                    }
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let ledger_entry = crate::storage::entities::evolve_value_ledger::Model {
+                        id: format!("evolve-ledger-{}", uuid::Uuid::new_v4().simple()),
+                        opportunity_id: opportunity.id.clone(),
+                        phase: "expected".to_string(),
+                        value_json: serde_json::json!({
+                            "expected_benefit": opportunity.expected_benefit_json.clone(),
+                            "recorded_at": now,
+                            "source": "approve_evolve_candidate",
+                        }),
+                        source_ref: Some(job_path.clone()),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    };
+                    if let Err(error) = storage
+                        .append_evolve_value_ledger_entry(&ledger_entry)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            opportunity_id = %opportunity.id,
+                            "failed to append expected value ledger entry"
+                        );
+                    }
+                    "Candidate approved. ArkEvolve queued an optimization run for quiet time; results canary before anything goes stable.".to_string()
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("Failed to queue optimization: {}", error),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        "rollback_prompt_to_version" => {
+            let surface_name = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("prompt");
+            let Some(version) = request
+                .proposal_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "proposal_id (snapshot version) is required.".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            let surface = match prompt_runtime_surface(surface_name) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            let ring_key = crate::core::self_evolve::strategy_runtime::prompt_snapshot_ring_key(
+                surface.baseline_snapshot_key,
+            );
+            let ring: Vec<serde_json::Value> = match storage.get(&ring_key).await {
+                Ok(Some(raw)) => serde_json::from_slice(&raw).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let Some(snapshot) = ring.iter().find_map(|entry| {
+                (entry.get("version").and_then(|entry| entry.as_str()) == Some(version))
+                    .then(|| entry.get("snapshot").cloned())
+                    .flatten()
+            }) else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "No snapshot with version '{}' in the {} history.",
+                            version, surface.label
+                        ),
+                    }),
+                )
+                    .into_response();
+            };
+            let snapshot_bytes = match serde_json::to_vec(&snapshot) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Snapshot could not be serialized: {}", error),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            if let Err(error) = storage.set(surface.profile_key, &snapshot_bytes).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to restore {}: {}", surface.label, error),
+                    }),
+                )
+                    .into_response();
+            }
+            if let Ok(mut state) = load_prompt_canary_state_for_surface(&storage, &surface).await {
+                state.enabled = false;
+                if let Ok(bytes) = serde_json::to_vec(&state) {
+                    let _ = storage.set(surface.canary_state_key, &bytes).await;
+                }
+            }
+            format!(
+                "{} restored to version '{}' from the snapshot history; any active canary was disabled.",
+                surface.label, version
+            )
+        }
+        "dismiss_evolve_candidate" | "dismiss_opportunity" => {
+            let Some(opportunity_id) = request
+                .proposal_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "proposal_id is required for dismiss_evolve_candidate.".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            match storage
+                .update_evolve_opportunity_status(opportunity_id, "dismissed", None, None)
+                .await
+            {
+                Ok(Some(_)) => {
+                    "Candidate dismissed. ArkEvolve will only revisit this segment if its evidence changes materially.".to_string()
+                }
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: "Candidate not found.".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to dismiss candidate: {}", error),
+                        }),
+                    )
                         .into_response();
                 }
             }
@@ -6748,89 +7331,13 @@ pub(super) async fn run_evolution_dev_action(
                     promoted_version
                 )
             } else {
-                let candidate_bytes = match storage
-                    .get(crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY)
-                    .await
-                {
-                    Ok(Some(v)) => v,
-                    _ => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse {
-                                error: "No candidate policy found to promote.".to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                };
-                match stable_deployment_cadence_pause_message(&storage).await {
-                    Ok(Some(message)) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse { error: message }),
-                        )
-                            .into_response();
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!(
-                                    "Failed to evaluate stable deployment cadence: {}",
-                                    error
-                                ),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-                if let Err(e) = storage
-                    .set(
-                        crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
-                        &candidate_bytes,
-                    )
-                    .await
-                {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("Failed to promote candidate: {}", e),
-                        }),
-                    )
-                        .into_response();
-                }
-                if let Some(mut canary) = load_evolution_canary_state(&storage).await {
-                    canary.enabled = false;
-                    let promoted_version = canary.candidate_version.clone();
-                    canary.baseline_version = canary.candidate_version.clone();
-                    if let Ok(bytes) = serde_json::to_vec(&canary) {
-                        let _ = storage
-                            .set(
-                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                                &bytes,
-                            )
-                            .await;
-                    }
-                    record_evolve_stable_deployment(
-                        &storage,
-                        "routing_policy",
-                        "manual_promote_candidate",
-                        None,
-                        Some(promoted_version),
-                    )
-                    .await;
-                } else {
-                    record_evolve_stable_deployment(
-                        &storage,
-                        "routing_policy",
-                        "manual_promote_candidate",
-                        None,
-                        None,
-                    )
-                    .await;
-                }
-                "Candidate policy promoted to baseline.".to_string()
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "candidate_id is required for promote_candidate; legacy routing-policy promotion is retired.".to_string(),
+                    }),
+                )
+                    .into_response();
             }
         }
         "rollback_baseline" => {
@@ -6890,50 +7397,13 @@ pub(super) async fn run_evolution_dev_action(
                     restored_version
                 )
             } else {
-                let snapshot = match storage
-                    .get(
-                        crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
-                    )
-                    .await
-                {
-                    Ok(Some(v)) => v,
-                    _ => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse {
-                                error: "No baseline snapshot available for rollback.".to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                };
-                if let Err(e) = storage
-                    .set(
-                        crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
-                        &snapshot,
-                    )
-                    .await
-                {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("Failed to rollback baseline policy: {}", e),
-                        }),
-                    )
-                        .into_response();
-                }
-                if let Some(mut canary) = load_evolution_canary_state(&storage).await {
-                    canary.enabled = false;
-                    if let Ok(bytes) = serde_json::to_vec(&canary) {
-                        let _ = storage
-                            .set(
-                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                                &bytes,
-                            )
-                            .await;
-                    }
-                }
-                "Rolled back to the stored baseline snapshot.".to_string()
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "candidate_id is required for rollback_baseline; legacy routing-policy rollback is retired.".to_string(),
+                    }),
+                )
+                    .into_response();
             }
         }
         "approve_learning_candidate" => {
@@ -7221,6 +7691,105 @@ pub(super) async fn run_evolution_dev_action(
                                 .into_response();
                         }
                     }
+                }
+                crate::core::self_evolve::ROUTER_LEARNING_CANDIDATE_TYPE => {
+                    // Apply arm (previously missing — captures were write-only):
+                    // approving turns the captured real failing exchange into a
+                    // permanent usage eval case, so candidates must avoid this
+                    // exact failure class to ever promote.
+                    let payload = match serde_json::from_value::<
+                        crate::core::self_evolve::RouterLearningCandidatePayload,
+                    >(candidate.proposed_content.clone())
+                    {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Router learning candidate payload is invalid: {}",
+                                        error
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                    let cases = payload
+                        .evidence
+                        .iter()
+                        .filter(|evidence| !evidence.user_message_preview.trim().is_empty())
+                        .map(|evidence| {
+                            crate::core::self_evolve::opportunities::eval_sets::UsageEvalCase {
+                                id: format!("router-case-{}", evidence.trace_id),
+                                source_run_id: evidence.trace_id.clone(),
+                                kind: "corrected".to_string(),
+                                request: evidence.user_message_preview.trim().to_string(),
+                                expectation: format!(
+                                    "Routing previously failed this request ({}). A good answer \
+                                     serves the request without that routing failure.",
+                                    payload.objective
+                                ),
+                                disallowed_behavior:
+                                    "Do not repeat the router miss or choose a weaker surface when the available capability evidence supports a better route."
+                                        .to_string(),
+                                missing_info_policy:
+                                    "Ask for missing non-secret routing requirements only when the semantic plan and capability evidence do not supply them."
+                                        .to_string(),
+                                secret_policy:
+                                    "Never request credentials in chat while repairing a routing failure."
+                                        .to_string(),
+                                contract_event: serde_json::json!({
+                                    "surface": "router",
+                                    "contract_kind": "router_miss",
+                                    "router_layer": payload.router_layer.clone(),
+                                }),
+                                opportunity_id: None,
+                                holdout: true,
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    if cases.is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "Router learning candidate has no usable trace evidence."
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    let added = cases.len();
+                    if let Err(error) =
+                        crate::core::self_evolve::opportunities::eval_sets::persist_usage_eval_cases(
+                            &storage,
+                            &cases,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %error, "failed to persist router learning eval rows");
+                    }
+                    let mut eval_store =
+                        crate::core::self_evolve::opportunities::eval_sets::load_usage_eval_store(
+                            &storage,
+                        )
+                        .await;
+                    if crate::core::self_evolve::opportunities::eval_sets::merge_usage_cases(
+                        &mut eval_store,
+                        cases,
+                    ) {
+                        crate::core::self_evolve::opportunities::eval_sets::save_usage_eval_store(
+                            &storage,
+                            &eval_store,
+                        )
+                        .await;
+                    }
+                    format!(
+                        "{}:{} eval case(s) added",
+                        crate::core::self_evolve::ROUTER_LEARNING_SUBJECT_KEY,
+                        added
+                    )
                 }
                 "memory_add" | "memory_update" | "memory_retract" => {
                     let operation_id = candidate
@@ -8034,6 +8603,25 @@ pub(super) async fn run_evolution_dev_action(
                             .map(|canary| canary.candidate_version.clone()),
                     )
                     .await;
+                    // Stable promotion realizes the value: clear the judge's
+                    // recommendation flag and move prompt-surface
+                    // opportunities to deployed with a realized ledger entry.
+                    let _ = storage.delete(PROMPT_CANARY_STABLE_RECOMMENDED_KEY).await;
+                    update_prompt_opportunity_lifecycle(
+                        &storage,
+                        surface,
+                        serde_json::json!({
+                            "realized": {
+                                "promoted_at": chrono::Utc::now().to_rfc3339(),
+                                "surface": surface,
+                                "candidate_version": canary_before_promotion
+                                    .as_ref()
+                                    .map(|canary| canary.candidate_version.clone()),
+                            }
+                        }),
+                        Some(("deployed", "promoted to stable by the user")),
+                    )
+                    .await;
                     if let Some(proposal_id) = request
                         .proposal_id
                         .as_deref()
@@ -8255,6 +8843,10 @@ pub(super) async fn run_evolution_dev_action(
                 .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
             "prompt_fragment_canary_state": dev.prompt_fragment_canary_state.clone(),
             "prompt_optimization_opportunities": dev.prompt_optimization_opportunities.clone(),
+            "usage_candidates": dev.usage_candidates.clone(),
+            "usage_opportunities": dev.usage_opportunities.clone(),
+            "prompt_stable_recommendation": dev.prompt_stable_recommendation.clone(),
+            "prompt_snapshot_history": dev.prompt_snapshot_history.clone(),
         }),
     )
     .await;
@@ -8344,5 +8936,108 @@ mod tests {
             gepa_auto_readiness_blocker_message("provider_api_key_missing"),
             "Background optimization cannot start yet. Provider API key missing."
         );
+    }
+
+    #[test]
+    fn prompt_surface_matching_stays_surface_specific() {
+        assert!(prompt_surface_matches_target(
+            "prompt",
+            "prompt_bundle:primary_response"
+        ));
+        assert!(prompt_surface_matches_target(
+            "specialist_prompt",
+            "specialist_prompt_bundle:domain_router"
+        ));
+        assert!(prompt_surface_matches_target(
+            "prompt_fragment",
+            "prompt_fragment:operation_contract_preflight"
+        ));
+        assert!(!prompt_surface_matches_target(
+            "prompt",
+            "prompt_fragment:operation_contract_preflight"
+        ));
+        assert!(!prompt_surface_matches_target(
+            "prompt_fragment",
+            "specialist_prompt_bundle:domain_router"
+        ));
+    }
+
+    #[test]
+    fn evolve_candidate_scan_message_explains_empty_results() {
+        let skipped = crate::core::self_evolve::opportunities::MiningPassSummary {
+            skipped_reason: Some("no honest-labeled usage yet".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            evolve_candidate_scan_message(&skipped),
+            "ArkEvolve scan skipped: no honest-labeled usage yet."
+        );
+
+        let empty = crate::core::self_evolve::opportunities::MiningPassSummary {
+            ran: true,
+            ..Default::default()
+        };
+        assert!(evolve_candidate_scan_message(&empty).contains("no candidate signals"));
+
+        let judged_none = crate::core::self_evolve::opportunities::MiningPassSummary {
+            ran: true,
+            drafts_mined: 3,
+            fresh_judged: 3,
+            rejected: 3,
+            ..Default::default()
+        };
+        assert!(
+            evolve_candidate_scan_message(&judged_none).contains("none were useful enough to show")
+        );
+
+        let surfaced = crate::core::self_evolve::opportunities::MiningPassSummary {
+            ran: true,
+            drafts_mined: 4,
+            fresh_judged: 4,
+            surfaced: 2,
+            rejected: 2,
+            ..Default::default()
+        };
+        assert!(evolve_candidate_scan_message(&surfaced).contains("ready for review"));
+    }
+
+    #[test]
+    fn canary_regression_dimensions_cover_success_latency_tokens_and_cost() {
+        let eval = crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult {
+            eligible: true,
+            promote: false,
+            baseline_version: "baseline".to_string(),
+            candidate_version: "candidate".to_string(),
+            baseline: crate::core::self_evolve::strategy_runtime::ReplayVersionMetrics {
+                samples: 25,
+                successes: 24,
+                success_rate: 0.96,
+                p95_latency_ms: Some(1_000),
+                avg_tokens_per_turn: Some(100.0),
+                p95_wall_ms: Some(1_200),
+                avg_cost_microusd: Some(10.0),
+            },
+            candidate: crate::core::self_evolve::strategy_runtime::ReplayVersionMetrics {
+                samples: 25,
+                successes: 20,
+                success_rate: 0.80,
+                p95_latency_ms: Some(2_000),
+                avg_tokens_per_turn: Some(200.0),
+                p95_wall_ms: Some(2_000),
+                avg_cost_microusd: Some(20.0),
+            },
+            success_gain: -0.16,
+            wins: 1,
+            losses: 4,
+            p_value: 1.0,
+            reason: "regressed".to_string(),
+            reasons: Vec::new(),
+        };
+
+        let dimensions = canary_regression_dimensions(&eval);
+        assert!(dimensions.contains(&"success rate"));
+        assert!(dimensions.contains(&"latency"));
+        assert!(dimensions.contains(&"tokens per turn"));
+        assert!(dimensions.contains(&"cost"));
     }
 }

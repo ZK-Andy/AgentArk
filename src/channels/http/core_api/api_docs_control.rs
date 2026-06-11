@@ -588,6 +588,12 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
     );
     add("/documents/{id}", "DELETE", "Delete document", "Documents");
     add(
+        "/documents/{id}/download",
+        "GET",
+        "Download document",
+        "Documents",
+    );
+    add(
         "/documents/{id}/search",
         "GET",
         "Search document",

@@ -1415,7 +1415,7 @@ impl ActionRuntime {
         self.register_workflow_action(
             ActionDef {
                 name: "research_report_compose".to_string(),
-                description: "Compose gathered research evidence into a polished report with clean sections, citations, tables, and chart blocks when the evidence supports them. Use after sources or evidence have already been collected, when the user wants a formal report, brief, memo, landscape, or implementation analysis rather than another search.".to_string(),
+                description: "Compose gathered research evidence into a polished report with clean sections, citations, tables, and chart blocks when the evidence supports them. For formal deep-research reports, include chart blocks by default for concrete comparable numeric evidence. Use after sources or evidence have already been collected, when the user wants a formal report, brief, memo, landscape, or implementation analysis rather than another search.".to_string(),
                 version: "1.0.0".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1424,7 +1424,7 @@ impl ActionRuntime {
                         "audience": { "type": "string", "description": "Optional reader or stakeholder group for tone and detail level." },
                         "report_type": { "type": "string", "description": "Optional report type such as policy brief, market landscape, technical comparison, implementation plan, investment memo, or literature review." },
                         "output_format": { "type": "string", "enum": ["markdown", "report", "brief"], "description": "Preferred output shape. Defaults to report." },
-                        "include_charts": { "type": "boolean", "description": "Include agentark-chart blocks when the evidence contains comparable numeric values." }
+                        "include_charts": { "type": "boolean", "description": "Include agentark-chart blocks when the evidence contains comparable numeric values. Defaults to true for formal deep-research report output." }
                     },
                     "required": ["evidence"]
                 }),
@@ -2681,12 +2681,12 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "pdf_generate".to_string(),
-            description: "Generate a paginated PDF file from supplied text content, with simple report, letter, invoice, or plain layouts. The result is a PDF artifact for reading, printing, or sharing rather than a runnable interface or hosted application.".to_string(),
+            description: "Generate a paginated PDF file from supplied Markdown/text content, with simple report, letter, invoice, or plain layouts. Fenced agentark-chart JSON blocks are rendered as vector charts in the PDF; when no chart fences are supplied, numeric Markdown tables are automatically summarized as PDF charts. The result is a PDF artifact for reading, printing, or sharing rather than a runnable interface or hosted application.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "content": { "type": "string", "description": "Text content for the PDF" },
+                    "content": { "type": "string", "description": "Markdown/text content for the PDF. Include fenced agentark-chart JSON blocks when the report needs charts backed by concrete numeric data; numeric Markdown tables are auto-charted if chart fences are absent." },
                     "title": { "type": "string", "description": "Document title (optional)" },
                     "filename": { "type": "string", "description": "Output filename (default: output.pdf)" },
                     "style": { "type": "string", "enum": ["report", "letter", "invoice", "plain"], "description": "PDF style/template (default: plain)" }
@@ -4092,11 +4092,11 @@ impl ActionRuntime {
         authorization: integration_authorization("media_gen"),
         }).await;
 
-        // Self-evolve - policy-first self-improvement
+        // Self-evolve - auditable behavior improvement
         self.register_builtin_action(ActionDef {
             name: "self_evolve".to_string(),
             description: format!(
-                "Evolve {} behavior with an auditable promotion loop. Supports policy/strategy, prompt, specialist prompt, and GEPA flows through benchmark, lineage archive, statistical gating, canary rollout, replay gate, and optional promotion. This tool does not mutate the local source tree.",
+                "Evolve {} behavior with an auditable promotion loop. Supports prompt, specialist prompt, and GEPA flows through benchmark, lineage archive, statistical gating, canary rollout, replay gate, and optional promotion. The legacy policy/strategy mode is retired. This tool does not mutate the local source tree.",
                 crate::branding::PRODUCT_NAME
             ),
             version: "1.0.0".to_string(),
@@ -4110,11 +4110,11 @@ impl ActionRuntime {
                     "mode": {
                         "type": "string",
                         "enum": ["policy", "strategy", "prompt", "specialist_prompt", "gepa_export", "gepa_run", "gepa_import", "gepa_status"],
-                        "description": "Evolution mode. policy (default) evolves runtime strategy; prompt/specialist_prompt evolve prompt surfaces; GEPA modes run offline seed export/run/import/status."
+                        "description": "Evolution mode. policy/strategy returns a retired status; prompt/specialist_prompt evolve prompt surfaces; GEPA modes run offline seed export/run/import/status."
                     },
                     "apply_promotion": {
                         "type": "boolean",
-                        "description": "For policy mode: apply promoted policy by activating canary rollout and replay gate. Default true."
+                        "description": "Apply a promoted candidate through canary rollout and replay gate when the selected mode supports promotion. Default false."
                     },
                     "canary_rollout_percent": {
                         "type": "integer",

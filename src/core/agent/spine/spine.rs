@@ -10,7 +10,7 @@ use futures::future::join_all;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
-const PRIMITIVE_NAMES: [&str; 15] = [
+const PRIMITIVE_NAMES: [&str; 16] = [
     "search",
     "fetch",
     "browse",
@@ -25,8 +25,13 @@ const PRIMITIVE_NAMES: [&str; 15] = [
     "skill_manage",
     "resource_rw",
     "memory_rw",
+    "action_call",
     "delegate",
 ];
+const ACTION_DIRECTORY_CONTEXT_MAX_ENTRIES: usize = 24;
+const ACTION_DIRECTORY_CONTEXT_MAX_NAMES: usize = 192;
+const ACTION_DIRECTORY_SCHEMA_FIELD_LIMIT: usize = 8;
+const ACTION_DIRECTORY_FIELD_MAX_CHARS: usize = 360;
 
 #[derive(Debug, Clone, Copy)]
 struct ResourceAdapterSpec {
@@ -767,6 +772,13 @@ impl ToolRegistry {
             "skill_manage" => plan_skill_manage(&call.arguments),
             "resource_rw" => plan_resource_rw(&call.arguments),
             "memory_rw" => plan_memory_rw_for_caller(&call.arguments, cx.request.caller_kind),
+            "action_call" => {
+                let action_def = match json_text(&call.arguments, "action_name") {
+                    Some(action_name) => cx.agent.runtime.action_definition(&action_name).await,
+                    None => None,
+                };
+                plan_action_call(&call.arguments, action_def.as_ref())
+            }
             "delegate" => PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
                 action_name: "delegate".to_string(),
                 arguments: merge_content_metadata(&call.arguments),
@@ -1964,6 +1976,9 @@ pub async fn run_spine(
     let mut completed_tool_signatures: HashMap<String, ToolProgressClass> = HashMap::new();
     let mut tool_repair_attempts: HashMap<String, usize> = HashMap::new();
     let mut completion_reprompts = 0usize;
+    // Never reset by tool evidence; the run-wide backstop against a
+    // permanently-failing tool refilling the per-evidence reprompt budget.
+    let mut total_completion_reprompts = 0usize;
     let current_turn_evidence_start = messages.len();
     let mut freshness_refresh_attempted = false;
     let mut capability_readiness_generation_seen = request.capability_readiness_generation;
@@ -2166,8 +2181,10 @@ pub async fn run_spine(
                     tool_call_id: refresh_call.id.clone(),
                     content: result.to_json_for_tool(&refresh_call),
                 });
-                completion_reprompts =
-                    completion_reprompts_after_tool_evidence(completion_reprompts);
+                if tool_result_progresses_completion_reprompt_budget(&result) {
+                    completion_reprompts =
+                        completion_reprompts_after_tool_evidence(completion_reprompts);
+                }
                 tracing::info!(
                     turn,
                     elapsed_ms = refresh_started.elapsed().as_millis() as u64,
@@ -2175,13 +2192,21 @@ pub async fn run_spine(
                 );
                 continue;
             }
-            match next_completion_step(completion_verdict, completion_reprompts, turn, max_turns) {
+            match next_completion_step(
+                completion_verdict,
+                completion_reprompts,
+                total_completion_reprompts,
+                turn,
+                max_turns,
+            ) {
                 CompletionStep::Accept => {}
                 CompletionStep::Reprompt { prompt } => {
                     completion_reprompts += 1;
+                    total_completion_reprompts += 1;
                     tracing::info!(
                         turn,
                         completion_reprompts,
+                        total_completion_reprompts,
                         elapsed_ms = terminal_gate_started.elapsed().as_millis() as u64,
                         "Spine completion reprompt issued: terminal answer deferred for another turn"
                     );
@@ -2189,15 +2214,21 @@ pub async fn run_spine(
                     continue;
                 }
                 CompletionStep::AcceptWithCaveat { message } => {
-                    let answer = if final_text.trim().is_empty() {
-                        message
-                    } else {
-                        format!("{}\n\n{}", message, final_text)
-                    };
-                    let answer = finalize_user_text(
-                        SpineTerminalTextKind::Completed,
-                        &answer,
+                    let answer = incomplete_terminal_acceptance_text(
+                        &message,
+                        &final_text,
                         TerminalTextProvenance::ModelAuthored,
+                    );
+                    let answer = finalize_user_text(
+                        SpineTerminalTextKind::Blocked,
+                        &answer,
+                        TerminalTextProvenance::SystemAuthored,
+                    );
+                    tracing::info!(
+                        turn,
+                        total_completion_reprompts,
+                        completion_gap = %message,
+                        "Spine blocking incomplete model-authored terminal answer after reprompt budget"
                     );
                     messages.push(SpineMessage::Assistant {
                         content: Some(answer.clone()),
@@ -2205,11 +2236,11 @@ pub async fn run_spine(
                     });
                     cx.emit(SpineTraceEvent::TurnCompleted {
                         turn,
-                        terminal_state: SpineTerminalState::Completed,
+                        terminal_state: SpineTerminalState::Blocked,
                         final_text_present: true,
                     })
                     .await;
-                    return SpineResult::Completed {
+                    return SpineResult::Blocked {
                         messages,
                         final_text: answer,
                         turns_used: turn + 1,
@@ -2326,7 +2357,13 @@ pub async fn run_spine(
                 content: result.to_json_for_tool(tool_call),
             });
         }
-        if prepared_calls.iter().any(|(_, _, blocked)| !*blocked) {
+        if prepared_calls
+            .iter()
+            .zip(results.iter())
+            .any(|((_, _, blocked), result)| {
+                !*blocked && tool_result_progresses_completion_reprompt_budget(result)
+            })
+        {
             completion_reprompts = completion_reprompts_after_tool_evidence(completion_reprompts);
         }
         for ((tool_call, _, blocked), result) in prepared_calls.iter().zip(results.iter()) {
@@ -2371,13 +2408,21 @@ pub async fn run_spine(
                 )
                 .await
             };
-            match next_completion_step(completion_verdict, completion_reprompts, turn, max_turns) {
+            match next_completion_step(
+                completion_verdict,
+                completion_reprompts,
+                total_completion_reprompts,
+                turn,
+                max_turns,
+            ) {
                 CompletionStep::Accept => {}
                 CompletionStep::Reprompt { prompt } => {
                     completion_reprompts += 1;
+                    total_completion_reprompts += 1;
                     tracing::info!(
                         turn,
                         completion_reprompts,
+                        total_completion_reprompts,
                         elapsed_ms = terminal_gate_started.elapsed().as_millis() as u64,
                         "Spine completion reprompt issued: blocked terminal answer deferred for another turn"
                     );
@@ -2385,11 +2430,17 @@ pub async fn run_spine(
                     continue;
                 }
                 CompletionStep::AcceptWithCaveat { message } => {
-                    let answer = if final_text.trim().is_empty() {
-                        message
-                    } else {
-                        format!("{}\n\n{}", message, final_text)
-                    };
+                    let answer = incomplete_terminal_acceptance_text(
+                        &message,
+                        &final_text,
+                        TerminalTextProvenance::SystemAuthored,
+                    );
+                    tracing::info!(
+                        turn,
+                        total_completion_reprompts,
+                        completion_gap = %message,
+                        "Spine returning incomplete blocked terminal answer after reprompt budget"
+                    );
                     final_text = finalize_user_text(
                         SpineTerminalTextKind::Blocked,
                         &answer,
@@ -3185,6 +3236,7 @@ pub struct AgentSpineLlmServer {
     trace: Arc<SpineTraceRecorder>,
     caller_kind: CallerKind,
     long_running: bool,
+    conversation_id: Option<String>,
     ordered_primary_candidates: tokio::sync::Mutex<Option<Vec<LlmAttemptCandidate>>>,
     prompt_profiles: tokio::sync::Mutex<Option<AgentSpinePromptProfiles>>,
 }
@@ -3203,6 +3255,7 @@ impl AgentSpineLlmServer {
         trace: Arc<SpineTraceRecorder>,
         caller_kind: CallerKind,
         long_running: bool,
+        conversation_id: Option<String>,
     ) -> Self {
         Self {
             agent,
@@ -3211,6 +3264,7 @@ impl AgentSpineLlmServer {
             trace,
             caller_kind,
             long_running,
+            conversation_id,
             ordered_primary_candidates: tokio::sync::Mutex::new(None),
             prompt_profiles: tokio::sync::Mutex::new(None),
         }
@@ -3248,11 +3302,17 @@ impl AgentSpineLlmServer {
 
         let primary_response = self
             .agent
-            .active_prompt_bundle_for_message(seed_user_message)
+            .active_prompt_bundle_for_conversation_message(
+                self.conversation_id.as_deref(),
+                seed_user_message,
+            )
             .await;
         let fragments = self
             .agent
-            .active_prompt_fragment_bundle_for_message(seed_user_message)
+            .active_prompt_fragment_bundle_for_conversation_message(
+                self.conversation_id.as_deref(),
+                seed_user_message,
+            )
             .await;
         let profiles = AgentSpinePromptProfiles {
             primary_response,
@@ -3994,6 +4054,176 @@ fn execution_profile_requests_long_running(profile: Option<&serde_json::Value>) 
         .unwrap_or(false)
 }
 
+fn action_directory_source_rank(source: &crate::actions::ActionSource) -> usize {
+    match source {
+        crate::actions::ActionSource::Custom => 4,
+        crate::actions::ActionSource::Bundled => 3,
+        crate::actions::ActionSource::System => 1,
+    }
+}
+
+fn action_directory_access_rank(action: &crate::actions::ActionDef) -> usize {
+    let access = &action.authorization.access;
+    let mut score = 0usize;
+    if !access.integration_ids.is_empty() {
+        score += 3;
+    }
+    if !access.extension_pack_ids.is_empty() {
+        score += 3;
+    }
+    if !access.integration_features.is_empty() {
+        score += 2;
+    }
+    if !access.channel_targets.is_empty() {
+        score += 2;
+    }
+    if action.authorization.requires_auth {
+        score += 1;
+    }
+    if action.authorization.outbound.outbound_write || action.authorization.outbound.read_only {
+        score += 1;
+    }
+    score
+}
+
+fn action_directory_capability_rank(action: &crate::actions::ActionDef) -> usize {
+    let mut score = 0usize;
+    for capability in &action.capabilities {
+        let capability = capability.trim();
+        if capability.is_empty() {
+            continue;
+        }
+        score += 1;
+        if matches!(
+            capability,
+            "custom_api"
+                | "integration"
+                | "integration_builder"
+                | "external_write"
+                | "network"
+                | "webhook"
+                | "messaging"
+        ) {
+            score += 2;
+        }
+    }
+    score
+}
+
+fn action_directory_rank(action: &crate::actions::ActionDef) -> (usize, usize, usize, String) {
+    (
+        action_directory_source_rank(&action.source),
+        action_directory_access_rank(action),
+        action_directory_capability_rank(action),
+        action.name.clone(),
+    )
+}
+
+fn action_directory_candidate(action: &crate::actions::ActionDef) -> bool {
+    let name = action.name.trim();
+    if name.is_empty() || PRIMITIVE_NAMES.contains(&name) {
+        return false;
+    }
+    true
+}
+
+fn build_action_directory_entry(action: &crate::actions::ActionDef) -> serde_json::Value {
+    let schema_fields =
+        crate::core::orchestration::action_catalog::action_schema_field_descriptions(
+            &action.input_schema,
+            ACTION_DIRECTORY_SCHEMA_FIELD_LIMIT,
+        )
+        .into_iter()
+        .map(|field| safe_truncate(&field, ACTION_DIRECTORY_FIELD_MAX_CHARS))
+        .collect::<Vec<_>>();
+    let required_shapes =
+        crate::core::orchestration::action_catalog::action_schema_required_shape_descriptions(
+            &action.input_schema,
+            4,
+        )
+        .into_iter()
+        .map(|shape| safe_truncate(&shape, ACTION_DIRECTORY_FIELD_MAX_CHARS))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "action_name": action.name,
+        "source": match action.source {
+            crate::actions::ActionSource::System => "system",
+            crate::actions::ActionSource::Bundled => "bundled",
+            crate::actions::ActionSource::Custom => "custom",
+        },
+        "description": safe_truncate(action.description.trim(), ACTION_DIRECTORY_FIELD_MAX_CHARS),
+        "capabilities": action.capabilities,
+        "requires_auth": action.authorization.requires_auth,
+        "outbound": {
+            "read_only": action.authorization.outbound.read_only,
+            "outbound_write": action.authorization.outbound.outbound_write,
+            "public_publish": action.authorization.outbound.public_publish,
+        },
+        "schema_fields": schema_fields,
+        "required_shapes": required_shapes,
+    })
+}
+
+fn build_action_directory_context_message(
+    actions: &[crate::actions::ActionDef],
+    _user_request: &str,
+    max_entries: usize,
+) -> Option<String> {
+    if max_entries == 0 {
+        return None;
+    }
+    let mut actions = actions
+        .iter()
+        .filter(|action| action_directory_candidate(action))
+        .collect::<Vec<_>>();
+    actions.sort_by(|left, right| {
+        action_directory_rank(right)
+            .cmp(&action_directory_rank(left))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let compact_action_names = actions
+        .iter()
+        .take(ACTION_DIRECTORY_CONTEXT_MAX_NAMES)
+        .map(|action| action.name.clone())
+        .collect::<Vec<_>>();
+    let action_count = actions.len();
+    let entries = actions
+        .into_iter()
+        .take(max_entries)
+        .map(build_action_directory_entry)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    let directory = serde_json::json!({
+        "available_action_count": action_count,
+        "compact_action_names": compact_action_names,
+        "action_cards": entries,
+    });
+    Some(format!(
+        "Runtime action directory:\n{}\nUse action_call only with an exact action_name from this directory or prior tool evidence, and pass the selected action's declared arguments object. Prefer higher-level spine primitives when they cover the requested capability.",
+        serde_json::to_string_pretty(&directory).unwrap_or_else(|_| "{}".to_string())
+    ))
+}
+
+async fn runtime_action_directory_context_system_message(
+    agent: &Agent,
+    user_request: &str,
+) -> Option<String> {
+    let actions = match agent.load_action_catalog_actions().await {
+        Ok(actions) => actions,
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to load runtime action directory for spine context");
+            return None;
+        }
+    };
+    build_action_directory_context_message(
+        &actions,
+        user_request,
+        ACTION_DIRECTORY_CONTEXT_MAX_ENTRIES,
+    )
+}
+
 async fn browser_profiles_context_system_message(
     storage: &crate::storage::Storage,
 ) -> Option<String> {
@@ -4132,6 +4362,13 @@ impl Agent {
                 content: request_context,
             });
         }
+        if let Some(action_directory_context) =
+            runtime_action_directory_context_system_message(self, message).await
+        {
+            spine_messages.push(SpineMessage::System {
+                content: action_directory_context,
+            });
+        }
         let capability_readiness_generation = self.capability_readiness_generation().await;
         if let Some(readiness_context) = self.capability_readiness_context_message().await {
             spine_messages.push(SpineMessage::System {
@@ -4194,6 +4431,7 @@ impl Agent {
             trace.clone(),
             request.caller_kind,
             request.long_running,
+            request.conversation_id.clone(),
         );
         let tools = ToolRegistry::new();
         let result = run_spine((*request).clone(), &server, &tools, &cx).await;
@@ -4412,6 +4650,16 @@ impl Agent {
             history.append(&mut spine_messages);
             spine_messages = history;
         }
+        if let Some(action_directory_context) =
+            runtime_action_directory_context_system_message(self, &task.description).await
+        {
+            spine_messages.insert(
+                0,
+                SpineMessage::System {
+                    content: action_directory_context,
+                },
+            );
+        }
 
         let mut request = SpineRequest::new(CallerKind::Task, spine_messages, channel);
         request.conversation_id = conversation_id.map(str::to_string);
@@ -4436,6 +4684,7 @@ impl Agent {
             trace.clone(),
             request.caller_kind,
             request.long_running,
+            request.conversation_id.clone(),
         );
         let tools = ToolRegistry::new();
         match run_spine((*request).clone(), &server, &tools, &cx).await {
@@ -4542,6 +4791,7 @@ impl Agent {
             trace.clone(),
             request.caller_kind,
             request.long_running,
+            request.conversation_id.clone(),
         );
         let tools = ToolRegistry::new();
         match run_spine((*request).clone(), &server, &tools, &cx).await {
@@ -4665,46 +4915,19 @@ fn storage_message_to_spine_message(
     }
 }
 
-/// Compose the persisted reply from this run's narration plus the final
-/// answer: each tool-calling turn's user-visible progress sentence (the
-/// Assistant content streamed before its tool calls) followed by the final
-/// text. The saved message then matches what the user watched stream instead
-/// of collapsing to the last turn's text only. Pure message shape — prior
-/// conversation history is excluded by index, not by content inspection.
+/// Compose the persisted reply from the terminal answer only.
+///
+/// Progress narration is streamed live while the run is active. Persisting it
+/// into the final assistant message makes an incomplete run look like a valid
+/// answer and causes the user to see all intermediate "what I am doing next"
+/// prose dumped at the end. The saved chat message is therefore the terminal
+/// answer/status, not the live progress transcript.
 fn spine_narrated_final_text(
-    prior_message_count: usize,
-    messages: &[SpineMessage],
+    _prior_message_count: usize,
+    _messages: &[SpineMessage],
     final_text: &str,
 ) -> String {
-    let final_trimmed = final_text.trim();
-    let mut sections: Vec<&str> = Vec::new();
-    for message in messages.iter().skip(prior_message_count) {
-        let SpineMessage::Assistant {
-            content: Some(content),
-            tool_calls,
-        } = message
-        else {
-            continue;
-        };
-        if tool_calls.is_empty() {
-            continue;
-        }
-        let text = content.trim();
-        if text.is_empty() || text == final_trimmed {
-            continue;
-        }
-        if sections.last() == Some(&text) {
-            continue;
-        }
-        sections.push(text);
-    }
-    if sections.is_empty() {
-        return final_text.to_string();
-    }
-    if !final_trimmed.is_empty() {
-        sections.push(final_trimmed);
-    }
-    sections.join("\n\n")
+    final_text.to_string()
 }
 
 fn spine_blocked_processed_message(
@@ -5620,14 +5843,14 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
         ),
         primitive_schema(
             "pdf_generate",
-            "Create a managed PDF document artifact from complete supplied content. Use this for PDF deliverables so AgentArk returns a Documents-visible managed file directly instead of requiring code execution or filesystem handoff.",
+            "Create a managed PDF document artifact from complete supplied Markdown/text content. Use this for PDF deliverables so AgentArk returns a Documents-visible managed file directly instead of requiring code execution or filesystem handoff. Include fenced agentark-chart JSON blocks for charts when the evidence contains concrete numeric values; AgentArk renders those blocks as vector charts in the PDF. When chart fences are absent, numeric Markdown tables are automatically summarized as PDF charts.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Human-readable document title." },
                     "filename": { "type": "string", "description": "Suggested PDF filename. AgentArk normalizes it safely." },
                     "style": { "type": "string", "enum": ["plain", "report", "letter", "invoice"], "default": "report" },
-                    "content": { "type": "string", "description": "Complete final document body to render into the PDF." },
+                    "content": { "type": "string", "description": "Complete final Markdown/text body to render into the PDF. Fenced agentark-chart JSON blocks are rendered as PDF charts; numeric Markdown tables are auto-charted when chart fences are absent." },
                     "metadata": { "type": "object", "description": "Optional provenance or artifact identity metadata." }
                 },
                 "required": ["content"],
@@ -5886,6 +6109,29 @@ fn build_primitive_schemas() -> Vec<ActionDef> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
                 },
                 "required": ["op"],
+                "additionalProperties": false
+            }),
+        ),
+        primitive_schema(
+            "action_call",
+            "Invoke a specific installed runtime action by exact action_name and declared arguments. Use only when the runtime action directory or prior tool evidence supplies the exact action id and another higher-level primitive does not cover the capability. This works for built-in, custom, plugin, MCP, custom API, extension-pack, custom messaging, and dynamic integration actions that the runtime exposes. Do not invent action names.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action_name": {
+                        "type": "string",
+                        "description": "Exact installed runtime action id from the runtime action directory or a prior tool result."
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "JSON object matching the selected action's declared input schema."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief semantic reason this exact action is the right runtime capability. This is trace metadata, not a selector."
+                    }
+                },
+                "required": ["action_name", "arguments"],
                 "additionalProperties": false
             }),
         ),
@@ -6198,6 +6444,76 @@ fn plan_direct_action(action_name: &str, arguments: &serde_json::Value) -> Primi
     PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
         action_name: action_name.to_string(),
         arguments: arguments.clone(),
+    }])
+}
+
+fn plan_action_call(
+    arguments: &serde_json::Value,
+    action_def: Option<&crate::actions::ActionDef>,
+) -> PrimitivePlan {
+    let Some(action_name) = json_text(arguments, "action_name") else {
+        return unsupported_with_extra(
+            "action_call requires `action_name`.",
+            serde_json::json!({
+                "field": "action_name",
+                "hint": "Use an exact action id from the runtime action directory or a prior tool result."
+            }),
+        );
+    };
+    let action_name = action_name.trim().to_string();
+    if action_name.is_empty() {
+        return unsupported("action_call requires a non-empty `action_name`.");
+    }
+    if PRIMITIVE_NAMES.contains(&action_name.as_str()) {
+        return unsupported_with_extra(
+            "action_call cannot invoke spine primitives recursively.",
+            serde_json::json!({
+                "action_name": action_name,
+                "hint": "Call the primitive directly with its declared schema."
+            }),
+        );
+    }
+    let Some(action_def) = action_def else {
+        return unsupported_with_extra(
+            "action_call requires an installed runtime action with this exact name.",
+            serde_json::json!({
+                "action_name": action_name,
+                "status": "missing_runtime_action",
+                "hint": "Use resource_rw to inspect/configure capabilities, or resolve the missing capability before trying an exact action call."
+            }),
+        );
+    };
+    if action_def.name != action_name {
+        return unsupported_with_extra(
+            "action_call action definition did not match the requested action name.",
+            serde_json::json!({
+                "requested_action": action_name,
+                "resolved_action": action_def.name,
+            }),
+        );
+    }
+    let Some(action_arguments) = arguments.get("arguments") else {
+        return unsupported_with_extra(
+            "action_call requires `arguments`: a JSON object matching the action's declared schema.",
+            serde_json::json!({
+                "action_name": action_name,
+                "field": "arguments",
+            }),
+        );
+    };
+    if !action_arguments.is_object() {
+        return unsupported_with_extra(
+            "action_call `arguments` must be a JSON object.",
+            serde_json::json!({
+                "action_name": action_name,
+                "field": "arguments",
+            }),
+        );
+    }
+
+    PrimitivePlan::Actions(vec![PrimitiveActionInvocation {
+        action_name,
+        arguments: action_arguments.clone(),
     }])
 }
 
@@ -8826,7 +9142,7 @@ fn search_backend_unavailable_user_message(detail: &str) -> String {
     let detail = detail.trim();
     if !detail.is_empty() {
         message.push_str(
-            "\n\nThe search provider returned a failure. Internal provider details were withheld.",
+            "\n\nThe free built-in search fallback failed or is currently unavailable. Configure an API-backed search provider or SearXNG in Settings -> Search for reliable live search.",
         );
     }
     message
@@ -8898,6 +9214,12 @@ enum FreshnessVerdict {
 const MAX_COMPLETION_REPROMPTS: usize = 1;
 const COMPLETION_REPROMPT_CONTINUATION_TURNS: usize = 2;
 const MAX_TOOL_REPAIR_ATTEMPTS: usize = 2;
+
+/// Run-wide ceiling on completion-verification reprompts. Per-evidence
+/// reprompts may reopen after successful tool progress, but a run that keeps
+/// failing to produce the requested user-visible outcome must eventually stop
+/// and report the current status instead of spending the whole turn budget.
+const MAX_TOTAL_COMPLETION_REPROMPTS: usize = 2;
 
 fn completion_guarded_max_turns(request_max_turns: usize) -> usize {
     request_max_turns
@@ -9294,6 +9616,15 @@ fn note_tool_repair_attempt(
     })
 }
 
+fn tool_result_progresses_completion_reprompt_budget(result: &ToolResult) -> bool {
+    match super::tool_responses::structured_tool_value_outcome(&result.value) {
+        Some(outcome) => {
+            outcome.state == super::tool_responses::StructuredToolOutcomeState::Success
+        }
+        None => result.ok,
+    }
+}
+
 fn tool_result_requires_model_repair(result: &ToolResult) -> bool {
     let Some(outcome) = super::tool_responses::structured_tool_value_outcome(&result.value) else {
         return !result.ok;
@@ -9369,13 +9700,16 @@ async fn verification_verdict_for_terminal_candidate(
 fn next_completion_step(
     verdict: CompletionVerdict,
     completion_reprompts: usize,
+    total_completion_reprompts: usize,
     turn: usize,
     max_turns: usize,
 ) -> CompletionStep {
     match verdict {
         CompletionVerdict::Complete => CompletionStep::Accept,
         CompletionVerdict::Incomplete { evidence_gap }
-            if completion_reprompts < MAX_COMPLETION_REPROMPTS && turn + 1 < max_turns =>
+            if completion_reprompts < MAX_COMPLETION_REPROMPTS
+                && total_completion_reprompts < MAX_TOTAL_COMPLETION_REPROMPTS
+                && turn + 1 < max_turns =>
         {
             CompletionStep::Reprompt {
                 prompt: completion_continue_prompt(&public_completion_gap(&evidence_gap)),
@@ -9671,10 +10005,33 @@ fn completion_continue_prompt(evidence_gap: &str) -> String {
 }
 
 fn completion_incomplete_message(evidence_gap: &str) -> String {
-    format!(
-        "I could not verify that the requested outcome is complete: {}",
-        evidence_gap.trim()
-    )
+    let evidence_gap = evidence_gap.trim();
+    if evidence_gap.is_empty() {
+        "I wasn't able to complete that request. Current status: the requested outcome is not yet evidenced."
+            .to_string()
+    } else {
+        format!(
+            "I wasn't able to complete that request. Current status: {}",
+            evidence_gap
+        )
+    }
+}
+
+fn incomplete_terminal_acceptance_text(
+    incomplete_status: &str,
+    candidate_text: &str,
+    provenance: TerminalTextProvenance,
+) -> String {
+    let incomplete_status = incomplete_status.trim();
+    let candidate_text = candidate_text.trim();
+    if matches!(
+        provenance,
+        TerminalTextProvenance::ModelAuthored | TerminalTextProvenance::ToolOrigin
+    ) || candidate_text.is_empty()
+    {
+        return incomplete_status.to_string();
+    }
+    format!("{}\n\n{}", incomplete_status, candidate_text)
 }
 
 /// The CURRENT turn's user request: the last User message of the initial
@@ -9842,6 +10199,124 @@ mod tests {
             .map(|schema| schema.name)
             .collect::<Vec<_>>();
         assert_eq!(names, PRIMITIVE_NAMES);
+    }
+
+    #[test]
+    fn primitive_registry_exposes_generic_runtime_action_escape_hatch() {
+        let schema = ToolRegistry::new()
+            .schemas()
+            .into_iter()
+            .find(|schema| schema.name == "action_call")
+            .expect("spine should expose a bounded generic runtime action primitive");
+
+        assert!(schema
+            .description
+            .contains("specific installed runtime action"));
+        let required = schema
+            .input_schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .expect("action_call schema should declare required fields")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(required.contains(&"action_name"));
+        assert!(required.contains(&"arguments"));
+    }
+
+    #[test]
+    fn action_call_plan_requires_exact_installed_action_and_argument_envelope() {
+        let installed = crate::actions::ActionDef {
+            name: "provider_task_create".to_string(),
+            description: "Create provider tasks from a structured payload.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                    "title": {"type": "string"}
+                }
+            }),
+            ..crate::actions::ActionDef::default()
+        };
+
+        match plan_action_call(
+            &serde_json::json!({
+                "action_name": "provider_task_create",
+                "arguments": {"title": "Follow up"}
+            }),
+            Some(&installed),
+        ) {
+            PrimitivePlan::Actions(actions) => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].action_name, "provider_task_create");
+                assert_eq!(actions[0].arguments["title"], "Follow up");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+
+        assert!(matches!(
+            plan_action_call(
+                &serde_json::json!({
+                    "action_name": "provider_task_create",
+                    "title": "Follow up"
+                }),
+                Some(&installed),
+            ),
+            PrimitivePlan::Unsupported { .. }
+        ));
+        assert!(matches!(
+            plan_action_call(
+                &serde_json::json!({
+                    "action_name": "missing_provider_action",
+                    "arguments": {"title": "Follow up"}
+                }),
+                None,
+            ),
+            PrimitivePlan::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn action_directory_context_is_bounded_and_advises_action_call() {
+        let actions = vec![
+            crate::actions::ActionDef {
+                name: "provider_task_create".to_string(),
+                description: "Create provider tasks from a structured payload.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["title"],
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Task title"
+                        }
+                    }
+                }),
+                capabilities: vec!["tasks".to_string(), "external_provider".to_string()],
+                ..crate::actions::ActionDef::default()
+            },
+            crate::actions::ActionDef {
+                name: "unrelated_archive_read".to_string(),
+                description: "Inspect archived records.".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                ..crate::actions::ActionDef::default()
+            },
+        ];
+
+        let context = build_action_directory_context_message(
+            &actions,
+            "create a task in the provider with a title",
+            1,
+        )
+        .expect("matching action directory context");
+
+        assert!(context.contains("Runtime action directory"));
+        assert!(context.contains("action_call"));
+        assert!(context.contains("provider_task_create"));
+        assert!(context.contains("title: string required"));
+        assert!(context.contains("compact_action_names"));
+        assert!(context.contains("unrelated_archive_read"));
+        assert!(!context.contains("Inspect archived records"));
     }
 
     #[test]
@@ -10128,7 +10603,7 @@ mod tests {
     }
 
     #[test]
-    fn narrated_final_text_joins_this_runs_progress_prose_with_the_final_answer() {
+    fn narrated_final_text_persists_only_the_terminal_answer() {
         let messages = vec![
             // Prior-history narration must be excluded by index.
             SpineMessage::User {
@@ -10169,10 +10644,7 @@ mod tests {
 
         let narrated = spine_narrated_final_text(3, &messages, "Integration saved and ready.");
 
-        assert_eq!(
-            narrated,
-            "Checking the current integration registry.\n\nRegistering the integration now.\n\nIntegration saved and ready."
-        );
+        assert_eq!(narrated, "Integration saved and ready.");
     }
 
     #[test]
@@ -10194,7 +10666,7 @@ mod tests {
     }
 
     #[test]
-    fn narrated_final_text_skips_duplicates_of_the_final_answer_and_consecutive_repeats() {
+    fn narrated_final_text_does_not_persist_progress_duplicates() {
         let messages = vec![
             SpineMessage::User {
                 content: "current request".to_string(),
@@ -10215,7 +10687,7 @@ mod tests {
 
         assert_eq!(
             spine_narrated_final_text(1, &messages, "Document saved."),
-            "Saving the document.\n\nDocument saved."
+            "Document saved."
         );
     }
 
@@ -10647,6 +11119,71 @@ mod tests {
     }
 
     #[test]
+    fn needs_arguments_result_does_not_reopen_completion_reprompt_budget() {
+        let result = ToolResult::from_value(
+            true,
+            serde_json::json!({
+                "tool": "arbitrary_integration",
+                "status": "needs_arguments",
+                "detail": "The operation requires more runtime arguments.",
+                "data": {
+                    "recoverable_by_model": true,
+                    "expected_contract": {
+                        "required_arguments": ["body"]
+                    }
+                }
+            }),
+        );
+
+        assert!(
+            !tool_result_progresses_completion_reprompt_budget(&result),
+            "structured missing-argument output is repairable, but it is not successful progress"
+        );
+    }
+
+    #[test]
+    fn successful_result_reopens_completion_reprompt_budget() {
+        let result = ToolResult::from_value(
+            true,
+            serde_json::json!({
+                "tool": "arbitrary_integration",
+                "status": "completed",
+                "data": {
+                    "records": [1, 2, 3]
+                }
+            }),
+        );
+
+        assert!(tool_result_progresses_completion_reprompt_budget(&result));
+    }
+
+    #[test]
+    fn incomplete_model_authored_terminal_replaces_unsupported_prose() {
+        let answer = incomplete_terminal_acceptance_text(
+            &completion_incomplete_message("No records were retrieved or displayed."),
+            "The integration is connected. Let me pull the records now.",
+            TerminalTextProvenance::ModelAuthored,
+        );
+
+        assert!(answer.contains("No records were retrieved or displayed."));
+        assert!(!answer.contains("Let me pull"));
+        assert!(!answer.contains("connected"));
+        assert!(!answer.contains("I could not verify"));
+    }
+
+    #[test]
+    fn incomplete_system_authored_terminal_can_keep_existing_blocker_context() {
+        let answer = incomplete_terminal_acceptance_text(
+            &completion_incomplete_message("No provider result was returned."),
+            "The provider is unavailable until credentials are configured.",
+            TerminalTextProvenance::SystemAuthored,
+        );
+
+        assert!(answer.contains("No provider result was returned."));
+        assert!(answer.contains("credentials are configured"));
+    }
+
+    #[test]
     fn public_completion_gap_redacts_internal_identifier_shapes() {
         let gap = public_completion_gap(
             "No app_deploy call was executed; tool_call_id abc and file_write staged source_paths only.",
@@ -10729,11 +11266,12 @@ mod tests {
             },
             0,
             0,
+            0,
             3,
         );
         assert!(matches!(first, CompletionStep::Reprompt { .. }));
 
-        let second = next_completion_step(CompletionVerdict::Complete, 1, 1, 3);
+        let second = next_completion_step(CompletionVerdict::Complete, 1, 1, 1, 3);
         assert_eq!(second, CompletionStep::Accept);
     }
 
@@ -10746,6 +11284,7 @@ mod tests {
                     .to_string(),
             },
             used_reprompts,
+            1,
             2,
             5,
         );
@@ -10757,18 +11296,44 @@ mod tests {
     }
 
     #[test]
-    fn persistent_gap_accepts_with_generic_incomplete_caveat() {
+    fn run_wide_reprompt_ceiling_stops_reloop_despite_fresh_evidence() {
+        // The per-evidence budget is refilled to 0 by fresh tool evidence and
+        // there are plenty of turns left, but the run-wide total has hit the
+        // ceiling — a permanently-failing tool call must stop reprompting
+        // instead of looping to max_turns.
+        let step = next_completion_step(
+            CompletionVerdict::Incomplete {
+                evidence_gap: "the query still returns no usable result".to_string(),
+            },
+            completion_reprompts_after_tool_evidence(MAX_COMPLETION_REPROMPTS),
+            MAX_TOTAL_COMPLETION_REPROMPTS,
+            2,
+            50,
+        );
+
+        assert!(
+            matches!(step, CompletionStep::AcceptWithCaveat { .. }),
+            "run-wide reprompt ceiling must terminate the loop even with fresh evidence and turns remaining"
+        );
+    }
+
+    #[test]
+    fn persistent_gap_accepts_with_generic_incomplete_status() {
         let step = next_completion_step(
             CompletionVerdict::Incomplete {
                 evidence_gap: "the report was never generated by app_deploy".to_string(),
             },
             MAX_COMPLETION_REPROMPTS,
             1,
+            1,
             3,
         );
 
         match step {
             CompletionStep::AcceptWithCaveat { message } => {
+                // The status is user-facing, but sanitized and generic: it
+                // reports the missing outcome without leaking internal tool
+                // identifiers.
                 assert!(message.contains("the report was never generated"));
                 for banned in ["work_type", "app_deploy", "watcher", "terminal_observation"] {
                     assert!(
@@ -10787,6 +11352,7 @@ mod tests {
             CompletionVerdict::Incomplete {
                 evidence_gap: "the final artifact is missing".to_string(),
             },
+            0,
             0,
             1,
             2,
@@ -12370,7 +12936,9 @@ mod tests {
         assert!(message.contains("best-effort and not always reliable"));
         assert!(message.contains("SearXNG"));
         assert!(message.contains("Serper"));
-        assert!(message.contains("Internal provider details were withheld"));
+        assert!(message.contains("The free built-in search fallback failed"));
+        assert!(message.contains("Configure an API-backed search provider or SearXNG"));
+        assert!(!message.contains("Internal provider details were withheld"));
         assert!(!message.contains("DuckDuckGo backend failed: challenge page"));
     }
 

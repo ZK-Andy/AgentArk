@@ -9503,7 +9503,7 @@ impl Agent {
             }),
         )
     }
-    /// Handle self-evolve tool call with policy-first evolution defaults.
+    /// Check whether GEPA background work can run without competing with foreground work.
     async fn gepa_idle_check(
         &self,
         quiet_window_seconds: i64,
@@ -10062,10 +10062,22 @@ impl Agent {
                 .await
                 .ok()
                 .flatten();
+            let usage_eval_store =
+                crate::core::self_evolve::opportunities::eval_sets::load_usage_eval_store(
+                    &self.storage,
+                )
+                .await;
+            let usage_cases_deciding =
+                crate::core::self_evolve::opportunities::eval_sets::load_usage_evals_deciding(
+                    &self.storage,
+                )
+                .await;
             let engine = crate::core::self_evolve::PromptEvolutionEngine::new(
                 crate::core::self_evolve::PromptEvolutionConfig {
                     project_root: project_root.clone(),
                     max_candidates: imported.prompt_candidates.len().max(1),
+                    usage_cases: usage_eval_store.cases,
+                    usage_cases_deciding,
                     ..Default::default()
                 },
                 self.llm.clone(),
@@ -10096,6 +10108,12 @@ impl Agent {
                                 existing_baseline,
                             )
                             .await;
+                        crate::core::self_evolve::strategy_runtime::push_prompt_snapshot_ring(
+                            &self.storage,
+                            crate::core::self_evolve::PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+                            existing_baseline,
+                        )
+                        .await;
                     }
                     let baseline_bundle_version = current_prompt_raw
                         .as_ref()
@@ -10139,7 +10157,7 @@ impl Agent {
                     canary_state = Some(state.clone());
                     if let Ok(runs) = self
                         .storage
-                        .list_recent_experience_runs_any_scope(replay_log_limit)
+                        .list_recent_experience_runs_for_canary_eval(replay_log_limit)
                         .await
                     {
                         replay_result = Some(
@@ -10299,7 +10317,7 @@ impl Agent {
                     canary_state = Some(state.clone());
                     if let Ok(runs) = self
                         .storage
-                        .list_recent_experience_runs_any_scope(replay_log_limit)
+                        .list_recent_experience_runs_for_canary_eval(replay_log_limit)
                         .await
                     {
                         replay_result = Some(
@@ -11027,361 +11045,27 @@ impl Agent {
                 Ok(serde_json::to_string_pretty(&value)?)
             }
             "policy" | "strategy" | "policy_strategy" => {
-                let policy_start = std::time::Instant::now();
-                let current_policy_raw = self
-                    .storage
-                    .get(crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY)
-                    .await
-                    .ok()
-                    .flatten();
-                let config = crate::core::self_evolve::PolicyEvolutionConfig {
-                    project_root,
-                    ..Default::default()
-                };
-                let evolve_engine =
-                    crate::core::self_evolve::PolicyEvolutionEngine::new(config, llm);
-                let result = evolve_engine
-                    .evolve_routing_policy(&request, current_policy_raw.as_deref())
-                    .await?;
-
-                let mut promotion_applied = false;
-                let mut canary_state: Option<
-                    crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
-                > = None;
-                let mut replay_result: Option<
-                    crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
-                > = None;
-                let mut promoted_directly_to_baseline = false;
-                if result.promoted && apply_promotion {
-                    if let Some(policy_json) = result.promoted_policy.as_ref() {
-                        let candidate_serialized = serde_json::to_vec(policy_json)?;
-                        if let Some(existing_baseline) = current_policy_raw.as_ref() {
-                            let _ = self
-                                .storage
-                                .set(
-                                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
-                                    existing_baseline,
-                                )
-                                .await;
-                        }
-                        let baseline_version = self
-                            .storage
-                            .get(
-                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                            )
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|raw| {
-                                serde_json::from_slice::<
-                                    crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
-                                >(&raw)
-                                .ok()
-                                .map(|s| s.baseline_version)
-                            })
-                            .unwrap_or_else(|| "routing-policy-default-v1".to_string());
-                        let candidate_version =
-                            format!("routing-candidate-{}", result.lineage_entry_id);
-
-                        self.storage
-                            .set(
-                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY,
-                                &candidate_serialized,
-                            )
-                            .await?;
-                        let state =
-                            crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
-                                enabled: true,
-                                baseline_version: baseline_version.clone(),
-                                candidate_version: candidate_version.clone(),
-                                rollout_percent: canary_rollout_percent,
-                                min_samples_per_version: canary_min_samples_per_version,
-                                min_success_gain: canary_min_success_gain,
-                                max_sign_test_p_value: canary_max_sign_test_p_value,
-                                activated_at: Some(chrono::Utc::now().to_rfc3339()),
-                            };
-                        let state_bytes = serde_json::to_vec(&state)?;
-                        self.storage
-                            .set(
-                                crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                                &state_bytes,
-                            )
-                            .await?;
-                        canary_state = Some(state.clone());
-
-                        if let Ok(logs) = self
-                            .storage
-                            .list_operational_logs_by_event("tool_call", replay_log_limit)
-                            .await
-                        {
-                            let replay_eval =
-                                crate::core::self_evolve::strategy_runtime::evaluate_canary_by_policy_version(
-                                    &logs,
-                                    &state.baseline_version,
-                                    &state.candidate_version,
-                                    state.min_samples_per_version,
-                                    state.min_success_gain,
-                                    state.max_sign_test_p_value,
-                                );
-                            if replay_eval.promote
-                                && stable_deployment_cadence_allows_auto_promotion(
-                                    &self.storage,
-                                    "routing_policy",
-                                    &candidate_version,
-                                )
-                                .await
-                            {
-                                self.storage
-                                    .set(
-                                        crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
-                                        &candidate_serialized,
-                                    )
-                                    .await?;
-                                let mut disabled_state = state.clone();
-                                disabled_state.enabled = false;
-                                let disabled_bytes = serde_json::to_vec(&disabled_state)?;
-                                self.storage
-                                    .set(
-                                        crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                                        &disabled_bytes,
-                                    )
-                                    .await?;
-                                promoted_directly_to_baseline = true;
-                                canary_state = Some(disabled_state);
-                                record_auto_stable_deployment(
-                                    &self.storage,
-                                    "routing_policy",
-                                    &candidate_version,
-                                )
-                                .await;
-                            }
-                            replay_result = Some(replay_eval);
-                        }
-                        promotion_applied = true;
-                    }
-                }
-
-                if let Some(tx) = stream_tx {
-                    let status_msg = if result.promoted {
-                        if promotion_applied {
-                            if promoted_directly_to_baseline {
-                                format!(
-                                    "Policy evolution complete: promoted candidate (gain {:.4}, p={:.4}), replay gate passed, baseline updated immediately",
-                                    result.accuracy_gain, result.p_value
-                                )
-                            } else {
-                                format!(
-                                    "Policy evolution complete: promoted candidate (gain {:.4}, p={:.4}) activated in canary mode ({}%)",
-                                    result.accuracy_gain,
-                                    result.p_value,
-                                    canary_state
-                                        .as_ref()
-                                        .map(|s| s.rollout_percent)
-                                        .unwrap_or(canary_rollout_percent)
-                                )
-                            }
-                        } else {
-                            format!(
-                                "Policy evolution complete: candidate passed promotion gate (gain {:.4}, p={:.4}) but not applied",
-                                result.accuracy_gain, result.p_value
-                            )
-                        }
-                    } else {
-                        format!(
-                            "Policy evolution complete: {}",
-                            result.promotion_gate_summary
-                        )
-                    };
-                    queue_stream_event(
-                        tx,
-                        StreamEvent::ToolResult {
-                            name: "self_evolve".to_string(),
-                            content: status_msg,
-                        },
-                    );
-                }
-
-                let changed_fields = result
-                    .promoted_policy
-                    .as_ref()
-                    .map(|policy| json_changed_keys(current_policy_raw.as_deref(), policy))
-                    .unwrap_or_default();
-                let policy_step_type = if result.success && result.promoted {
-                    "success"
-                } else if result.success {
-                    "info"
-                } else {
-                    "error"
-                };
-                let policy_detail = if result.success {
-                    format!(
-                        "Evaluated {} candidate policies. Accuracy {:.0}% -> {:.0}% with gate: {}",
-                        result.evaluated_candidates,
-                        result.baseline_accuracy * 100.0,
-                        result.best_candidate_accuracy * 100.0,
-                        result.promotion_gate_summary
-                    )
-                } else {
-                    format!(
-                        "Policy evolution failed: {}",
-                        result.error.as_deref().unwrap_or("unknown error")
-                    )
-                };
-                push_trace_step(
-                    trace_ref,
-                    "[evolve]",
-                    "Policy Evolution Evaluated",
-                    policy_detail,
-                    policy_step_type,
-                    Some(serde_json::json!({
-                        "trace_kind": "self_evolve.policy.result",
-                        "request": request.clone(),
-                        "mode": "policy",
-                        "target_key": result.target_key.clone(),
-                        "success": result.success,
-                        "promoted": result.promoted,
-                        "evaluated_candidates": result.evaluated_candidates,
-                        "baseline_accuracy": result.baseline_accuracy,
-                        "best_candidate_accuracy": result.best_candidate_accuracy,
-                        "accuracy_gain": result.accuracy_gain,
-                        "wins": result.wins,
-                        "losses": result.losses,
-                        "p_value": result.p_value,
-                        "candidate_source": result.candidate_source.clone(),
-                        "promotion_gate": result.promotion_gate.clone(),
-                        "promotion_gate_summary": result.promotion_gate_summary.clone(),
-                        "promotion_gate_report": result.promotion_gate_report.clone(),
-                        "lineage_entry_id": result.lineage_entry_id.clone(),
-                        "lineage_archive_path": result.lineage_archive_path.clone(),
-                        "notes": result.notes.clone(),
-                        "error": result.error.clone(),
-                        "changed_fields": changed_fields.clone(),
-                        "promoted_policy": result.promoted_policy.clone(),
-                    })),
-                    Some(policy_start.elapsed().as_millis() as u64),
-                )
-                .await;
-
-                let promotion_mode = if promoted_directly_to_baseline {
-                    "baseline"
-                } else if promotion_applied {
-                    "canary"
-                } else {
-                    "none"
-                };
-                let promotion_detail = if promoted_directly_to_baseline {
-                    "Replay evaluation promoted the candidate directly to baseline.".to_string()
-                } else if promotion_applied {
-                    format!(
-                        "Candidate activated in canary mode at {}% rollout.",
-                        canary_state
-                            .as_ref()
-                            .map(|state| state.rollout_percent)
-                            .unwrap_or(canary_rollout_percent)
-                    )
-                } else if result.promoted {
-                    "Candidate passed the promotion gate but was not applied.".to_string()
-                } else {
-                    format!("No promotion applied. {}", result.promotion_gate_summary)
-                };
-                push_trace_step(
-                    trace_ref,
-                    if promotion_applied { "[ok]" } else { "[info]" },
-                    "Policy Promotion Decision",
-                    promotion_detail,
-                    if promotion_applied { "success" } else { "info" },
-                    Some(serde_json::json!({
-                        "trace_kind": "self_evolve.policy.promotion",
-                        "request": request.clone(),
-                        "promotion_applied": promotion_applied,
-                        "apply_promotion_requested": apply_promotion_requested,
-                        "promotion_mode": promotion_mode,
-                        "promoted_directly_to_baseline": promoted_directly_to_baseline,
-                        "canary_state": canary_state.clone(),
-                        "replay_evaluation": replay_result.clone(),
-                    })),
-                    None,
-                )
-                .await;
-
-                let mut value = serde_json::to_value(&result)?;
-                if let serde_json::Value::Object(obj) = &mut value {
-                    obj.insert("mode".to_string(), serde_json::json!("policy"));
-                    obj.insert(
-                        "promotion_applied".to_string(),
-                        serde_json::json!(promotion_applied),
-                    );
-                    obj.insert(
-                        "apply_promotion_requested".to_string(),
-                        serde_json::json!(apply_promotion_requested),
-                    );
-                    obj.insert(
-                        "promotion_mode".to_string(),
-                        serde_json::json!(if promoted_directly_to_baseline {
-                            "baseline"
-                        } else if promotion_applied {
-                            "canary"
-                        } else {
-                            "none"
-                        }),
-                    );
-                    obj.insert(
-                        "canary_state".to_string(),
-                        serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
-                    );
-                    obj.insert(
-                        "replay_evaluation".to_string(),
-                        serde_json::to_value(&replay_result).unwrap_or(serde_json::Value::Null),
-                    );
-                }
-                if let Ok(last_bytes) = serde_json::to_vec(&value) {
+                // RETIRED (2026-06-10): the RoutingComplexityPolicy this mode
+                // evolved is never read by the live router, and its canary
+                // feed (operational "tool_call" events) has no production
+                // writer - every run burned model calls with no behavioral
+                // effect. Usage-mined opportunities replaced this path; see
+                // crate::core::self_evolve::opportunities.
+                let value = serde_json::json!({
+                    "status": "retired",
+                    "mode": mode,
+                    "message": "Routing-policy evolution is retired: its output was never consumed by the live router. Usage-mined opportunities on the Evolve page replaced this path.",
+                });
+                if let Ok(bytes) = serde_json::to_vec(&value) {
                     let _ = self
                         .storage
                         .set(
                             crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_LAST_RESULT_KEY,
-                            &last_bytes,
+                            &bytes,
                         )
                         .await;
                 }
-                // Return human-friendly summary instead of raw JSON
-                let summary = if result.success {
-                    if result.promoted {
-                        let mode_label = if promoted_directly_to_baseline {
-                            "applied immediately"
-                        } else if promotion_applied {
-                            "activated in canary mode for gradual rollout"
-                        } else {
-                            "ready but not yet applied"
-                        };
-                        format!(
-                            "Self-evolution completed successfully.\n\n\
-                            I evaluated {} candidate strategies and found an improvement.\n\
-                            - Accuracy improved from {:.0}% to {:.0}% ({} wins, {} losses)\n\
-                            - The improved strategy has been {}\n\n\
-                            Your agent's decision-making is now more accurate.",
-                            result.evaluated_candidates,
-                            result.baseline_accuracy * 100.0,
-                            result.best_candidate_accuracy * 100.0,
-                            result.wins,
-                            result.losses,
-                            mode_label,
-                        )
-                    } else {
-                        format!(
-                            "Self-evolution completed. I evaluated {} candidate strategies \
-                            but none outperformed the current approach (accuracy: {:.0}%). \
-                            No changes were made.",
-                            result.evaluated_candidates,
-                            result.baseline_accuracy * 100.0,
-                        )
-                    }
-                } else {
-                    format!(
-                        "Self-evolution ran but encountered an issue: {}",
-                        result.error.as_deref().unwrap_or("unknown error")
-                    )
-                };
-                Ok(summary)
+                Ok(serde_json::to_string_pretty(&value)?)
             }
             "prompt" => {
                 let prompt_start = std::time::Instant::now();
@@ -11391,8 +11075,20 @@ impl Agent {
                     .await
                     .ok()
                     .flatten();
+                let usage_eval_store =
+                    crate::core::self_evolve::opportunities::eval_sets::load_usage_eval_store(
+                        &self.storage,
+                    )
+                    .await;
+                let usage_cases_deciding =
+                    crate::core::self_evolve::opportunities::eval_sets::load_usage_evals_deciding(
+                        &self.storage,
+                    )
+                    .await;
                 let config = crate::core::self_evolve::PromptEvolutionConfig {
                     project_root,
+                    usage_cases: usage_eval_store.cases,
+                    usage_cases_deciding,
                     ..Default::default()
                 };
                 let evolve_engine =
@@ -11465,7 +11161,7 @@ impl Agent {
 
                         if let Ok(runs) = self
                             .storage
-                            .list_recent_experience_runs_any_scope(replay_log_limit)
+                            .list_recent_experience_runs_for_canary_eval(replay_log_limit)
                             .await
                         {
                             let replay_eval = crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_prompt_version(
@@ -11884,7 +11580,7 @@ impl Agent {
 
                 if let Ok(runs) = self
                     .storage
-                    .list_recent_experience_runs_any_scope(replay_log_limit)
+                    .list_recent_experience_runs_for_canary_eval(replay_log_limit)
                     .await
                 {
                     let replay_eval = crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_metadata_version(

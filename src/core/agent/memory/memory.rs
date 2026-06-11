@@ -317,6 +317,35 @@ mod saved_memory_sensitivity_tests {
         );
     }
 
+    #[test]
+    fn memory_capture_payload_repairs_truncated_object_to_recoverable_shape() {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{"memories":[{"key":"user_name","value":"Indrani"}],"retractions""#,
+        )
+        .expect("truncated object should recover the complete memories field");
+
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::ShapeRecovered
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("memories")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("retractions")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
     fn memory_operation_with_type(operation_type: &str) -> crate::storage::memory_operation::Model {
         crate::storage::memory_operation::Model {
             id: format!("memory-operation-{operation_type}"),
@@ -1574,6 +1603,23 @@ pub(super) fn build_user_memory_capture_prompt(
     prompt
 }
 
+pub(super) fn build_user_memory_capture_compact_prompt(
+    time_context: &str,
+    recent_dialogue: &str,
+    message: &str,
+    saved_facts: &str,
+    response_shape: &str,
+) -> String {
+    format!(
+        "Extract reviewable user-memory operations from the source message.\n\nCurrent time:\n{time_context}\n\nRecent dialogue, context only:\n{recent_dialogue}\n\nSource user message, authoritative:\n{message}\n\nCurrent saved user facts:\n{saved_facts}\n\nReturn JSON only with this exact top-level shape:\n{response_shape}\n\nSemantic contract:\n- Always include both top-level arrays: memories and retractions.\n- Use memories for new, updated, corrected, or superseding user-authored memory candidates. Use stable semantic keys so updates replace stale facts instead of creating duplicate slots.\n- Use retractions when the user asks to delete, forget, stop retaining, undo, or negate a stored fact/preference/constraint.\n- Store only information useful beyond the current turn: profile facts, assistant preferences, durable work preferences, reusable project/domain context, reusable knowledge, temporary/situational self-context, or explicit memory operations.\n- Do not store one-off requests, assistant claims, tool output, operational state, integration setup/auth state, task/watch/schedule configuration, transient errors, or credentials.\n- For every emitted item, source_support must be explicit_source_message and source_evidence must be a short exact quote from the source user message supporting the same operation. If this cannot be done, omit the item.\n- Decide from meaning and context, not exact wording, keyword lists, regexes, casing, punctuation, order, or anticipated phrases.\n- Return empty arrays only when there is genuinely no saveable memory operation.",
+        time_context = time_context,
+        recent_dialogue = recent_dialogue,
+        message = message,
+        saved_facts = saved_facts,
+        response_shape = response_shape
+    )
+}
+
 pub(super) fn build_user_memory_candidate_semantic_review_prompt(
     source_message: &str,
     recent_dialogue: &str,
@@ -1666,6 +1712,17 @@ pub(super) struct UserMemoryCaptureFocusedRecovery {
     pub(super) selected_provider: String,
     pub(super) selected_model: String,
     pub(super) selected_stage: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct UserMemoryCaptureParsedRecovery {
+    pub(super) payload: serde_json::Value,
+    pub(super) selected_slot_id: String,
+    pub(super) selected_slot_label: String,
+    pub(super) selected_provider: String,
+    pub(super) selected_model: String,
+    pub(super) selected_stage: String,
+    pub(super) is_empty_decision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1901,10 +1958,66 @@ pub(super) fn recover_user_memory_capture_payload_shape(
     Some(serde_json::Value::Object(recovered))
 }
 
+fn repair_truncated_user_memory_capture_object(raw: &str) -> Option<serde_json::Value> {
+    let start = raw.find('{')?;
+    let text = &raw[start..];
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut last_complete_top_level_field_end = None::<usize>;
+
+    for (index, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.last() == Some(&ch) {
+                    stack.pop();
+                    if stack.is_empty() && ch == '}' {
+                        let candidate = &text[..=index];
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+                            return value.is_object().then_some(value);
+                        }
+                    }
+                }
+            }
+            ',' if stack.len() == 1 && stack.last() == Some(&'}') => {
+                last_complete_top_level_field_end = Some(index);
+            }
+            _ => {}
+        }
+    }
+
+    let end = last_complete_top_level_field_end?;
+    let mut candidate = text[..end].trim_end().trim_end_matches(',').to_string();
+    candidate.push('}');
+    serde_json::from_str::<serde_json::Value>(&candidate)
+        .ok()
+        .filter(|value| value.is_object())
+}
+
+fn extract_user_memory_capture_json_object(raw: &str) -> Option<serde_json::Value> {
+    extract_json_object_from_text(raw).or_else(|| repair_truncated_user_memory_capture_object(raw))
+}
+
 pub(super) fn parse_user_memory_capture_payload(
     raw: &str,
 ) -> Result<ParsedUserMemoryCapturePayload, UserMemoryCapturePayloadError> {
-    let Some(payload) = extract_json_object_from_text(raw) else {
+    let Some(payload) = extract_user_memory_capture_json_object(raw) else {
         return Err(UserMemoryCapturePayloadError::Unparseable);
     };
     if user_memory_capture_payload_has_required_shape(&payload) {
@@ -3370,6 +3483,13 @@ impl UserMemoryCaptureWorker {
             &saved_facts,
             response_shape,
         );
+        let compact_prompt = build_user_memory_capture_compact_prompt(
+            &time_context,
+            &recent_dialogue,
+            &prompt_message,
+            &saved_facts,
+            response_shape,
+        );
 
         let memory_capture_candidates = self.user_memory_capture_llm_candidates();
         let memory_capture_candidate_count = memory_capture_candidates.len();
@@ -3404,6 +3524,7 @@ impl UserMemoryCaptureWorker {
                 channel,
                 conversation_id,
                 &prompt,
+                &compact_prompt,
                 response_shape,
                 memory_capture_candidates,
                 memory_capture_timeout_ms,
@@ -5555,11 +5676,103 @@ impl UserMemoryCaptureWorker {
         None
     }
 
+    pub(super) async fn run_user_memory_capture_compact_recovery(
+        &self,
+        channel: &str,
+        conversation_id: Option<&str>,
+        compact_prompt: &str,
+        candidate: &LlmAttemptCandidate,
+        attempts: &mut Vec<UserMemoryCaptureAttemptRecord>,
+        timeout_ms: u64,
+    ) -> Option<UserMemoryCaptureParsedRecovery> {
+        let role = Agent::model_role_label(&candidate.role).to_string();
+        let compact_recovery = match self
+            .run_memory_capture_llm_candidate(
+                channel,
+                conversation_id,
+                "user_fact_memory_capture_compact_recovery",
+                compact_prompt,
+                candidate,
+                timeout_ms,
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                attempts.push(UserMemoryCaptureAttemptRecord {
+                    slot_id: candidate.slot_id.clone(),
+                    slot_label: candidate.slot_label.clone(),
+                    role,
+                    provider: None,
+                    model: None,
+                    stage: "compact_recovery".to_string(),
+                    request_kind: "user_fact_memory_capture_compact_recovery".to_string(),
+                    outcome: "transport_failed".to_string(),
+                    error: Some(safe_truncate(&error.to_string(), 240)),
+                });
+                return None;
+            }
+        };
+
+        match parse_user_memory_capture_payload(&compact_recovery.content) {
+            Ok(parsed) => {
+                let is_empty_decision =
+                    user_memory_capture_payload_is_empty_decision(&parsed.payload);
+                attempts.push(UserMemoryCaptureAttemptRecord {
+                    slot_id: candidate.slot_id.clone(),
+                    slot_label: candidate.slot_label.clone(),
+                    role,
+                    provider: Some(compact_recovery.provider.clone()),
+                    model: Some(compact_recovery.model.clone()),
+                    stage: "compact_recovery".to_string(),
+                    request_kind: "user_fact_memory_capture_compact_recovery".to_string(),
+                    outcome: user_memory_capture_payload_ok_outcome(&parsed, is_empty_decision)
+                        .to_string(),
+                    error: None,
+                });
+                Some(UserMemoryCaptureParsedRecovery {
+                    payload: parsed.payload,
+                    selected_slot_id: candidate.slot_id.clone(),
+                    selected_slot_label: candidate.slot_label.clone(),
+                    selected_provider: compact_recovery.provider,
+                    selected_model: compact_recovery.model,
+                    selected_stage: "compact_recovery".to_string(),
+                    is_empty_decision,
+                })
+            }
+            Err(error) => {
+                let outcome = match error {
+                    UserMemoryCapturePayloadError::Unparseable => "unparseable",
+                    UserMemoryCapturePayloadError::IncompleteShape => "incomplete_shape",
+                };
+                attempts.push(UserMemoryCaptureAttemptRecord {
+                    slot_id: candidate.slot_id.clone(),
+                    slot_label: candidate.slot_label.clone(),
+                    role,
+                    provider: Some(compact_recovery.provider.clone()),
+                    model: Some(compact_recovery.model.clone()),
+                    stage: "compact_recovery".to_string(),
+                    request_kind: "user_fact_memory_capture_compact_recovery".to_string(),
+                    outcome: outcome.to_string(),
+                    error: Some(outcome.to_string()),
+                });
+                log_user_memory_capture_payload_error(
+                    "memory capture compact recovery",
+                    conversation_id,
+                    &compact_recovery.content,
+                    error,
+                );
+                None
+            }
+        }
+    }
+
     pub(super) async fn run_memory_capture_with_schema_recovery(
         &self,
         channel: &str,
         conversation_id: Option<&str>,
         original_prompt: &str,
+        compact_prompt: &str,
         response_shape: &str,
         candidates: Vec<LlmAttemptCandidate>,
         timeout_ms: u64,
@@ -5855,6 +6068,35 @@ impl UserMemoryCaptureWorker {
                         outcome: "transport_failed".to_string(),
                         error: Some(safe_truncate(&error.to_string(), 240)),
                     });
+                    if let Some(compact) = self
+                        .run_user_memory_capture_compact_recovery(
+                            channel,
+                            conversation_id,
+                            compact_prompt,
+                            candidate,
+                            &mut attempts,
+                            timeout_ms,
+                        )
+                        .await
+                    {
+                        if compact.is_empty_decision && idx + 1 < limited_candidates.len() {
+                            tracing::debug!(
+                                "memory capture compact recovery returned an empty decision for conversation {:?}; trying the next configured capture model",
+                                conversation_id
+                            );
+                            continue;
+                        }
+                        return UserMemoryCaptureRunOutcome {
+                            payload: Some(compact.payload),
+                            attempts,
+                            selected_slot_id: Some(compact.selected_slot_id),
+                            selected_slot_label: Some(compact.selected_slot_label),
+                            selected_provider: Some(compact.selected_provider),
+                            selected_model: Some(compact.selected_model),
+                            selected_stage: Some(compact.selected_stage),
+                            terminal_error: None,
+                        };
+                    }
                     continue;
                 }
             };
@@ -6071,6 +6313,35 @@ impl UserMemoryCaptureWorker {
                         &repaired.content,
                         error,
                     );
+                    if let Some(compact) = self
+                        .run_user_memory_capture_compact_recovery(
+                            channel,
+                            conversation_id,
+                            compact_prompt,
+                            candidate,
+                            &mut attempts,
+                            timeout_ms,
+                        )
+                        .await
+                    {
+                        if compact.is_empty_decision && idx + 1 < limited_candidates.len() {
+                            tracing::debug!(
+                                "memory capture compact recovery returned an empty decision for conversation {:?}; trying the next configured capture model",
+                                conversation_id
+                            );
+                            continue;
+                        }
+                        return UserMemoryCaptureRunOutcome {
+                            payload: Some(compact.payload),
+                            attempts,
+                            selected_slot_id: Some(compact.selected_slot_id),
+                            selected_slot_label: Some(compact.selected_slot_label),
+                            selected_provider: Some(compact.selected_provider),
+                            selected_model: Some(compact.selected_model),
+                            selected_stage: Some(compact.selected_stage),
+                            terminal_error: None,
+                        };
+                    }
                 }
             }
         }
@@ -6396,6 +6667,24 @@ impl Agent {
                     channel
                 }
             };
+            let should_capture = match self.embedding_client.as_deref() {
+                Some(embedder) => {
+                    crate::security::embedding_classifier::classify_inbound_embedding_fast(
+                        embedder,
+                        &crate::security::normalize_for_analysis(&message.content),
+                        None,
+                        Some(self.data_dir.as_path()),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|decision| decision.decision.memory_capture.should_capture)
+                }
+                None => false,
+            };
+            if !should_capture {
+                continue;
+            }
             if self
                 .mark_user_memory_capture_candidate(
                     &message.content,

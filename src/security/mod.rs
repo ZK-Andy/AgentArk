@@ -778,6 +778,60 @@ fn spans_are_near(left: RedactionSpan, right: RedactionSpan, max_distance: usize
     distance <= max_distance
 }
 
+fn span_contains_index(span: RedactionSpan, index: usize) -> bool {
+    span.start <= index && index < span.end
+}
+
+fn index_is_in_any_span(spans: &[RedactionSpan], index: usize) -> bool {
+    spans.iter().any(|span| span_contains_index(*span, index))
+}
+
+fn grouped_numeric_separator(ch: char) -> bool {
+    ch.is_ascii_whitespace() || matches!(ch, '.' | '-' | '(' | ')' | '+')
+}
+
+fn previous_group_digit_index(source: &str, span: RedactionSpan) -> Option<usize> {
+    let mut idx = span.start;
+    let mut saw_separator = false;
+    while let Some((prev_idx, ch)) = source[..idx].char_indices().next_back() {
+        if grouped_numeric_separator(ch) {
+            saw_separator = true;
+            idx = prev_idx;
+            continue;
+        }
+        return (saw_separator && ch.is_ascii_digit()).then_some(prev_idx);
+    }
+    None
+}
+
+fn next_group_digit_index(source: &str, span: RedactionSpan) -> Option<usize> {
+    let mut idx = span.end;
+    let mut saw_separator = false;
+    while idx < source.len() {
+        let Some(ch) = source[idx..].chars().next() else {
+            return None;
+        };
+        if grouped_numeric_separator(ch) {
+            saw_separator = true;
+            idx += ch.len_utf8();
+            continue;
+        }
+        return (saw_separator && ch.is_ascii_digit()).then_some(idx);
+    }
+    None
+}
+
+fn short_numeric_code_is_grouped_number_part(
+    source: &str,
+    code_span: RedactionSpan,
+    payment_number_spans: &[RedactionSpan],
+) -> bool {
+    previous_group_digit_index(source, code_span)
+        .is_some_and(|idx| !index_is_in_any_span(payment_number_spans, idx))
+        || next_group_digit_index(source, code_span)
+            .is_some_and(|idx| !index_is_in_any_span(payment_number_spans, idx))
+}
+
 fn apply_payment_credential_redaction(
     text: &mut String,
     redactions: &mut Vec<String>,
@@ -823,7 +877,8 @@ fn apply_payment_credential_redaction(
     let mut spans: Vec<RedactionSpan> = candidate_spans
         .iter()
         .filter(|(payment_span, valid_luhn)| {
-            *valid_luhn
+            let digits = digit_count(&source[payment_span.start..payment_span.end]);
+            *valid_luhn && digits >= 13
                 || short_code_spans.iter().any(|code_span| {
                     !spans_overlap(*payment_span, *code_span)
                         && spans_are_near(*payment_span, *code_span, PAYMENT_CODE_PROXIMITY_BYTES)
@@ -846,6 +901,9 @@ fn apply_payment_credential_redaction(
             .iter()
             .any(|payment_span| spans_overlap(*payment_span, code_span))
         {
+            continue;
+        }
+        if short_numeric_code_is_grouped_number_part(&source, code_span, &payment_number_spans) {
             continue;
         }
         if payment_number_spans.iter().any(|payment_span| {
@@ -1211,6 +1269,17 @@ mod tests {
         let punctuated = redact_secret_input("Use 4242 4242 4242 4242.");
         assert!(punctuated.had_secret());
         assert!(punctuated.text.contains("[REDACTED_PAYMENT_DATA]."));
+    }
+
+    #[test]
+    fn test_secret_redaction_keeps_phone_number_groups_near_payment_credentials() {
+        let result =
+            redact_secret_input("text +1 555 123 4567 and card 4111 1111 1111 1111 stays private");
+
+        assert!(result.had_secret());
+        assert!(result.text.contains("+1 555 123 4567"));
+        assert!(!result.text.contains("4111 1111 1111 1111"));
+        assert!(result.text.contains("[REDACTED_PAYMENT_DATA]"));
     }
 
     #[test]

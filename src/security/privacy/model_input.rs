@@ -79,16 +79,10 @@ fn default_true() -> bool {
 impl Default for ModelPrivacyConfig {
     fn default() -> Self {
         Self {
-            // Redact by SINK, not by data TYPE. Internal model-input / agent-reasoning
-            // is inside the user's self-hosted trust boundary, so the agent must see
-            // the user's own data (emails, phones, names, addresses, account numbers,
-            // order IDs, …) to act on it. SecretsOnly keeps the unconditional
-            // secret/API-key layer (redact_secret_input) while skipping PII redaction
-            // for those internal contexts; genuine external-leak sinks (outbound guard,
-            // webhooks) keep their own PII redaction. RawCurrentTurn covers the
-            // CurrentUserMessage path for the same reason. This is non-enumerated:
-            // it removes the PII step for internal sinks rather than toggling per type.
-            default_model_input_mode: ModelInputPrivacyMode::SecretsOnly,
+            // Current-turn user text keeps addressable targets available to the
+            // agent; other model-input contexts keep default PII masking unless
+            // the caller explicitly opts into a lower-exposure mode.
+            default_model_input_mode: ModelInputPrivacyMode::DefaultRedact,
             current_chat_pii_policy: CurrentChatPiiPolicy::RawCurrentTurn,
             request_scoped_sensitive_approval_enabled: true,
         }

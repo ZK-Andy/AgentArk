@@ -629,7 +629,7 @@
 }
 
 .arkreflect-memory-legend-line.is-weak {
-  border-top: 1px dashed rgba(226, 232, 240, 0.46);
+  border-top: 1px dashed rgba(140, 205, 175, 0.55);
 }
 
 .arkreflect-theme-panel {
@@ -1131,4 +1131,36 @@
 
 .settings-shell-layout .companion-connect-url {
   color: var(--settings-accent-text) !important;
+}
+
+/* Topics memory graph: slow radar sweep replaces the generic scanline layer
+   inside this panel only (the chart already supplies the rings/crosshair). */
+.arkreflect-memory-graph .arkreflect-panorama-canvas::before {
+  inset: auto;
+  top: 50%;
+  left: 50%;
+  width: 150%;
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  background: conic-gradient(
+    from 0deg at 50% 50%,
+    transparent 0deg,
+    rgba(120, 242, 176, 0.055) 16deg,
+    transparent 36deg
+  );
+  mask-image: radial-gradient(circle at 50% 50%, #000 0%, rgba(0, 0, 0, 0.55) 38%, transparent 64%);
+  -webkit-mask-image: radial-gradient(circle at 50% 50%, #000 0%, rgba(0, 0, 0, 0.55) 38%, transparent 64%);
+  animation: arkreflect-radar-sweep 16s linear infinite;
+}
+
+@keyframes arkreflect-radar-sweep {
+  from { transform: translate(-50%, -50%) rotate(0deg); }
+  to { transform: translate(-50%, -50%) rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .arkreflect-memory-graph .arkreflect-panorama-canvas::before {
+    animation: none;
+    background: none;
+  }
 }

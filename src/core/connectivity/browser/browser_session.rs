@@ -3436,11 +3436,7 @@ async fn wait_for_browser_operator_input(
 fn stalled_browser_question(content: &PageContent, reason: &str) -> String {
     let title = content.title.trim();
     let url = content.url.trim();
-    let location = if title.is_empty() {
-        url
-    } else {
-        title
-    };
+    let location = if title.is_empty() { url } else { title };
     let page_status = browser_visible_page_status(content);
     format!(
         "The browser automation paused because {reason}. Current page: {location}. {page_status} Please verify or finish the next step in the live browser, then tell me how to proceed."
@@ -3453,7 +3449,11 @@ fn browser_visible_page_status(content: &PageContent) -> String {
     if !url.is_empty() {
         parts.push(format!("URL: {url}."));
     }
-    let body = content.body_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let body = content
+        .body_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if !body.is_empty() {
         parts.push(format!(
             "Visible text starts: {}.",
@@ -3870,11 +3870,9 @@ async fn run_browser_loop(
                     .await
                 {
                     Ok(()) => {
-                        last_interaction_progress_probe =
-                            Some(BrowserInteractionProgressProbe::new(
-                                current_page_key.clone(),
-                                true,
-                            ));
+                        last_interaction_progress_probe = Some(
+                            BrowserInteractionProgressProbe::new(current_page_key.clone(), true),
+                        );
                         stall_tracker.reset();
                         history.push(format!("Step {}: Clicked '{}'", iteration + 1, label));
                     }
@@ -3935,11 +3933,9 @@ async fn run_browser_loop(
                     .await
                 {
                     Ok(()) => {
-                        last_interaction_progress_probe =
-                            Some(BrowserInteractionProgressProbe::new(
-                                current_page_key.clone(),
-                                false,
-                            ));
+                        last_interaction_progress_probe = Some(
+                            BrowserInteractionProgressProbe::new(current_page_key.clone(), false),
+                        );
                         stall_tracker.reset();
                         history.push(format!(
                             "Step {}: Typed {} chars",
@@ -4018,11 +4014,9 @@ async fn run_browser_loop(
                     .unwrap_or("Enter");
                 match ctx.integration.press_key(ctx.sidecar_id, key).await {
                     Ok(()) => {
-                        last_interaction_progress_probe =
-                            Some(BrowserInteractionProgressProbe::new(
-                                current_page_key.clone(),
-                                true,
-                            ));
+                        last_interaction_progress_probe = Some(
+                            BrowserInteractionProgressProbe::new(current_page_key.clone(), true),
+                        );
                         stall_tracker.reset();
                         history.push(format!("Step {}: Pressed {}", iteration + 1, key));
                     }

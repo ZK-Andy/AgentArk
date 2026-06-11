@@ -345,7 +345,7 @@ Optional inputs:
 - `audience`: who will read the report.
 - `report_type`: policy brief, market landscape, technical comparison, implementation plan, investment memo, literature review, or another user-implied type.
 - `output_format`: markdown, report, or brief.
-- `include_charts`: whether to include `agentark-chart` JSON fences when the evidence supports useful charts.
+- `include_charts`: whether to include `agentark-chart` JSON fences when the evidence supports useful charts. Defaults to true for deep-research reports and formal report output.
 
 ## Workflow
 1. Infer the user's underlying decision or knowledge need from the evidence and optional fields.
@@ -353,7 +353,7 @@ Optional inputs:
 3. Group related evidence into a small number of themes. Remove duplicate points.
 4. Make the report decision-grade: compare positions, implications, constraints, counterarguments, practical options, uncertainty, and what would change the conclusion.
 5. Use Markdown tables for comparisons, phased plans, risk allocations, scoring matrices, or evidence summaries when they make the report easier to scan.
-6. Include chart fences only when the evidence contains concrete comparable values, such as counts, percentages, dates, ratings, ranges, or grouped categories. Use `agentark-chart` JSON with `title`, `type`, `x`, `series`, `data`, and `height`. Do not chart qualitative claims without numeric support.
+6. For deep-research reports and formal report output, include chart fences by default when the evidence contains concrete comparable values, such as counts, percentages, dates, ratings, ranges, or grouped categories. Use `agentark-chart` JSON with `title`, `type`, `x`, `series`, `data`, and `height`. Do not chart qualitative claims without numeric support. If charts are disabled or not useful, preserve numeric Markdown tables so PDF export can still create an automatic visual summary.
 7. Cite material claims with the source numbers, names, or identifiers present in the evidence. Do not fabricate citations.
 8. End with evidence gaps or verification needs when support is incomplete.
 

@@ -80,7 +80,9 @@ const REFLECT_FOLLOWUP_SEARCH_RESULTS_PER_TOPIC: usize = 3;
 const REFLECT_FOLLOWUP_BACKGROUND_SEARCH_LIMIT: usize = 3;
 const REFLECT_FOLLOWUP_PLAN_LIMIT: usize = 8;
 const REFLECT_FOLLOWUP_PLAN_RETENTION_DAYS: i64 = 120;
-const REFLECT_FOLLOWUP_PLAN_TIMEOUT: Duration = Duration::from_secs(45);
+const REFLECT_FOLLOWUP_PLAN_NEGATIVE_RETENTION_DAYS: i64 = 7;
+const REFLECT_FOLLOWUP_PLAN_TOPIC_CHARS: usize = 600;
+const REFLECT_FOLLOWUP_PLAN_TIMEOUT: Duration = Duration::from_secs(120);
 const REFLECT_FOLLOWUP_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
 const REFLECT_FOLLOWUP_SUMMARY_MAX_CHARS: usize = 1_000;
 const REFLECT_SEMANTIC_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -100,6 +102,10 @@ static REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static REFLECT_REFRESH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static REFLECT_REFRESH_STATUS: OnceLock<Arc<RwLock<ReflectRefreshStatus>>> = OnceLock::new();
 static REFLECT_CLUSTER_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static REFLECT_FOLLOWUP_PLANNING_TELEMETRY: OnceLock<
+    Arc<RwLock<ReflectFollowupPlanningTelemetry>>,
+> = OnceLock::new();
+static REFLECT_FOLLOWUP_PLANNING_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -488,6 +494,29 @@ struct ReflectFollowupPlanEntry {
     structured_context: serde_json::Value,
     #[serde(default)]
     planned_at: String,
+    #[serde(default)]
+    topic: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReflectFollowupPlanningTelemetry {
+    last_attempt_at: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct ReflectFollowupPlanningStatus {
+    pending_count: usize,
+    planning_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_attempt_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+struct ReflectFollowupBuild {
+    followups: Vec<ReflectSuggestedFollowup>,
+    unplanned: Vec<ReflectSuggestedFollowup>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -570,6 +599,7 @@ struct ReflectResponse {
     cache_status: ReflectCacheStatus,
     daily_digest_status: ReflectDailyDigestStatus,
     suggested_followups: Vec<ReflectSuggestedFollowup>,
+    followup_planning: ReflectFollowupPlanningStatus,
     clusters: Vec<ReflectClusterResponse>,
     unclustered_units: Vec<ReflectUnitResponse>,
 }
@@ -641,12 +671,58 @@ impl Drop for ReflectFollowupCoordinatorInFlightGuard {
     }
 }
 
+/// Counts in-flight LLM planning passes specifically, unlike the coordinator
+/// flag which also covers search/summary coordination.
+struct ReflectFollowupPlanningActiveGuard;
+
+impl ReflectFollowupPlanningActiveGuard {
+    fn new() -> Self {
+        REFLECT_FOLLOWUP_PLANNING_ACTIVE.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ReflectFollowupPlanningActiveGuard {
+    fn drop(&mut self) {
+        REFLECT_FOLLOWUP_PLANNING_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn refresh_status_store() -> &'static Arc<RwLock<ReflectRefreshStatus>> {
     REFLECT_REFRESH_STATUS.get_or_init(|| Arc::new(RwLock::new(ReflectRefreshStatus::default())))
 }
 
 async fn current_refresh_status() -> ReflectRefreshStatus {
     refresh_status_store().read().await.clone()
+}
+
+fn planning_telemetry_store() -> &'static Arc<RwLock<ReflectFollowupPlanningTelemetry>> {
+    REFLECT_FOLLOWUP_PLANNING_TELEMETRY
+        .get_or_init(|| Arc::new(RwLock::new(ReflectFollowupPlanningTelemetry::default())))
+}
+
+async fn record_reflect_planning_attempt(error: Option<String>) {
+    let mut telemetry = planning_telemetry_store().write().await;
+    telemetry.last_attempt_at = Some(chrono::Utc::now().to_rfc3339());
+    telemetry.last_error = error;
+}
+
+async fn reflect_followup_planning_status(pending_count: usize) -> ReflectFollowupPlanningStatus {
+    let telemetry = planning_telemetry_store().read().await.clone();
+    let planning_active = REFLECT_FOLLOWUP_PLANNING_ACTIVE.load(Ordering::Acquire) > 0;
+    // A stale error is meaningless once nothing is pending: nothing will
+    // retry, and the empty state should not read as a failure.
+    let last_error = if pending_count == 0 && !planning_active {
+        None
+    } else {
+        telemetry.last_error
+    };
+    ReflectFollowupPlanningStatus {
+        pending_count,
+        planning_active,
+        last_attempt_at: telemetry.last_attempt_at,
+        last_error,
+    }
 }
 
 async fn update_refresh_status(
@@ -980,6 +1056,10 @@ fn reflect_experience_run_failed(run: &experience_run::Model) -> bool {
     run.success_state == "failed" || run.correction_state == "corrected"
 }
 
+fn reflect_tool_name_is_research(name: &str) -> bool {
+    matches!(name, "research" | "web_search" | "page_fetch") || name.starts_with("browser_")
+}
+
 fn reflect_experience_run_is_research(run: &experience_run::Model) -> bool {
     if run
         .task_type
@@ -993,10 +1073,10 @@ fn reflect_experience_run_is_research(run: &experience_run::Model) -> bool {
         .as_array()
         .map(|items| {
             items.iter().any(|item| {
-                matches!(
-                    item.get("tool_name").and_then(|value| value.as_str()),
-                    Some("research" | "web_search" | "page_fetch")
-                )
+                item.get("name")
+                    .or_else(|| item.get("tool_name"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(reflect_tool_name_is_research)
             })
         })
         .unwrap_or(false)
@@ -1129,7 +1209,7 @@ async fn load_reflect_followup_feedback(storage: &Storage) -> ReflectFollowupFee
 async fn save_reflect_followup_feedback(storage: &Storage, store: &ReflectFollowupFeedbackStore) {
     if let Ok(bytes) = serde_json::to_vec(store) {
         if let Err(error) = storage.set(REFLECT_FOLLOWUP_FEEDBACK_KEY, &bytes).await {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to save followup feedback");
+            tracing::warn!(error = %error, "failed to save followup feedback");
         }
     }
 }
@@ -1592,11 +1672,11 @@ async fn build_reflect_semantic_freshness_context(
     {
         Ok(Ok(embeddings)) => embeddings,
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "semantic freshness concept embedding failed");
+            tracing::warn!(error = %error, "semantic freshness concept embedding failed");
             return None;
         }
         Err(_) => {
-            tracing::debug!(target: "arkreflect", "semantic freshness concept embedding timed out");
+            tracing::warn!("semantic freshness concept embedding timed out");
             return None;
         }
     };
@@ -2114,7 +2194,7 @@ async fn load_reflect_followup_search_cache(storage: &Storage) -> ReflectFollowu
 async fn save_reflect_followup_search_cache(storage: &Storage, cache: &ReflectFollowupSearchCache) {
     if let Ok(bytes) = serde_json::to_vec(cache) {
         if let Err(error) = storage.set(REFLECT_FOLLOWUP_SEARCH_CACHE_KEY, &bytes).await {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to save followup search cache");
+            tracing::warn!(error = %error, "failed to save followup search cache");
         }
     }
 }
@@ -2132,7 +2212,7 @@ async fn load_reflect_followup_plan_cache(storage: &Storage) -> ReflectFollowupP
 async fn save_reflect_followup_plan_cache(storage: &Storage, cache: &ReflectFollowupPlanCache) {
     if let Ok(bytes) = serde_json::to_vec(cache) {
         if let Err(error) = storage.set(REFLECT_FOLLOWUP_PLAN_CACHE_KEY, &bytes).await {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to save followup plan cache");
+            tracing::warn!(error = %error, "failed to save followup plan cache");
         }
     }
 }
@@ -2140,11 +2220,13 @@ async fn save_reflect_followup_plan_cache(storage: &Storage, cache: &ReflectFoll
 fn reflect_plan_cache_entry_from_plan(
     plan: &ReflectExternalPursuitPlan,
     planned_at: &str,
+    topic: &str,
 ) -> Option<ReflectFollowupPlanEntry> {
     let id = plan.id.trim();
     if id.is_empty() {
         return None;
     }
+    let topic = truncate_chars(topic.trim(), REFLECT_FOLLOWUP_PLAN_TOPIC_CHARS);
     if !plan.useful {
         return Some(ReflectFollowupPlanEntry {
             id: truncate_chars(id, 140),
@@ -2155,6 +2237,7 @@ fn reflect_plan_cache_entry_from_plan(
             source_strategy: plan.source_strategy,
             structured_context: plan.structured_context.clone(),
             planned_at: planned_at.to_string(),
+            topic,
         });
     }
 
@@ -2164,7 +2247,25 @@ fn reflect_plan_cache_entry_from_plan(
         || search_query.is_empty()
         || !reflect_external_search_query_is_safe(search_query)
     {
-        return None;
+        // Cache the failure as a short-lived not-useful verdict instead of
+        // dropping it: an uncached candidate would re-enter the planner on
+        // every poll, looping the same defective verdict forever. The
+        // negative TTL re-judges it in a few days.
+        tracing::warn!(
+            plan_id = %id,
+            "planner returned unusable useful pursuit; caching as not useful"
+        );
+        return Some(ReflectFollowupPlanEntry {
+            id: truncate_chars(id, 140),
+            useful: false,
+            title: String::new(),
+            search_query: String::new(),
+            rationale: "Planner returned an unusable pursuit (empty or unsafe query).".to_string(),
+            source_strategy: plan.source_strategy,
+            structured_context: serde_json::Value::Null,
+            planned_at: planned_at.to_string(),
+            topic,
+        });
     }
 
     Some(ReflectFollowupPlanEntry {
@@ -2176,6 +2277,7 @@ fn reflect_plan_cache_entry_from_plan(
         source_strategy: plan.source_strategy,
         structured_context: plan.structured_context.clone(),
         planned_at: planned_at.to_string(),
+        topic,
     })
 }
 
@@ -2199,21 +2301,29 @@ fn prune_reflect_followup_plan_cache(
         if entry.id.trim().is_empty() {
             return false;
         }
-        parse_time(&entry.planned_at).is_none_or(|planned_at| {
-            (now - planned_at).num_days() <= REFLECT_FOLLOWUP_PLAN_RETENTION_DAYS
-        })
+        // Not-useful verdicts expire quickly so evolving interests get
+        // re-judged instead of staying pinned dead for months.
+        let retention_days = if entry.useful {
+            REFLECT_FOLLOWUP_PLAN_RETENTION_DAYS
+        } else {
+            REFLECT_FOLLOWUP_PLAN_NEGATIVE_RETENTION_DAYS
+        };
+        parse_time(&entry.planned_at)
+            .is_none_or(|planned_at| (now - planned_at).num_days() <= retention_days)
     });
 }
 
 fn update_reflect_followup_plan_cache(
     cache: &mut ReflectFollowupPlanCache,
     plans: &BTreeMap<String, ReflectExternalPursuitPlan>,
+    topics: &BTreeMap<String, String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     let planned_at = now.to_rfc3339();
     let mut changed = false;
     for plan in plans.values() {
-        let Some(entry) = reflect_plan_cache_entry_from_plan(plan, &planned_at) else {
+        let topic = topics.get(&plan.id).map(String::as_str).unwrap_or("");
+        let Some(entry) = reflect_plan_cache_entry_from_plan(plan, &planned_at, topic) else {
             continue;
         };
         let changed_entry = cache.entries.get(&entry.id).is_none_or(|existing| {
@@ -2221,6 +2331,7 @@ fn update_reflect_followup_plan_cache(
                 || existing.title != entry.title
                 || existing.search_query != entry.search_query
                 || existing.rationale != entry.rationale
+                || existing.topic != entry.topic
         });
         if changed_entry {
             changed = true;
@@ -2260,15 +2371,15 @@ where
     {
         Ok(Ok(Some(guard))) => guard,
         Ok(Ok(None)) => {
-            tracing::debug!(target: "arkreflect", "followup cache write lease is held elsewhere");
+            tracing::debug!("followup cache write lease is held elsewhere");
             return None;
         }
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to acquire followup cache write lease");
+            tracing::warn!(error = %error, "failed to acquire followup cache write lease");
             return None;
         }
         Err(_) => {
-            tracing::debug!(target: "arkreflect", "followup cache write lease timed out");
+            tracing::warn!("followup cache write lease timed out");
             return None;
         }
     };
@@ -2281,9 +2392,62 @@ where
         .release_kv_lease_guard(REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_KEY, &lease_guard)
         .await
     {
-        tracing::debug!(target: "arkreflect", error = %error, "failed to release followup cache write lease");
+        tracing::debug!(error = %error, "failed to release followup cache write lease");
     }
     Some(result)
+}
+
+/// Leased read-modify-write for the plan cache, mirroring the search-cache
+/// helper: a fresh load happens inside the lease so concurrent planning
+/// passes (view-triggered vs idle/post-refresh) cannot clobber each other's
+/// persisted verdicts. Returns the merged cache, or None if the lease was
+/// unavailable (callers fall back to a local, unpersisted merge).
+async fn update_reflect_followup_plan_cache_guarded(
+    storage: &Storage,
+    plans: &BTreeMap<String, ReflectExternalPursuitPlan>,
+    topics: &BTreeMap<String, String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ReflectFollowupPlanCache> {
+    let lease_owner = format!(
+        "arkreflect-followup-plan:{}:{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let lease_guard = match tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.acquire_kv_lease_guard(
+            REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_KEY,
+            &lease_owner,
+            REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_TTL_SECS,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(guard))) => guard,
+        Ok(Ok(None)) => {
+            tracing::debug!("followup cache write lease is held elsewhere; plan persist skipped");
+            return None;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "failed to acquire followup cache write lease");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("followup cache write lease timed out");
+            return None;
+        }
+    };
+    let mut cache = load_reflect_followup_plan_cache(storage).await;
+    if update_reflect_followup_plan_cache(&mut cache, plans, topics, now) {
+        save_reflect_followup_plan_cache(storage, &cache).await;
+    }
+    if let Err(error) = storage
+        .release_kv_lease_guard(REFLECT_FOLLOWUP_CACHE_WRITE_LEASE_KEY, &lease_guard)
+        .await
+    {
+        tracing::debug!(error = %error, "failed to release followup cache write lease");
+    }
+    Some(cache)
 }
 
 fn reflect_sensitive_key_fragment(value: &str) -> bool {
@@ -2484,6 +2648,43 @@ fn reflect_planning_handle(index: usize) -> String {
     format!("item_{}", index + 1)
 }
 
+fn reflect_candidate_planning_topic(candidate: &ReflectSuggestedFollowup) -> String {
+    candidate
+        .search_planning_context
+        .as_deref()
+        .or(candidate.search_query.as_deref())
+        .unwrap_or(&candidate.title)
+        .to_string()
+}
+
+/// Content-only topic text for plan-cache identity. Deliberately NOT the
+/// planning context: that blob is label-scaffolded ("source_kind:", "title:",
+/// ...) and the shared template tokens would make unrelated topics look alike.
+fn reflect_candidate_topic_for_cache(candidate: &ReflectSuggestedFollowup) -> String {
+    reflect_followup_intent_text(candidate)
+}
+
+/// Strict meaning match for reusing a cached plan verdict across candidate-id
+/// churn: jaccard only (containment lets a short text spuriously match a long
+/// one), at least 3 shared meaningful tokens, both sides non-trivial.
+fn reflect_plan_topic_reuse_score(candidate_topic: &str, entry_topic: &str) -> Option<f64> {
+    let candidate_tokens = reflect_followup_meaning_tokens(candidate_topic);
+    let entry_tokens = reflect_followup_meaning_tokens(entry_topic);
+    if candidate_tokens.len() < 3 || entry_tokens.len() < 3 {
+        return None;
+    }
+    let overlap = candidate_tokens.intersection(&entry_tokens).count();
+    if overlap < 3 {
+        return None;
+    }
+    let union = candidate_tokens.union(&entry_tokens).count();
+    if union == 0 {
+        return None;
+    }
+    let jaccard = overlap as f64 / union as f64;
+    (jaccard >= REFLECT_FOLLOWUP_TEXT_DUPLICATE_THRESHOLD).then_some(jaccard)
+}
+
 fn build_reflect_external_pursuit_planning_items(
     candidates: &[ReflectSuggestedFollowup],
 ) -> (Vec<serde_json::Value>, BTreeMap<String, String>) {
@@ -2496,14 +2697,10 @@ fn build_reflect_external_pursuit_planning_items(
         .map(|(index, candidate)| {
             let handle = reflect_planning_handle(index);
             handle_to_candidate_id.insert(handle.clone(), candidate.id.clone());
-            let reflected_topic = candidate
-                .search_planning_context
-                .as_deref()
-                .or(candidate.search_query.as_deref())
-                .unwrap_or(&candidate.title);
+            let reflected_topic = reflect_candidate_planning_topic(candidate);
             serde_json::json!({
                 "id": handle,
-                "reflected_topic": reflect_external_text(reflected_topic, 900),
+                "reflected_topic": reflect_external_text(&reflected_topic, 900),
                 "source_label": candidate.source_label,
                 "detail": reflect_external_text(&candidate.detail, 260),
             })
@@ -2553,6 +2750,7 @@ async fn plan_reflect_external_pursuits(
     if planning_items.is_empty() {
         return BTreeMap::new();
     }
+    let _planning_active_guard = ReflectFollowupPlanningActiveGuard::new();
     let system_prompt = reflect_opportunity_classifier_system_prompt();
     let user_message = format!(
         "Classify these reflected topics as human next steps before any source enrichment runs:\n{}\n\nEach id is an opaque handle such as item_1. Return exactly that handle in the id field; do not create, redact, alter, hash, or expose internal identifiers. For each useful next step, include the public-source query that should be used later to enrich the UI. Do not require search results to exist at this stage. source_strategy may be public_search unless a structured discovery surface such as flight_price_discovery is clearly more useful; structured_context should contain only non-sensitive constraints needed by that strategy.\n\nReturn JSON in this exact shape: {{\"plans\":[{{\"id\":\"same item id\",\"useful\":true|false,\"title\":\"short human-facing title when useful\",\"search_query\":\"public web search query for later enrichment when useful\",\"rationale\":\"brief reason\",\"source_strategy\":\"public_search\",\"structured_context\":{{}}}}]}}",
@@ -2560,27 +2758,49 @@ async fn plan_reflect_external_pursuits(
     );
     match tokio::time::timeout(
         REFLECT_FOLLOWUP_PLAN_TIMEOUT,
-        llm.chat_with_system_bounded(system_prompt, &user_message, 900),
+        llm.chat_with_system(system_prompt, &user_message),
     )
     .await
     {
-        Ok(Ok(response)) => remap_reflect_external_pursuit_plan_ids(
-            parse_reflect_external_pursuit_plans(&response.content),
-            &handle_to_candidate_id,
-        ),
+        Ok(Ok(response)) => {
+            let plans = remap_reflect_external_pursuit_plan_ids(
+                parse_reflect_external_pursuit_plans(&response.content),
+                &handle_to_candidate_id,
+            );
+            if plans.is_empty() {
+                tracing::warn!(
+                    items = planning_items.len(),
+                    "reflect opportunity planner returned no parseable verdicts"
+                );
+                record_reflect_planning_attempt(Some(
+                    "Opportunity planning returned no usable verdicts.".to_string(),
+                ))
+                .await;
+            } else {
+                record_reflect_planning_attempt(None).await;
+            }
+            plans
+        }
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "external pursuit planning failed");
+            tracing::warn!(error = %error, "reflect opportunity planning failed");
+            record_reflect_planning_attempt(Some(truncate_chars(
+                &format!("Opportunity planning failed: {}", error),
+                300,
+            )))
+            .await;
             BTreeMap::new()
         }
         Err(_) => {
-            tracing::debug!(target: "arkreflect", "external pursuit planning timed out");
+            tracing::warn!("reflect opportunity planning timed out");
+            record_reflect_planning_attempt(Some("Opportunity planning timed out.".to_string()))
+                .await;
             BTreeMap::new()
         }
     }
 }
 
 fn reflect_opportunity_classifier_system_prompt() -> &'static str {
-    "You classify whether Reflect reflected topics are useful human next steps. Classification happens before search, so do not require source results to already exist. Work from underlying user intent and semantic meaning, not exact words, topic labels, keyword matches, templates, or anticipated phrasing. Differences in wording, order, grammar, punctuation, casing, spacing, tone, abbreviations, typos, and paraphrasing must not change the decision when the intent is the same. A useful item is an x+1, x+2, or x+z pursuit: public evidence would materially help the user compare, decide, prepare, monitor, book, plan, study, understand what changed, estimate cost/timing, or defer intelligently. Do not merely tell the user to continue the old thread. Use the old reflected context as the seed, then create the next researched item that would add new evidence or a concrete decision path. The useful horizon may be immediate, near-term, later, exploratory, or recurring. Reflected memories and ambient interests are eligible only when they imply a real future decision or public-source check; private facts alone are context, not facts to validate. Treat private or personal context only as intent context: do not validate private memories, profile facts, names, relationships, emotions, or assertions against the web. If the useful next step can be grounded in public sources without exposing unrelated private details, emit a concise human-facing title and a public search query for later enrichment. Preserve the user's real deliverable, named entity, domain, constraints, location or timing constraints when relevant, and evaluation criteria when present. If currentness matters, target the freshest reliable evidence needed for the decision rather than generic news. For analytical topics, target the evidence needed to answer the real decision rather than broad background. For potentially sensitive personal topics, avoid diagnosis and avoid turning private claims into public queries; target reputable practical public resources if useful. Remove unrelated private facts, raw memory keys, credentials, and unnecessary personal identifiers from the query. Do not surface routine background/system state unless it clearly contains a user-facing decision or repair path. If public evidence would not materially improve the user's next step, mark it not useful. Return only JSON."
+    "You classify whether Reflect reflected topics are useful human next steps. Classification happens before search, so do not require source results to already exist. Work from underlying user intent and semantic meaning, not exact words, topic labels, keyword matches, templates, or anticipated phrasing. Differences in wording, order, grammar, punctuation, casing, spacing, tone, abbreviations, typos, and paraphrasing must not change the decision when the intent is the same. A useful item is an x+1, x+2, or x+z pursuit: public evidence would materially help the user compare, decide, prepare, monitor, book, plan, study, understand what changed, estimate cost/timing, or defer intelligently. Do not merely tell the user to continue the old thread. Use the old reflected context as the seed, then create the next researched item that would add new evidence or a concrete decision path. The useful horizon may be immediate, near-term, later, exploratory, or recurring. Reflected memories and ambient interests are eligible only when they imply a real future decision or public-source check; private facts alone are context, not facts to validate. Treat private or personal context only as intent context: do not validate private memories, profile facts, names, relationships, emotions, or assertions against the web. If the useful next step can be grounded in public sources without exposing unrelated private details, emit a concise human-facing title and a public search query for later enrichment. Preserve the user's real deliverable, named entity, domain, constraints, location or timing constraints when relevant, and evaluation criteria when present. If currentness matters, target the freshest reliable evidence needed for the decision rather than generic news. For analytical topics, target the evidence needed to answer the real decision rather than broad background. For potentially sensitive personal topics, avoid diagnosis and avoid turning private claims into public queries; target reputable practical public resources if useful. Remove unrelated private facts, raw memory keys, credentials, and unnecessary personal identifiers from the query. Do not surface routine background/system state unless it clearly contains a user-facing decision or repair path. Judge usefulness from the user's perspective: keep only pursuits a person with this activity would genuinely want to act on, learn from, or monitor right now; an update nobody asked for about something nobody is deciding is not useful. If public evidence would not materially improve the user's next step, mark it not useful. Return only JSON."
 }
 
 fn reflect_external_plan_for_candidate(
@@ -2588,82 +2808,101 @@ fn reflect_external_plan_for_candidate(
     plans: &BTreeMap<String, ReflectExternalPursuitPlan>,
     plan_cache: &ReflectFollowupPlanCache,
 ) -> Option<ReflectExternalPursuitPlan> {
-    plans.get(&candidate.id).cloned().or_else(|| {
-        plan_cache
-            .entries
-            .get(&candidate.id)
-            .map(reflect_plan_from_cache_entry)
-    })
+    if let Some(plan) = plans.get(&candidate.id) {
+        return Some(plan.clone());
+    }
+    if let Some(entry) = plan_cache.entries.get(&candidate.id) {
+        return Some(reflect_plan_from_cache_entry(entry));
+    }
+    // Candidate ids hash cluster topology, which drifts as new activity
+    // arrives. Reuse USEFUL verdicts by topic meaning so id churn doesn't
+    // re-pay the planner. Negative verdicts are intentionally excluded: a
+    // false semantic match would silently suppress a distinct topic, while a
+    // miss only costs one cheap re-plan through the pending bucket.
+    let topic = reflect_candidate_topic_for_cache(candidate);
+    plan_cache
+        .entries
+        .values()
+        .filter(|entry| entry.useful && !entry.topic.trim().is_empty())
+        .filter_map(|entry| {
+            reflect_plan_topic_reuse_score(&topic, &entry.topic).map(|score| (score, entry))
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, entry)| reflect_plan_from_cache_entry(entry))
 }
 
 fn apply_reflect_external_pursuit_plans(
     candidates: Vec<ReflectSuggestedFollowup>,
     plans: &BTreeMap<String, ReflectExternalPursuitPlan>,
     plan_cache: &ReflectFollowupPlanCache,
-) -> Vec<ReflectSuggestedFollowup> {
-    candidates
-        .into_iter()
-        .filter_map(|mut candidate| {
-            if !candidate.search_requires_planning {
-                return Some(candidate);
-            }
-            let Some(plan) = reflect_external_plan_for_candidate(&candidate, plans, plan_cache)
-            else {
-                return apply_unplanned_reflect_source_check(candidate);
-            };
-            if !plan.useful || plan.search_query.trim().is_empty() || plan.title.trim().is_empty()
-            {
-                return None;
-            }
-            if !reflect_external_search_query_is_safe(&plan.search_query) {
-                tracing::debug!(
-                    target: "arkreflect",
-                    source_id = %candidate.id,
-                    "dropping planned next step with unsafe external search query"
-                );
-                return None;
-            }
-            let cached_plan_query_matches = candidate.search_checked_at.is_some()
-                && candidate
-                    .search_query
-                    .as_deref()
-                    .is_some_and(|query| {
-                        candidate.source_strategy == plan.source_strategy
-                            && reflect_search_queries_match_for_cache(query, &plan.search_query)
-                    });
-            let query_changed = !cached_plan_query_matches
-                && candidate
-                    .search_query
-                    .as_deref()
-                    .map(|query| !reflect_search_queries_match_for_cache(query, &plan.search_query))
-                    .unwrap_or(true);
-            candidate.title = reflect_external_text(&plan.title, 120);
-            candidate.search_query = Some(plan.search_query.trim().to_string());
-            candidate.search_requires_planning = false;
-            candidate.prompt = format!(
-                "Use current source evidence to summarize this useful next step: {}",
-                candidate.title
-            );
-            candidate.source_strategy = plan.source_strategy;
-            candidate.structured_context = plan.structured_context.clone();
-            candidate.detail = if plan.rationale.trim().is_empty() {
-                "Reflect classified this reflected topic as a useful next step. Source enrichment is queued.".to_string()
+) -> (Vec<ReflectSuggestedFollowup>, Vec<ReflectSuggestedFollowup>) {
+    let mut kept = Vec::new();
+    let mut unplanned = Vec::new();
+    for mut candidate in candidates {
+        if !candidate.search_requires_planning {
+            kept.push(candidate);
+            continue;
+        }
+        let Some(plan) = reflect_external_plan_for_candidate(&candidate, plans, plan_cache) else {
+            if candidate.allow_unplanned_source_check {
+                if let Some(applied) = apply_unplanned_reflect_source_check(candidate) {
+                    kept.push(applied);
+                }
             } else {
-                reflect_external_text(&plan.rationale, 220)
-            };
-            if query_changed {
-                candidate.status = "queued".to_string();
-                candidate.search_results.clear();
-                candidate.search_checked_at = None;
-                candidate.search_error = None;
-                candidate.latest_summary = None;
-                candidate.latest_summary_generated_at = None;
-                candidate.latest_summary_error = None;
+                // No verdict yet: report as pending so the caller can plan it
+                // instead of silently erasing the topic.
+                unplanned.push(candidate);
             }
-            candidate.rank_score += 12.0;
-            Some(candidate)
-        })
-        .collect()
+            continue;
+        };
+        if !plan.useful || plan.search_query.trim().is_empty() || plan.title.trim().is_empty() {
+            continue;
+        }
+        if !reflect_external_search_query_is_safe(&plan.search_query) {
+            tracing::warn!(
+                source_id = %candidate.id,
+                "dropping planned next step with unsafe external search query"
+            );
+            continue;
+        }
+        let cached_plan_query_matches = candidate.search_checked_at.is_some()
+            && candidate.search_query.as_deref().is_some_and(|query| {
+                candidate.source_strategy == plan.source_strategy
+                    && reflect_search_queries_match_for_cache(query, &plan.search_query)
+            });
+        let query_changed = !cached_plan_query_matches
+            && candidate
+                .search_query
+                .as_deref()
+                .map(|query| !reflect_search_queries_match_for_cache(query, &plan.search_query))
+                .unwrap_or(true);
+        candidate.title = reflect_external_text(&plan.title, 120);
+        candidate.search_query = Some(plan.search_query.trim().to_string());
+        candidate.search_requires_planning = false;
+        candidate.prompt = format!(
+            "Use current source evidence to summarize this useful next step: {}",
+            candidate.title
+        );
+        candidate.source_strategy = plan.source_strategy;
+        candidate.structured_context = plan.structured_context.clone();
+        candidate.detail = if plan.rationale.trim().is_empty() {
+            "Reflect classified this reflected topic as a useful next step. Source enrichment is queued.".to_string()
+        } else {
+            reflect_external_text(&plan.rationale, 220)
+        };
+        if query_changed {
+            candidate.status = "queued".to_string();
+            candidate.search_results.clear();
+            candidate.search_checked_at = None;
+            candidate.search_error = None;
+            candidate.latest_summary = None;
+            candidate.latest_summary_generated_at = None;
+            candidate.latest_summary_error = None;
+        }
+        candidate.rank_score += 12.0;
+        kept.push(candidate);
+    }
+    (kept, unplanned)
 }
 
 fn apply_unplanned_reflect_source_check(
@@ -2704,7 +2943,7 @@ async fn build_suggested_followups(
     embedder: Option<&EmbeddingClient>,
     llm: Option<&LlmClient>,
     persist_feedback_vectors: bool,
-) -> Vec<ReflectSuggestedFollowup> {
+) -> ReflectFollowupBuild {
     let now = chrono::Utc::now();
     let cache = load_reflect_followup_search_cache(storage).await;
     let mut plan_cache = load_reflect_followup_plan_cache(storage).await;
@@ -2769,27 +3008,57 @@ async fn build_suggested_followups(
         }
     }
     let plans = plan_reflect_external_pursuits(llm, &candidates).await;
-    if !plans.is_empty()
-        && update_reflect_followup_plan_cache(&mut plan_cache, &plans, now)
-        && persist_feedback_vectors
-    {
-        save_reflect_followup_plan_cache(storage, &plan_cache).await;
+    if !plans.is_empty() {
+        let topics = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.id.clone(),
+                    reflect_candidate_topic_for_cache(candidate),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let persisted = if persist_feedback_vectors {
+            update_reflect_followup_plan_cache_guarded(storage, &plans, &topics, now).await
+        } else {
+            None
+        };
+        match persisted {
+            Some(merged) => plan_cache = merged,
+            None => {
+                update_reflect_followup_plan_cache(&mut plan_cache, &plans, &topics, now);
+            }
+        }
     }
-    candidates = apply_reflect_external_pursuit_plans(candidates, &plans, &plan_cache);
+    let (kept, unplanned) = apply_reflect_external_pursuit_plans(candidates, &plans, &plan_cache);
+    let mut candidates = kept;
     if persist_feedback_vectors
         && reflect_register_followup_feedback_vectors(&mut feedback_store, &candidates)
     {
         feedback_store.updated_at = Some(now.to_rfc3339());
         save_reflect_followup_feedback(storage, &feedback_store).await;
     }
-    candidates = candidates
+    candidates = apply_reflect_followup_feedback_gates(candidates, &feedback_store, now);
+    let unplanned = apply_reflect_followup_feedback_gates(unplanned, &feedback_store, now);
+    ReflectFollowupBuild {
+        followups: select_top_reflect_followups(candidates),
+        unplanned,
+    }
+}
+
+fn apply_reflect_followup_feedback_gates(
+    candidates: Vec<ReflectSuggestedFollowup>,
+    feedback_store: &ReflectFollowupFeedbackStore,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<ReflectSuggestedFollowup> {
+    candidates
         .into_iter()
         .filter_map(|mut candidate| {
             let feedback =
-                reflect_followup_effective_feedback(&candidate.feedback_keys, &feedback_store);
+                reflect_followup_effective_feedback(&candidate.feedback_keys, feedback_store);
             let semantic_feedback = reflect_followup_semantic_feedback(
                 candidate.feedback_vector.as_deref(),
-                &feedback_store,
+                feedback_store,
             );
             let feedback = reflect_followup_refresh_feedback_for_new_evidence(
                 feedback,
@@ -2828,8 +3097,7 @@ async fn build_suggested_followups(
             candidate.feedback = reflect_feedback_for_response(feedback.or(semantic_feedback));
             Some(candidate)
         })
-        .collect();
-    select_top_reflect_followups(candidates)
+        .collect()
 }
 
 fn due_latest_followup_searches(
@@ -3007,7 +3275,7 @@ async fn generate_reflect_followup_latest_summary(
     );
     match tokio::time::timeout(
         REFLECT_FOLLOWUP_SUMMARY_TIMEOUT,
-        llm.chat_with_system_bounded(system_prompt, &user_message, 480),
+        llm.chat_with_system(system_prompt, &user_message),
     )
     .await
     {
@@ -3060,11 +3328,11 @@ async fn generate_reflect_followup_latest_summary(
             }
         }
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "followup latest summary failed");
+            tracing::warn!(error = %error, "followup latest summary failed");
             (None, Some(error.to_string()), None)
         }
         Err(_) => {
-            tracing::debug!(target: "arkreflect", "followup latest summary timed out");
+            tracing::warn!("followup latest summary timed out");
             (
                 None,
                 Some("Latest-development summary timed out.".to_string()),
@@ -3246,11 +3514,11 @@ async fn spawn_reflect_followup_summary_worker(
             return false;
         }
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to acquire followup summary lease");
+            tracing::warn!(error = %error, "failed to acquire followup summary lease");
             return false;
         }
         Err(_) => {
-            tracing::debug!(target: "arkreflect", "followup summary lease timed out");
+            tracing::warn!("followup summary lease timed out");
             return false;
         }
     };
@@ -3266,33 +3534,27 @@ async fn spawn_reflect_followup_summary_worker(
             match result {
                 Ok(Ok(count)) => {
                     tracing::debug!(
-                        target: "arkreflect",
                         trigger,
                         count,
                         "followup latest-summary background pass completed"
                     );
                 }
                 Ok(Err(error)) => {
-                    tracing::debug!(
-                        target: "arkreflect",
+                    tracing::warn!(
                         trigger,
                         error = %error,
                         "followup latest-summary background pass failed"
                     );
                 }
                 Err(_) => {
-                    tracing::debug!(
-                        target: "arkreflect",
-                        trigger,
-                        "followup latest-summary background pass timed out"
-                    );
+                    tracing::warn!(trigger, "followup latest-summary background pass timed out");
                 }
             }
             if let Err(error) = storage
                 .release_kv_lease_guard(REFLECT_FOLLOWUP_SUMMARY_LEASE_KEY, &lease_guard)
                 .await
             {
-                tracing::debug!(target: "arkreflect", error = %error, "failed to release followup summary lease");
+                tracing::debug!(error = %error, "failed to release followup summary lease");
             }
         }
     );
@@ -3338,11 +3600,11 @@ async fn spawn_reflect_followup_search_worker(
             return false;
         }
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to acquire followup search lease");
+            tracing::warn!(error = %error, "failed to acquire followup search lease");
             return false;
         }
         Err(_) => {
-            tracing::debug!(target: "arkreflect", "followup search lease timed out");
+            tracing::warn!("followup search lease timed out");
             return false;
         }
     };
@@ -3358,7 +3620,6 @@ async fn spawn_reflect_followup_search_worker(
             match result {
                 Ok(Ok(count)) => {
                     tracing::debug!(
-                        target: "arkreflect",
                         trigger,
                         count,
                         "followup latest-search background pass completed"
@@ -3372,26 +3633,21 @@ async fn spawn_reflect_followup_search_worker(
                     .await;
                 }
                 Ok(Err(error)) => {
-                    tracing::debug!(
-                        target: "arkreflect",
+                    tracing::warn!(
                         trigger,
                         error = %error,
                         "followup latest-search background pass failed"
                     );
                 }
                 Err(_) => {
-                    tracing::debug!(
-                        target: "arkreflect",
-                        trigger,
-                        "followup latest-search background pass timed out"
-                    );
+                    tracing::warn!(trigger, "followup latest-search background pass timed out");
                 }
             }
             if let Err(error) = storage
                 .release_kv_lease_guard(REFLECT_FOLLOWUP_SEARCH_LEASE_KEY, &lease_guard)
                 .await
             {
-                tracing::debug!(target: "arkreflect", error = %error, "failed to release followup search lease");
+                tracing::debug!(error = %error, "failed to release followup search lease");
             }
         }
     );
@@ -3409,6 +3665,97 @@ fn reflect_due_followup_work(
     }
 }
 
+async fn reflect_foreground_busy(state: &AppState) -> bool {
+    let agent = state.agent.read().await;
+    agent.active_message_request_count() > 0
+}
+
+/// Plan usefulness verdicts for the exact candidates a page view computed,
+/// then start source checks for whatever survives. Unlike the idle-gated
+/// background passes, this defers only to an active foreground chat, so a
+/// viewed window converges to planned opportunities within a few polls.
+async fn spawn_reflect_followup_planning_for_candidates(
+    state: AppState,
+    unplanned: Vec<ReflectSuggestedFollowup>,
+    followups: Vec<ReflectSuggestedFollowup>,
+    trigger: &'static str,
+) -> bool {
+    if REFLECT_REFRESH_IN_FLIGHT.load(Ordering::Acquire) {
+        return false;
+    }
+    if REFLECT_FOLLOWUP_COORDINATOR_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    let _guard = ReflectFollowupCoordinatorInFlightGuard;
+    if reflect_foreground_busy(&state).await {
+        return false;
+    }
+    let (storage, config_dir, llm) = {
+        let agent = state.agent.read().await;
+        (
+            agent.storage.clone(),
+            agent.config_dir.clone(),
+            agent.llm.clone(),
+        )
+    };
+    let now = chrono::Utc::now();
+    let mut survivors = followups;
+    if !unplanned.is_empty() {
+        let plans = plan_reflect_external_pursuits(Some(&llm), &unplanned).await;
+        if !plans.is_empty() {
+            let topics = unplanned
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.id.clone(),
+                        reflect_candidate_topic_for_cache(candidate),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let plan_cache =
+                match update_reflect_followup_plan_cache_guarded(&storage, &plans, &topics, now)
+                    .await
+                {
+                    Some(merged) => merged,
+                    None => {
+                        let mut cache = load_reflect_followup_plan_cache(&storage).await;
+                        update_reflect_followup_plan_cache(&mut cache, &plans, &topics, now);
+                        cache
+                    }
+                };
+            let (kept, _) = apply_reflect_external_pursuit_plans(unplanned, &plans, &plan_cache);
+            survivors.extend(kept);
+        }
+    }
+    if survivors.is_empty() {
+        return false;
+    }
+    let mut feedback_store = load_reflect_followup_feedback(&storage).await;
+    if reflect_register_followup_feedback_vectors(&mut feedback_store, &survivors) {
+        feedback_store.updated_at = Some(now.to_rfc3339());
+        save_reflect_followup_feedback(&storage, &feedback_store).await;
+    }
+    let cache = load_reflect_followup_search_cache(&storage).await;
+    let due_work = reflect_due_followup_work(&survivors, &cache, chrono::Utc::now());
+    if !due_work.has_work() {
+        return false;
+    }
+    let summary_spawned = spawn_reflect_followup_summary_worker(
+        storage.clone(),
+        llm.clone(),
+        due_work.summaries,
+        trigger,
+    )
+    .await;
+    let search_spawned =
+        spawn_reflect_followup_search_worker(storage, config_dir, llm, due_work.searches, trigger)
+            .await;
+    summary_spawned || search_spawned
+}
+
 async fn maybe_spawn_reflect_followup_search(
     state: AppState,
     suggestions: Vec<ReflectSuggestedFollowup>,
@@ -3424,7 +3771,7 @@ async fn maybe_spawn_reflect_followup_search(
         return false;
     }
     let _guard = ReflectFollowupCoordinatorInFlightGuard;
-    if !reflect_server_is_idle(&state).await {
+    if reflect_foreground_busy(&state).await {
         return false;
     }
     let (storage, config_dir, llm) = {
@@ -3481,7 +3828,7 @@ async fn maybe_spawn_reflect_followup_search_for_range(
     .and_then(|result| result.ok())
     .unwrap_or_default();
     let (clusters, _, _) = build_clusters_bounded(units).await;
-    let suggestions = build_suggested_followups(
+    let build = build_suggested_followups(
         &storage,
         &clusters,
         embedding_client.as_deref(),
@@ -3489,7 +3836,7 @@ async fn maybe_spawn_reflect_followup_search_for_range(
         true,
     )
     .await;
-    maybe_spawn_reflect_followup_search(state, suggestions, trigger).await
+    maybe_spawn_reflect_followup_search(state, build.followups, trigger).await
 }
 
 async fn maybe_spawn_reflect_followup_search_from_recent_activity(
@@ -3519,7 +3866,7 @@ async fn maybe_spawn_reflect_followup_search_from_recent_activity(
     .and_then(|result| result.ok())
     .unwrap_or_default();
     let (clusters, _, _) = build_clusters_bounded(units).await;
-    let suggestions = build_suggested_followups(
+    let build = build_suggested_followups(
         &storage,
         &clusters,
         embedding_client.as_deref(),
@@ -3527,7 +3874,7 @@ async fn maybe_spawn_reflect_followup_search_from_recent_activity(
         true,
     )
     .await;
-    maybe_spawn_reflect_followup_search(state, suggestions, trigger).await
+    maybe_spawn_reflect_followup_search(state, build.followups, trigger).await
 }
 
 fn message_excerpt(messages: &[message::Model], role: &str, reverse: bool) -> String {
@@ -4537,11 +4884,11 @@ async fn embedding_for_candidate(
     {
         Ok(Ok(mut embeddings)) => embeddings.pop(),
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "semantic work unit embedding failed");
+            tracing::debug!(error = %error, "semantic work unit embedding failed");
             None
         }
         Err(_) => {
-            tracing::warn!(target: "arkreflect", "semantic work unit embedding timed out");
+            tracing::warn!("semantic work unit embedding timed out");
             None
         }
     }
@@ -4593,11 +4940,11 @@ async fn upsert_candidate(
     {
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
-            tracing::warn!(target: "arkreflect", error = %error, "failed to upsert semantic work unit");
+            tracing::warn!(error = %error, "failed to upsert semantic work unit");
             false
         }
         Err(_) => {
-            tracing::warn!(target: "arkreflect", "semantic work unit upsert timed out");
+            tracing::warn!("semantic work unit upsert timed out");
             false
         }
     }
@@ -4629,15 +4976,15 @@ async fn list_orbit_transcripts_blocking(
     {
         Ok(Ok(Ok(transcripts))) => transcripts,
         Ok(Ok(Err(error))) => {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to list ArkOrbit transcripts");
+            tracing::debug!(error = %error, "failed to list ArkOrbit transcripts");
             Vec::new()
         }
         Ok(Err(error)) => {
-            tracing::warn!(target: "arkreflect", error = %error, "ArkOrbit transcript listing task failed");
+            tracing::warn!(error = %error, "ArkOrbit transcript listing task failed");
             Vec::new()
         }
         Err(_) => {
-            tracing::warn!(target: "arkreflect", "ArkOrbit transcript listing timed out");
+            tracing::warn!("ArkOrbit transcript listing timed out");
             Vec::new()
         }
     }
@@ -4662,15 +5009,15 @@ async fn read_orbit_transcript_blocking(
     {
         Ok(Ok(Ok(messages))) => messages,
         Ok(Ok(Err(error))) => {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to read ArkOrbit transcript");
+            tracing::debug!(error = %error, "failed to read ArkOrbit transcript");
             Vec::new()
         }
         Ok(Err(error)) => {
-            tracing::warn!(target: "arkreflect", error = %error, "ArkOrbit transcript read task failed");
+            tracing::warn!(error = %error, "ArkOrbit transcript read task failed");
             Vec::new()
         }
         Err(_) => {
-            tracing::warn!(target: "arkreflect", "ArkOrbit transcript read timed out");
+            tracing::warn!("ArkOrbit transcript read timed out");
             Vec::new()
         }
     }
@@ -4702,7 +5049,7 @@ async fn refresh_reflect_units(
     )
     .await
     {
-        tracing::debug!(target: "arkreflect", error = %error, "semantic work unit retention cleanup failed");
+        tracing::debug!(error = %error, "semantic work unit retention cleanup failed");
     }
 
     if let Ok(Ok(conversations)) = tokio::time::timeout(
@@ -5435,12 +5782,14 @@ async fn build_clusters_bounded(
     {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => {
+            tracing::warn!("cluster semaphore closed; using activity fallback clusters");
             return build_activity_cluster_fallback(
                 &fallback_units,
                 "Semantic grouping is temporarily unavailable; showing cached activity instead.",
             );
         }
         Err(_) => {
+            tracing::debug!("cluster queue busy; using activity fallback clusters");
             return build_activity_cluster_fallback(
                 &fallback_units,
                 "Semantic grouping is busy; showing cached activity instead.",
@@ -5454,14 +5803,14 @@ async fn build_clusters_bounded(
     match tokio::time::timeout(REFLECT_CLUSTER_TIMEOUT, handle).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
-            tracing::warn!(target: "arkreflect", error = %error, "cluster worker failed");
+            tracing::warn!(error = %error, "cluster worker failed");
             build_activity_cluster_fallback(
                 &fallback_units,
                 "Semantic grouping failed; showing cached activity instead.",
             )
         }
         Err(_) => {
-            tracing::warn!(target: "arkreflect", "cluster worker timed out");
+            tracing::warn!("cluster worker timed out");
             build_activity_cluster_fallback(
                 &fallback_units,
                 "Semantic grouping took too long; showing cached activity instead.",
@@ -5517,14 +5866,14 @@ async fn enrich_clusters_with_related_history(
         let rows = match related {
             Ok(Ok(rows)) => rows,
             Ok(Err(error)) => {
-                tracing::debug!(target: "arkreflect", error = %error, "related history lookup failed");
+                tracing::debug!(error = %error, "related history lookup failed");
                 cluster.related_history = ReflectRelatedHistory::unavailable(
                     "Related history was unavailable for this cluster.",
                 );
                 continue;
             }
             Err(_) => {
-                tracing::debug!(target: "arkreflect", "related history lookup timed out");
+                tracing::debug!("related history lookup timed out");
                 cluster.related_history = ReflectRelatedHistory::unavailable(
                     "Related history took too long and was skipped for this cluster.",
                 );
@@ -5771,7 +6120,7 @@ async fn spawn_reflect_refresh(
             };
         }
         Ok(Err(error)) => {
-            tracing::warn!(target: "arkreflect", error = %error, "failed to acquire refresh lease");
+            tracing::warn!(error = %error, "failed to acquire refresh lease");
             let refresh_status = update_refresh_status(|status| {
                 status.running = false;
                 status.status = "lease_failed".to_string();
@@ -5877,7 +6226,7 @@ async fn spawn_reflect_refresh(
             .release_kv_lease_guard(REFLECT_REFRESH_LEASE_KEY, &lease_guard)
             .await
         {
-            tracing::warn!(target: "arkreflect", error = %error, "failed to release refresh lease");
+            tracing::warn!(error = %error, "failed to release refresh lease");
         }
         drop(guard);
         if completed {
@@ -6029,11 +6378,11 @@ async fn save_daily_digest_status(storage: &Storage, status: &ReflectDailyDigest
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("daily digest status save timed out")))
             {
-                tracing::debug!(target: "arkreflect", error = %error, "failed to save daily digest status");
+                tracing::debug!(error = %error, "failed to save daily digest status");
             }
         }
         Err(error) => {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to serialize daily digest status");
+            tracing::debug!(error = %error, "failed to serialize daily digest status");
         }
     }
 }
@@ -6199,11 +6548,11 @@ async fn generate_daily_digest_summary(
             }
         }
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "daily digest LLM summary failed");
+            tracing::debug!(error = %error, "daily digest LLM summary failed");
             fallback
         }
         Err(_) => {
-            tracing::debug!(target: "arkreflect", "daily digest LLM summary timed out");
+            tracing::debug!("daily digest LLM summary timed out");
             fallback
         }
     }
@@ -6251,7 +6600,7 @@ async fn maybe_prepare_daily_digest(state: AppState) {
         Ok(Ok(Some(guard))) => guard,
         Ok(Ok(None)) => return,
         Ok(Err(error)) => {
-            tracing::debug!(target: "arkreflect", error = %error, "failed to acquire daily digest lease");
+            tracing::debug!(error = %error, "failed to acquire daily digest lease");
             return;
         }
         Err(_) => return,
@@ -6413,7 +6762,7 @@ async fn reflect_idle_loop(state: AppState, mut shutdown_rx: tokio::sync::watch:
             ) => result,
         };
         if digest_result.is_err() {
-            tracing::debug!(target: "arkreflect", "daily digest background pass timed out");
+            tracing::debug!("daily digest background pass timed out");
         }
         if *shutdown_rx.borrow() {
             break;
@@ -6473,21 +6822,6 @@ pub(super) async fn ark_reflect_endpoint(
     let today_date = reflect_local_date(chrono::Utc::now(), tz);
     let digest_enabled = arkreflect_daily_digest_enabled(&storage).await;
     let daily_digest_status = load_daily_digest_status(&storage, digest_enabled, today_date).await;
-    let followup_state = state.clone();
-    let followup_from = request.from;
-    let followup_to = request.to;
-    crate::spawn_logged!(
-        "src/channels/http/reflect_control.rs:followup_page_probe",
-        async move {
-            let _ = maybe_spawn_reflect_followup_search_for_range(
-                followup_state,
-                followup_from,
-                followup_to,
-                "view",
-            )
-            .await;
-        }
-    );
     let units = match tokio::time::timeout(
         REFLECT_DB_TIMEOUT,
         storage.list_semantic_work_units_between(&from_s, &to_s, REFLECT_MAX_UNITS),
@@ -6528,9 +6862,9 @@ pub(super) async fn ark_reflect_endpoint(
     .await
     .is_err()
     {
-        tracing::debug!(target: "arkreflect", "related history enrichment timed out");
+        tracing::debug!("related history enrichment timed out");
     }
-    let suggested_followups = build_suggested_followups(
+    let followup_build = build_suggested_followups(
         &storage,
         &clusters,
         embedding_client.as_deref(),
@@ -6538,6 +6872,25 @@ pub(super) async fn ark_reflect_endpoint(
         false,
     )
     .await;
+    let suggested_followups = followup_build.followups;
+    let followup_planning = reflect_followup_planning_status(followup_build.unplanned.len()).await;
+    // Plan the very candidates this response computed (no re-cluster, no id
+    // drift) and run due source checks for the visible ones.
+    let planning_state = state.clone();
+    let pending_candidates = followup_build.unplanned;
+    let visible_followups = suggested_followups.clone();
+    crate::spawn_logged!(
+        "src/channels/http/reflect_control.rs:followup_view_planning",
+        async move {
+            let _ = spawn_reflect_followup_planning_for_candidates(
+                planning_state,
+                pending_candidates,
+                visible_followups,
+                "view",
+            )
+            .await;
+        }
+    );
     (
         StatusCode::OK,
         Json(ReflectResponse {
@@ -6552,6 +6905,7 @@ pub(super) async fn ark_reflect_endpoint(
             cache_status,
             daily_digest_status,
             suggested_followups,
+            followup_planning,
             clusters,
             unclustered_units,
         }),
@@ -6788,7 +7142,7 @@ mod tests {
     }
 
     #[test]
-    fn unplanned_source_check_drops_direct_chat_without_planner() {
+    fn unplanned_candidates_stay_pending_instead_of_displaying() {
         let now = chrono::Utc
             .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
             .single()
@@ -6807,12 +7161,13 @@ mod tests {
         chat_candidate.search_query =
             Some("recent public policy shifts affecting a local community".to_string());
 
-        let dropped_chat = apply_reflect_external_pursuit_plans(
+        let (kept_chat, pending_chat) = apply_reflect_external_pursuit_plans(
             vec![chat_candidate],
             &BTreeMap::new(),
             &ReflectFollowupPlanCache::default(),
         );
-        assert!(dropped_chat.is_empty());
+        assert!(kept_chat.is_empty());
+        assert_eq!(pending_chat.len(), 1);
 
         let memory_cluster = freshness_cluster_with_source_kind(
             "memory-interest",
@@ -6824,12 +7179,13 @@ mod tests {
             reflect_planned_cluster_latest_suggestion(&memory_cluster, &cache, now)
                 .expect("memory cluster should still produce a planned candidate");
         assert!(!memory_candidate.allow_unplanned_source_check);
-        let dropped = apply_reflect_external_pursuit_plans(
+        let (kept, pending) = apply_reflect_external_pursuit_plans(
             vec![memory_candidate],
             &BTreeMap::new(),
             &ReflectFollowupPlanCache::default(),
         );
-        assert!(dropped.is_empty());
+        assert!(kept.is_empty());
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
@@ -6876,7 +7232,12 @@ mod tests {
             }),
         };
 
-        let entry = reflect_plan_cache_entry_from_plan(&plan, "2026-06-03T00:00:00Z").unwrap();
+        let entry = reflect_plan_cache_entry_from_plan(
+            &plan,
+            "2026-06-03T00:00:00Z",
+            "Kolkata to Thailand travel planning",
+        )
+        .unwrap();
         assert_eq!(
             entry.source_strategy,
             ReflectFollowupSourceStrategy::FlightPriceDiscovery
@@ -7261,12 +7622,21 @@ mod tests {
             tool_sequence_digest: None,
             tool_sequence_json: serde_json::json!(tool_names
                 .iter()
-                .map(|name| serde_json::json!({ "tool_name": name }))
+                .map(|name| serde_json::json!({
+                    "name": name,
+                    "status": "success",
+                    "started_at": serde_json::Value::Null,
+                    "completed_at": serde_json::Value::Null,
+                }))
                 .collect::<Vec<_>>()),
             strategy_version: None,
             policy_version: None,
             prompt_version: None,
             model_slot: None,
+            tokens_in: None,
+            tokens_out: None,
+            wall_ms: None,
+            est_cost_microusd: None,
             success_state: "accepted".to_string(),
             correction_state: "none".to_string(),
             outcome_summary: None,
@@ -7397,6 +7767,25 @@ mod tests {
         .unwrap();
         assert!(renewed_feedback.renewed_after_feedback);
         assert!(!reflect_followup_is_dismissed(Some(&renewed_feedback)));
+    }
+
+    #[test]
+    fn research_detection_reads_production_and_legacy_tool_keys() {
+        // The production writer serializes tool entries under "name"
+        // (experience_tool_sequence_json in message_processing.rs); the chat
+        // pipeline always stamps task_type "chat".
+        let production = experience_run_with_tools(Some("chat"), &["web_search"]);
+        assert!(reflect_experience_run_is_research(&production));
+
+        let browsing = experience_run_with_tools(Some("chat"), &["browser_navigate"]);
+        assert!(reflect_experience_run_is_research(&browsing));
+
+        let mut legacy = experience_run_with_tools(Some("chat"), &[]);
+        legacy.tool_sequence_json = serde_json::json!([{ "tool_name": "page_fetch" }]);
+        assert!(reflect_experience_run_is_research(&legacy));
+
+        let chat_only = experience_run_with_tools(Some("chat"), &["calendar_read"]);
+        assert!(!reflect_experience_run_is_research(&chat_only));
     }
 
     #[test]
@@ -7548,7 +7937,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let planned =
+        let (planned, _) =
             apply_reflect_external_pursuit_plans(vec![suggestion], &BTreeMap::new(), &plan_cache);
 
         assert_eq!(planned.len(), 1);
@@ -7665,7 +8054,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let planned =
+        let (planned, _) =
             apply_reflect_external_pursuit_plans(vec![suggestion], &BTreeMap::new(), &plan_cache);
 
         assert_eq!(planned.len(), 1);
@@ -7731,7 +8120,7 @@ mod tests {
             },
         );
 
-        let planned =
+        let (planned, _) =
             apply_reflect_external_pursuit_plans(vec![suggestion], &BTreeMap::new(), &plan_cache);
 
         assert_eq!(planned.len(), 1);
@@ -7786,12 +8175,13 @@ mod tests {
             reflect_planned_cluster_latest_suggestion(&user_cluster, &cache, now).unwrap();
 
         assert!(suggestion.search_requires_planning);
-        let planned = apply_reflect_external_pursuit_plans(
+        let (planned, pending) = apply_reflect_external_pursuit_plans(
             vec![suggestion],
             &BTreeMap::new(),
             &ReflectFollowupPlanCache::default(),
         );
         assert!(planned.is_empty());
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
@@ -7812,16 +8202,17 @@ mod tests {
             },
         );
 
-        let planned = apply_reflect_external_pursuit_plans(
+        let (planned, pending) = apply_reflect_external_pursuit_plans(
             vec![candidate],
             &plans,
             &ReflectFollowupPlanCache::default(),
         );
         assert!(planned.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]
-    fn external_pursuit_planning_still_drops_private_memory_without_plan() {
+    fn external_pursuit_planning_holds_private_memory_pending_without_plan() {
         let mut candidate = followup("memory-topic", "latest_developments", 80.0);
         candidate.title = "Learned user memory".to_string();
         candidate.search_requires_planning = true;
@@ -7831,13 +8222,14 @@ mod tests {
                 .to_string(),
         );
 
-        let planned = apply_reflect_external_pursuit_plans(
+        let (planned, pending) = apply_reflect_external_pursuit_plans(
             vec![candidate],
             &BTreeMap::new(),
             &ReflectFollowupPlanCache::default(),
         );
 
         assert!(planned.is_empty());
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
@@ -7864,7 +8256,7 @@ mod tests {
             },
         );
 
-        let planned =
+        let (planned, _) =
             apply_reflect_external_pursuit_plans(vec![candidate], &BTreeMap::new(), &cache);
 
         assert_eq!(planned.len(), 1);
@@ -7899,7 +8291,7 @@ mod tests {
             },
         );
 
-        let planned = apply_reflect_external_pursuit_plans(
+        let (planned, _) = apply_reflect_external_pursuit_plans(
             vec![candidate],
             &plans,
             &ReflectFollowupPlanCache::default(),
@@ -7938,7 +8330,7 @@ mod tests {
             },
         );
 
-        let planned = apply_reflect_external_pursuit_plans(
+        let (planned, _) = apply_reflect_external_pursuit_plans(
             vec![candidate],
             &plans,
             &ReflectFollowupPlanCache::default(),
@@ -7971,12 +8363,162 @@ mod tests {
             },
         );
 
-        let planned = apply_reflect_external_pursuit_plans(
+        let (planned, pending) = apply_reflect_external_pursuit_plans(
             vec![candidate],
             &plans,
             &ReflectFollowupPlanCache::default(),
         );
         assert!(planned.is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn plan_cache_reuses_verdicts_by_topic_meaning_across_id_churn() {
+        let mut candidate = followup("latest:planned:new-id", "latest_developments", 80.0);
+        candidate.title = "GMI cloud GPU pricing comparison".to_string();
+        candidate.search_requires_planning = true;
+        candidate.search_query =
+            Some("GMI cloud GPU pricing comparison before committing".to_string());
+
+        let mut cache = ReflectFollowupPlanCache::default();
+        cache.entries.insert(
+            "latest:planned:old-id".to_string(),
+            ReflectFollowupPlanEntry {
+                id: "latest:planned:old-id".to_string(),
+                useful: true,
+                title: "Compare current GPU cloud pricing options".to_string(),
+                search_query: "GMI Cloud GPU pricing comparison alternatives 2026".to_string(),
+                rationale: "Current provider pricing changes often.".to_string(),
+                planned_at: "2026-06-01T00:00:00Z".to_string(),
+                topic: "GMI cloud GPU pricing comparison before committing to a provider"
+                    .to_string(),
+                ..Default::default()
+            },
+        );
+
+        let (planned, pending) =
+            apply_reflect_external_pursuit_plans(vec![candidate], &BTreeMap::new(), &cache);
+
+        assert!(pending.is_empty());
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].title,
+            "Compare current GPU cloud pricing options"
+        );
+    }
+
+    #[test]
+    fn plan_cache_topic_reuse_rejects_distinct_topics_sharing_scheme_tokens() {
+        // Same-family topics share scheme words ("learned user memory") but
+        // have disjoint content; the verdict must NOT transfer.
+        let mut candidate = followup("latest:planned:color-id", "latest_developments", 80.0);
+        candidate.title = "Learned user memory favorite color".to_string();
+        candidate.search_requires_planning = true;
+        candidate.search_query = Some("Learned user memory favorite color".to_string());
+
+        let mut cache = ReflectFollowupPlanCache::default();
+        cache.entries.insert(
+            "latest:planned:nickname-id".to_string(),
+            ReflectFollowupPlanEntry {
+                id: "latest:planned:nickname-id".to_string(),
+                useful: true,
+                title: "Nickname etymology resources".to_string(),
+                search_query: "common nickname origins".to_string(),
+                rationale: "Public references exist.".to_string(),
+                planned_at: "2026-06-01T00:00:00Z".to_string(),
+                topic: "Learned user memory ordinary nickname".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let (planned, pending) =
+            apply_reflect_external_pursuit_plans(vec![candidate], &BTreeMap::new(), &cache);
+
+        assert!(planned.is_empty());
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn plan_cache_never_transfers_negative_verdicts_by_similarity() {
+        // A not-useful verdict for a same-meaning topic under a different id
+        // must not silently suppress the candidate; it stays pending and gets
+        // one cheap re-plan instead.
+        let mut candidate = followup("latest:planned:new-id", "latest_developments", 80.0);
+        candidate.title = "GMI cloud GPU pricing comparison".to_string();
+        candidate.search_requires_planning = true;
+        candidate.search_query =
+            Some("GMI cloud GPU pricing comparison before committing".to_string());
+
+        let mut cache = ReflectFollowupPlanCache::default();
+        cache.entries.insert(
+            "latest:planned:old-id".to_string(),
+            ReflectFollowupPlanEntry {
+                id: "latest:planned:old-id".to_string(),
+                useful: false,
+                planned_at: "2026-06-01T00:00:00Z".to_string(),
+                topic: "GMI cloud GPU pricing comparison before committing to a provider"
+                    .to_string(),
+                ..Default::default()
+            },
+        );
+
+        let (planned, pending) =
+            apply_reflect_external_pursuit_plans(vec![candidate], &BTreeMap::new(), &cache);
+
+        assert!(planned.is_empty());
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn unusable_useful_verdicts_are_cached_as_short_lived_negatives() {
+        let plan = ReflectExternalPursuitPlan {
+            id: "defective-topic".to_string(),
+            useful: true,
+            title: "Has a title".to_string(),
+            search_query: String::new(),
+            rationale: "Planner forgot the query.".to_string(),
+            ..Default::default()
+        };
+
+        let entry = reflect_plan_cache_entry_from_plan(&plan, "2026-06-10T00:00:00Z", "a topic")
+            .expect("unusable useful verdict should cache as a negative entry");
+        assert!(!entry.useful);
+        assert_eq!(entry.topic, "a topic");
+    }
+
+    #[test]
+    fn negative_plan_verdicts_expire_faster_than_useful_ones() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 10, 0, 0, 0)
+            .single()
+            .unwrap();
+        let planned_at = (now - chrono::Duration::days(30)).to_rfc3339();
+        let mut cache = ReflectFollowupPlanCache::default();
+        cache.entries.insert(
+            "useful".to_string(),
+            ReflectFollowupPlanEntry {
+                id: "useful".to_string(),
+                useful: true,
+                title: "Track a useful pursuit".to_string(),
+                search_query: "useful pursuit current sources".to_string(),
+                planned_at: planned_at.clone(),
+                ..Default::default()
+            },
+        );
+        cache.entries.insert(
+            "not-useful".to_string(),
+            ReflectFollowupPlanEntry {
+                id: "not-useful".to_string(),
+                useful: false,
+                planned_at,
+                ..Default::default()
+            },
+        );
+
+        prune_reflect_followup_plan_cache(&mut cache, now);
+
+        assert!(cache.entries.contains_key("useful"));
+        assert!(!cache.entries.contains_key("not-useful"));
     }
 
     #[test]

@@ -4,6 +4,54 @@ use super::*;
 
 const GENERATED_FILE_DOCUMENT_ID_PREFIX: &str = "generated-file:";
 
+fn document_text_downloadable(filename: &str, content_type: &str, chunk_count: i32) -> bool {
+    if chunk_count <= 1 {
+        return false;
+    }
+
+    let lower_name = filename.to_ascii_lowercase();
+    let ext = lower_name.rsplit('.').next().unwrap_or("");
+    let lower_ct = content_type.to_ascii_lowercase();
+    let text_exts = [
+        "txt", "md", "markdown", "json", "csv", "tsv", "xml", "html", "htm", "yaml", "yml", "log",
+        "ini", "toml", "sql", "js", "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "cpp", "h",
+        "hpp", "sh", "bat", "ps1",
+    ];
+
+    lower_ct.starts_with("text/")
+        || lower_ct.contains("json")
+        || lower_ct.contains("xml")
+        || lower_ct.contains("yaml")
+        || text_exts.contains(&ext)
+}
+
+fn document_text_download_url(
+    id: &str,
+    filename: &str,
+    content_type: &str,
+    chunk_count: i32,
+) -> Option<String> {
+    if document_text_downloadable(filename, content_type, chunk_count) {
+        Some(format!(
+            "/documents/{}/download",
+            urlencoding::encode(id.trim())
+        ))
+    } else {
+        None
+    }
+}
+
+fn document_download_url(
+    id: &str,
+    filename: &str,
+    content_type: &str,
+    chunk_count: i32,
+    managed_output_url: Option<String>,
+) -> Option<String> {
+    managed_output_url
+        .or_else(|| document_text_download_url(id, filename, content_type, chunk_count))
+}
+
 fn document_metadata_download_url(content: &str) -> Option<String> {
     content.lines().find_map(|line| {
         let value = line.trim().strip_prefix("download_url:")?.trim();
@@ -64,7 +112,13 @@ pub(super) async fn list_documents_endpoint(
                     "file_size": d.file_size,
                     "created_at": d.created_at.clone(),
                 });
-                if let Some(download_url) = download_url {
+                if let Some(download_url) = document_download_url(
+                    &d.id,
+                    &d.filename,
+                    &d.content_type,
+                    d.chunk_count,
+                    download_url,
+                ) {
                     doc["download_url"] = serde_json::Value::String(download_url);
                 }
                 list.push(doc);
@@ -96,6 +150,110 @@ pub(super) async fn delete_document_endpoint(
         )
             .into_response(),
     }
+}
+
+fn document_download_content_type(content_type: &str) -> String {
+    let trimmed = content_type.trim();
+    if trimmed.is_empty() {
+        return "text/plain; charset=utf-8".to_string();
+    }
+    if trimmed.to_ascii_lowercase().starts_with("text/") && !trimmed.contains("charset=") {
+        return format!("{trimmed}; charset=utf-8");
+    }
+    trimmed.to_string()
+}
+
+fn document_content_disposition_filename(raw: &str) -> String {
+    let sanitized = raw.replace(['\r', '\n', '"'], "_");
+    if sanitized.trim().is_empty() {
+        "document.txt".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn document_download_text_from_chunks(
+    chunks: &[crate::storage::entities::document_chunk::Model],
+) -> Option<String> {
+    let content = chunks
+        .iter()
+        .filter(|chunk| chunk.chunk_index > 0)
+        .map(|chunk| chunk.content.as_str())
+        .collect::<String>();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+pub(super) async fn download_document_endpoint(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let agent = state.agent.read().await;
+    let doc = match agent.storage.get_document(&id).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    if !document_text_downloadable(&doc.filename, &doc.content_type, doc.chunk_count) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "Download is available for text documents and generated output artifacts. This record only has indexed metadata.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let chunks = match agent.storage.get_document_chunks(&doc.id).await {
+        Ok(chunks) => chunks,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(content) = document_download_text_from_chunks(&chunks) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "No indexed text content is available to download for this document."
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let content_type = document_download_content_type(&doc.content_type);
+    let safe_filename = document_content_disposition_filename(&doc.filename);
+    (
+        [
+            (header::CONTENT_TYPE, content_type.as_str()),
+            (
+                header::CONTENT_DISPOSITION,
+                &format!("attachment; filename=\"{}\"", safe_filename),
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        content.into_bytes(),
+    )
+        .into_response()
 }
 
 pub(super) fn sanitize_document_filename(raw: &str) -> String {
@@ -770,5 +928,78 @@ mod tests {
         assert!(chunk.contains("filename: unsafe name.png"));
         assert!(chunk.contains("text_extraction_status: unsupported format"));
         assert!(!chunk.contains("unsafe\nname"));
+    }
+
+    #[test]
+    fn document_download_url_falls_back_for_text_documents() {
+        let value = document_download_url(
+            "doc:with space",
+            "research-brief.md",
+            "text/markdown",
+            3,
+            None,
+        );
+
+        assert_eq!(
+            value.as_deref(),
+            Some("/documents/doc%3Awith%20space/download")
+        );
+    }
+
+    #[test]
+    fn document_download_url_prefers_managed_output_url() {
+        let value = document_download_url(
+            "generated-file:test",
+            "report.pdf",
+            "application/pdf",
+            1,
+            Some(
+                "/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/report.pdf/download".to_string(),
+            ),
+        );
+
+        assert_eq!(
+            value.as_deref(),
+            Some("/api/outputs/0185f5e8-9694-454f-b0d3-42c83fbba585/report.pdf/download")
+        );
+    }
+
+    #[test]
+    fn document_download_url_omits_metadata_only_non_text_documents() {
+        let value = document_download_url("image-id", "image.png", "image/png", 1, None);
+
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn document_download_text_from_chunks_skips_metadata_chunk() {
+        let chunks = vec![
+            crate::storage::entities::document_chunk::Model {
+                id: "meta".to_string(),
+                document_id: "doc".to_string(),
+                chunk_index: 0,
+                content: "artifact_kind: document\nfilename: notes.md".to_string(),
+                embedding: None,
+            },
+            crate::storage::entities::document_chunk::Model {
+                id: "chunk-1".to_string(),
+                document_id: "doc".to_string(),
+                chunk_index: 1,
+                content: "hello ".to_string(),
+                embedding: None,
+            },
+            crate::storage::entities::document_chunk::Model {
+                id: "chunk-2".to_string(),
+                document_id: "doc".to_string(),
+                chunk_index: 2,
+                content: "world".to_string(),
+                embedding: None,
+            },
+        ];
+
+        assert_eq!(
+            document_download_text_from_chunks(&chunks).as_deref(),
+            Some("hello world")
+        );
     }
 }

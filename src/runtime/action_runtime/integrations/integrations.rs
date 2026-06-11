@@ -339,7 +339,14 @@ impl ActionRuntime {
                     || self.google_workspace_granted_bundle_for_runtime("calendar")
             }
             "google_workspace" => self.google_workspace_connected_for_runtime(),
-            _ => true,
+            _ => {
+                let manager = crate::integrations::IntegrationManager::new(&self.config_dir);
+                manager.get(integration_id).is_some()
+                    && crate::integrations::effective_integration_enabled(
+                        &self.config_dir,
+                        integration_id,
+                    )
+            }
         }
     }
 

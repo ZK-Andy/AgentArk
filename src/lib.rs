@@ -304,6 +304,7 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         execution_surface: actions::ActionExecutionSurface::Chat,
         direct_user_intent: true,
         recorded_user_message_id: None,
+        memory_capture: Default::default(),
         attachments_present: false,
         attachments: Vec::new(),
         execution_profile: None,

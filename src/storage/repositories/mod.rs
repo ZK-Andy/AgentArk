@@ -6,6 +6,8 @@ mod conversations;
 mod database_health;
 mod documents;
 mod encrypted_payloads;
+mod evolve_eval_cases;
+mod evolve_opportunities;
 mod execution;
 mod experience_runs;
 mod housekeeping;

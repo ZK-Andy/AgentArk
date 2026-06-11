@@ -964,6 +964,32 @@
   overflow: auto;
 }
 
+.cview-file-markdown {
+  padding: 16px 18px;
+  max-height: 62vh;
+  overflow: auto;
+  font-family: var(--font-sans);
+  font-size: 0.84rem;
+  line-height: 1.62;
+  white-space: normal;
+  word-break: normal;
+}
+
+.cview-file-markdown.chat-markdown {
+  color: var(--ui-rgba-228-241-255-940);
+}
+
+.cview-file-markdown.chat-markdown pre {
+  max-width: 100%;
+}
+
+.cview-file-markdown.chat-markdown img {
+  display: block;
+  max-width: 100%;
+  max-height: min(42vh, 360px);
+  object-fit: contain;
+}
+
 .cview-file-empty {
   padding: 12px;
   color: var(--ui-rgba-184-191-201-720);

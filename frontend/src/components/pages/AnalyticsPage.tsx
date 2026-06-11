@@ -161,6 +161,20 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     return `$${value.toFixed(resolvedDigits)}`;
   }
 
+  function formatLatencyMs(value: number | null | undefined): string {
+    if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+    if (value < 1000) return `${Math.round(value)}ms`;
+    const seconds = value / 1000;
+    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+    let minutes = Math.floor(seconds / 60);
+    let rest = Math.round(seconds % 60);
+    if (rest === 60) {
+      minutes += 1;
+      rest = 0;
+    }
+    return rest > 0 ? `${minutes}m ${rest}s` : `${minutes}m`;
+  }
+
   function formatBreakdownLabel(
     row: LlmAnalyticsBreakdownRow,
     view: BreakdownView,
@@ -571,10 +585,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     },
     {
       label: "Slowest p95",
-      value:
-        slowestPolicyLatency == null
-          ? "-"
-          : `${num(slowestPolicyLatency, 0).toLocaleString()}ms`,
+      value: formatLatencyMs(slowestPolicyLatency),
       detail:
         slowestPolicyLatency == null
           ? "Latency pending"
@@ -649,9 +660,10 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
       itemWidth: 10,
       itemHeight: 10,
     },
-    grid: { left: 48, right: 58, top: 18, bottom: 52 },
+    grid: { left: 46, right: 64, top: 16, bottom: 52 },
     tooltip: {
       trigger: "axis",
+      axisPointer: { type: "shadow" },
       backgroundColor: chartTokens.tooltipBg,
       borderColor: chartTokens.tooltipBorder,
       textStyle: { color: "#fff8ed" },
@@ -668,7 +680,9 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
             const label = item.seriesName || "";
             const rawValue = Number(item.value);
             const value = label.toLowerCase().includes("latency")
-              ? `${Number.isFinite(rawValue) ? rawValue.toLocaleString() : item.value}ms`
+              ? Number.isFinite(rawValue)
+                ? formatLatencyMs(rawValue)
+                : `${item.value}`
               : `${Number.isFinite(rawValue) ? rawValue.toFixed(1) : item.value}%`;
             return `${item.marker || ""}${label}: ${value}`;
           });
@@ -678,6 +692,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     xAxis: {
       type: "category",
       data: policyChartLabels,
+      axisTick: { show: false },
       axisLabel: { color: "rgba(226, 218, 208, 0.7)", fontSize: 10 },
       axisLine: {
         lineStyle: { color: chartTokens.axisLine },
@@ -686,28 +701,24 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     yAxis: [
       {
         type: "value",
-        name: "success/error %",
         min: 0,
         max: 100,
         axisLabel: {
           color: "rgba(226, 218, 208, 0.7)",
           formatter: "{value}%",
         },
-        nameTextStyle: { color: "rgba(226, 218, 208, 0.7)" },
         splitLine: {
           lineStyle: { color: chartTokens.splitLine },
         },
       },
       {
         type: "value",
-        name: "p95 ms",
         min: 0,
         max: policyLatencyCeiling,
         axisLabel: {
-          color: "rgba(226, 218, 208, 0.7)",
-          formatter: "{value}",
+          color: "rgba(240, 184, 106, 0.85)",
+          formatter: (value: number) => formatLatencyMs(value),
         },
-        nameTextStyle: { color: "rgba(226, 218, 208, 0.7)" },
         splitLine: { show: false },
       },
     ],
@@ -722,7 +733,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
           color: "#14f195",
           borderRadius: [4, 4, 0, 0],
         },
-        barMaxWidth: 28,
+        barMaxWidth: 34,
       },
       {
         name: "Errors",
@@ -734,7 +745,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
           color: "#f87171",
           borderRadius: [4, 4, 0, 0],
         },
-        barMaxWidth: 28,
+        barMaxWidth: 34,
       },
       {
         name: "p95 latency",
@@ -891,10 +902,109 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
             lg: "minmax(0, 1.62fr) minmax(320px, 0.78fr)",
           },
           gap: 1.5,
-          alignItems: "start",
+          alignItems: "stretch",
           minWidth: 0,
         }}
       >
+        <Box
+          sx={{
+            gridColumn: { lg: "1 / -1" },
+            display: "grid",
+            gridTemplateColumns: {
+              xs: "minmax(0, 1fr)",
+              sm: "repeat(2, minmax(0, 1fr))",
+              lg: "repeat(5, minmax(0, 1fr))",
+            },
+            gap: 0.75,
+            minWidth: 0,
+            alignItems: "stretch",
+          }}
+        >
+          {railCards.map((card) => (
+            <Box
+              key={card.label}
+              sx={{
+                minWidth: 0,
+                minHeight: 78,
+                display: "flex",
+                alignItems: "center",
+                borderRadius: "8px",
+                border: "1px solid rgba(130, 170, 160, 0.12)",
+                background:
+                  "linear-gradient(180deg, var(--ui-rgba-17-17-20-920), var(--ui-rgba-12-18-28-920))",
+                px: 1,
+                py: 0.85,
+              }}
+            >
+              <Stack
+                direction="row"
+                spacing={0.8}
+                sx={{
+                  width: "100%",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                }}
+              >
+                <Box sx={{ minWidth: 0, flex: "1 1 auto" }}>
+                  <Typography
+                    variant="overline"
+                    sx={{
+                      color: "text.secondary",
+                      display: "block",
+                      letterSpacing: 0,
+                      lineHeight: 1.05,
+                    }}
+                  >
+                    {card.label}
+                  </Typography>
+                  <Typography
+                    variant="h6"
+                    sx={{
+                      color: "#f6f0e8",
+                      fontSize: "1rem",
+                      lineHeight: 1.12,
+                      mt: 0.25,
+                    }}
+                  >
+                    {card.value}
+                  </Typography>
+                  {card.detail ? (
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "text.secondary",
+                        display: "block",
+                        lineHeight: 1.25,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                      title={card.detail}
+                    >
+                      {card.detail}
+                    </Typography>
+                  ) : null}
+                </Box>
+                <Box
+                  sx={{
+                    width: { xs: 92, lg: 72 },
+                    flex: "0 0 auto",
+                  }}
+                >
+                  <ReactECharts
+                    style={{ height: 42 }}
+                    option={buildSparklineOption(
+                      card.values,
+                      card.color,
+                      card.chartType,
+                    )}
+                  />
+                </Box>
+              </Stack>
+            </Box>
+          ))}
+        </Box>
+
         <Stack
           spacing={1.5}
           useFlexGap
@@ -1195,7 +1305,10 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                 },
                 yAxis: {
                   type: "value",
-                  axisLabel: { color: chartTokens.axisLabel },
+                  axisLabel: {
+                    color: chartTokens.axisLabel,
+                    formatter: (value: number) => compactNumber(value),
+                  },
                   splitLine: {
                     lineStyle: { color: chartTokens.splitLine },
                   },
@@ -1269,6 +1382,8 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
             sx={{
               order: 3,
               minWidth: 0,
+              flexGrow: 1,
+              minHeight: 0,
               display: "flex",
               flexDirection: "column",
             }}
@@ -1325,6 +1440,8 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
               <TableContainer
                 className="table-shell"
                 sx={{
+                  flexGrow: 1,
+                  minHeight: 160,
                   maxHeight: { xs: 360, md: 560 },
                   overflow: "auto",
                 }}
@@ -1385,78 +1502,18 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
         </Stack>
 
           <Stack
-            spacing={1.5}
+            spacing={1}
             sx={{
               gridColumn: { lg: "2" },
               minWidth: 0,
+              alignSelf: { lg: "stretch" },
+              justifyContent: "flex-start",
             }}
           >
-            <Stack spacing={1} sx={{ minWidth: 0 }}>
-              {railCards.map((card) => (
-                <Box
-                  key={card.label}
-                  sx={{
-                    minWidth: 0,
-                    borderRadius: "12px",
-                    border: "1px solid rgba(130, 170, 160, 0.12)",
-                    background:
-                      "linear-gradient(180deg, var(--ui-rgba-17-17-20-920), var(--ui-rgba-12-18-28-920))",
-                    px: 1.2,
-                    py: 1.1,
-                  }}
-                >
-                  <Stack
-                    direction="row"
-                    spacing={1}
-                    sx={{
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                    }}
-                  >
-                    <Box sx={{ minWidth: 0 }}>
-                      <Typography
-                        variant="overline"
-                        sx={{ color: "text.secondary", letterSpacing: 0 }}
-                      >
-                        {card.label}
-                      </Typography>
-                      <Typography
-                        variant="h6"
-                        sx={{ color: "#f6f0e8", mt: 0.1 }}
-                      >
-                        {card.value}
-                      </Typography>
-                      {card.detail ? (
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            color: "text.secondary",
-                            display: "block",
-                            lineHeight: 1.45,
-                          }}
-                        >
-                          {card.detail}
-                        </Typography>
-                      ) : null}
-                    </Box>
-                    <Box sx={{ width: 96, flex: "0 0 auto" }}>
-                      <ReactECharts
-                        style={{ height: 48 }}
-                        option={buildSparklineOption(
-                          card.values,
-                          card.color,
-                          card.chartType,
-                        )}
-                      />
-                    </Box>
-                  </Stack>
-                </Box>
-              ))}
-
-              <Box
+            <Box
                 sx={{
                   minWidth: 0,
-                  borderRadius: "12px",
+                  borderRadius: "8px",
                   border: "1px solid rgba(130, 170, 160, 0.12)",
                   background:
                     "linear-gradient(180deg, var(--ui-rgba-17-17-20-920), var(--ui-rgba-12-18-28-920))",
@@ -1541,9 +1598,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   )}
                 </Stack>
               </Box>
-            </Stack>
 
-            <Stack spacing={1.5} sx={{ minWidth: 0 }}>
               <MetricBarCard
                 title="Model Mix"
                 value={`${resp?.by_model?.length ?? 0} live`}
@@ -1574,28 +1629,49 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                 palette={palette}
                 compact
               />
-            </Stack>
+          </Stack>
 
-            <Box
-              className="list-shell"
-              sx={{
-                minWidth: 0,
-                display: "flex",
-                flexDirection: "column",
-              }}
-            >
-              <Typography
-                variant="h6"
-                sx={{ color: "#fff8ed", fontWeight: 600 }}
+          <Box
+            className="list-shell"
+            sx={{
+              gridColumn: { xs: "auto", lg: "1 / -1" },
+              minWidth: 0,
+              display: "flex",
+              flexDirection: "column",
+            }}
+          >
+              <Stack
+                direction={{ xs: "column", md: "row" }}
+                spacing={1}
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", md: "center" },
+                  mb: 1.2,
+                }}
               >
-                Routing Policy Performance
-              </Typography>
-              <Typography
-                variant="body2"
-                sx={{ color: "text.secondary", mb: 1.2 }}
-              >
-                Success, errors, and tail latency across routing policy versions.
-              </Typography>
+                <Box>
+                  <Typography
+                    variant="h6"
+                    sx={{ color: "#fff8ed", fontWeight: 600 }}
+                  >
+                    Routing Policy Performance
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    Success, errors, and tail latency across routing policy
+                    versions.
+                  </Typography>
+                </Box>
+                {policyMetricsRows.length > 0 ? (
+                  <Typography
+                    variant="caption"
+                    sx={{ color: "text.secondary", flexShrink: 0 }}
+                  >
+                    {policyMetricsRows.length} version
+                    {policyMetricsRows.length === 1 ? "" : "s"} ·{" "}
+                    {compactNumber(totalPolicySamples)} samples
+                  </Typography>
+                ) : null}
+              </Stack>
               {policyMetricsQ.isLoading ? (
                 <Typography variant="body2" sx={{ color: "text.secondary" }}>
                   Loading policy metrics...
@@ -1607,31 +1683,51 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   No routing policy metrics yet.
                 </Typography>
               ) : (
-                <Stack spacing={1.15}>
-                  <ReactECharts
-                    option={policyMetricsOption}
-                    style={{ height: 286 }}
-                  />
+                <Stack spacing={1.25}>
                   <Box
                     sx={{
                       display: "grid",
                       gridTemplateColumns: {
-                        xs: "1fr",
-                        sm: "repeat(3, minmax(0, 1fr))",
+                        xs: "minmax(0, 1fr)",
+                        lg: "minmax(0, 1.62fr) minmax(280px, 0.78fr)",
                       },
-                      gap: 1,
+                      gap: 1.25,
+                      alignItems: "stretch",
+                      minWidth: 0,
                     }}
                   >
+                    <Box sx={{ minWidth: 0 }}>
+                      <ReactECharts
+                        option={policyMetricsOption}
+                        style={{ height: 300 }}
+                      />
+                    </Box>
+                    <Box
+                      sx={{
+                        display: "grid",
+                        gridTemplateColumns: {
+                          xs: "1fr",
+                          sm: "repeat(3, minmax(0, 1fr))",
+                          lg: "1fr",
+                        },
+                        gridAutoRows: { lg: "1fr" },
+                        gap: 1,
+                        minWidth: 0,
+                      }}
+                    >
                     {policySummaryCards.map((card) => (
                       <Box
                         key={card.label}
                         sx={{
                           minWidth: 0,
+                          display: "flex",
+                          flexDirection: "column",
+                          justifyContent: "center",
                           borderRadius: "10px",
                           border: "1px solid rgba(130, 170, 160, 0.12)",
                           background:
                             "linear-gradient(180deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-15-15-18-880))",
-                          px: 1,
+                          px: 1.1,
                           py: 0.95,
                         }}
                       >
@@ -1662,6 +1758,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                         </Typography>
                       </Box>
                     ))}
+                    </Box>
                   </Box>
                   <TableContainer
                     className="table-shell"
@@ -1694,7 +1791,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                             <TableCell align="right">
                               {row.p95_latency_ms == null
                                 ? "-"
-                                : `${num(row.p95_latency_ms, 0)}ms`}
+                                : formatLatencyMs(num(row.p95_latency_ms, 0))}
                             </TableCell>
                           </TableRow>
                         ))}
@@ -1703,8 +1800,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   </TableContainer>
                 </Stack>
               )}
-            </Box>
-          </Stack>
+          </Box>
       </Box>
     </WorkspacePageShell>
   );

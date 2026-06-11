@@ -162,6 +162,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn measured_metrics_come_from_trace_usage_with_null_when_absent() {
+        let mut trace = ExecutionTrace::default();
+        trace.started_at = Some(chrono::Utc::now() - chrono::Duration::milliseconds(2500));
+        trace.completed_at = Some(chrono::Utc::now());
+        trace.input_tokens = 1200;
+        trace.output_tokens = 340;
+        trace.total_tokens = 1540;
+        trace.cost_usd = 0.0123;
+
+        let (tokens_in, tokens_out, wall_ms, cost) = experience_run_measured_metrics(&trace);
+        assert_eq!(tokens_in, Some(1200));
+        assert_eq!(tokens_out, Some(340));
+        assert!(wall_ms.unwrap() >= 2500);
+        assert_eq!(cost, Some(12_300));
+
+        // No usage evidence (immediate-persistence path): token/cost stay NULL,
+        // never a misleading zero.
+        let empty = ExecutionTrace::default();
+        let (none_in, none_out, no_wall, none_cost) = experience_run_measured_metrics(&empty);
+        assert_eq!(none_in, None);
+        assert_eq!(none_out, None);
+        assert_eq!(no_wall, None);
+        assert_eq!(none_cost, None);
+    }
+
+    #[test]
     fn request_project_id_is_trimmed_not_dropped() {
         assert_eq!(
             normalize_request_project_id(Some(" project-1 ")),
@@ -217,6 +243,20 @@ enum DeferredExchangePersistenceKind {
     Immediate,
 }
 
+/// Single-flight guard for the outcome judge: at most one judge runs at a
+/// time machine-wide; contended turns skip (the next turn re-judges) so work
+/// can never queue or pile up on small machines.
+static OUTCOME_JUDGE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+struct OutcomeJudgeInFlightGuard;
+
+impl Drop for OutcomeJudgeInFlightGuard {
+    fn drop(&mut self) {
+        OUTCOME_JUDGE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 struct DeferredExchangePersistence {
     kind: DeferredExchangePersistenceKind,
@@ -250,6 +290,23 @@ fn trace_duration_ms(trace: &ExecutionTrace) -> Option<u64> {
             .completed_at
             .map(|end| (end - start).num_milliseconds().max(0) as u64)
     })
+}
+
+/// Measured per-turn metrics for the experience-run evidence row, taken from
+/// the trace snapshot (the turn pipeline stamps its usage delta onto the
+/// trace). A zero token total means no usage evidence reached the trace
+/// (e.g. the immediate-persistence path), so token/cost stay NULL rather than
+/// recording a misleading zero.
+fn experience_run_measured_metrics(
+    trace: &ExecutionTrace,
+) -> (Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
+    let has_usage_evidence = trace.total_tokens > 0;
+    let tokens_in = has_usage_evidence.then_some(trace.input_tokens.max(0));
+    let tokens_out = has_usage_evidence.then_some(trace.output_tokens.max(0));
+    let wall_ms = trace_duration_ms(trace).map(|ms| ms.min(i64::MAX as u64) as i64);
+    let est_cost_microusd =
+        has_usage_evidence.then_some((trace.cost_usd.max(0.0) * 1_000_000.0).round() as i64);
+    (tokens_in, tokens_out, wall_ms, est_cost_microusd)
 }
 
 fn operational_success_for_run_status(status: &str) -> bool {
@@ -751,6 +808,125 @@ impl Agent {
         }
     }
 
+    async fn queue_recorded_user_memory_capture_candidate(
+        &self,
+        message: &str,
+        user_message_for_link_capture: &str,
+        channel: &str,
+        conversation_key: &str,
+        project_id: Option<&str>,
+        source_message_id: Option<&str>,
+    ) -> bool {
+        let queued = self
+            .mark_user_memory_capture_candidate(
+                message,
+                user_message_for_link_capture,
+                channel,
+                Some(conversation_key),
+                project_id,
+                source_message_id,
+            )
+            .await;
+        if queued {
+            self.kick_deferred_user_memory_capture_processing();
+        }
+        queued
+    }
+
+    fn spawn_deferred_user_memory_capture_triage(
+        &self,
+        message: &str,
+        user_message_for_link_capture: &str,
+        channel: &str,
+        conversation_key: &str,
+        project_id: Option<&str>,
+        source_message_id: Option<&str>,
+        is_new_conversation: bool,
+        user_message_already_recorded: bool,
+    ) {
+        let Some(source_message_id) = source_message_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        if message.trim().is_empty() {
+            return;
+        }
+        let agent = self.clone();
+        let message = message.to_string();
+        let user_message_for_link_capture = user_message_for_link_capture.to_string();
+        let channel = channel.to_string();
+        let conversation_key = conversation_key.to_string();
+        let project_id = project_id.map(str::to_string);
+        crate::spawn_logged!(
+            "src/core/agent/conversation/message_processing.rs:deferred_memory_capture_triage",
+            async move {
+                let normalized_for_guard = crate::security::normalize_for_analysis(&message);
+                let new_empty_conversation = is_new_conversation && !user_message_already_recorded;
+                let recent_artifacts = if new_empty_conversation {
+                    Vec::new()
+                } else {
+                    Self::conversation_artifacts_for_prompt(
+                        &agent.load_recent_artifact_contexts(&conversation_key).await,
+                        INBOUND_CLASSIFIER_RECENT_ARTIFACTS,
+                    )
+                };
+                let recent_artifacts_context = (!recent_artifacts.is_empty())
+                    .then(|| serde_json::Value::Array(recent_artifacts.clone()));
+                let mut recent_messages_context = if new_empty_conversation {
+                    Vec::new()
+                } else {
+                    agent
+                        .recent_messages_for_intent_gating(&conversation_key, &message)
+                        .await
+                        .into_iter()
+                        .rev()
+                        .take(4)
+                        .map(|message| {
+                            serde_json::json!({
+                                "role": message.role,
+                                "content": safe_truncate(
+                                    &crate::security::redact_secret_input(&message.content).text,
+                                    360,
+                                ),
+                                "timestamp": message._timestamp,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                recent_messages_context.reverse();
+                let recent_messages_context_value = (!recent_messages_context.is_empty())
+                    .then(|| serde_json::Value::Array(recent_messages_context));
+                let decision = crate::security::intent_classifier::classify_inbound_with_metadata(
+                    &agent.llm,
+                    &crate::security::intent_classifier::default_policy(),
+                    &normalized_for_guard,
+                    recent_messages_context_value.as_ref(),
+                    None,
+                    None,
+                    None,
+                    recent_artifacts_context.as_ref(),
+                    None,
+                )
+                .await;
+                if decision.memory_capture.should_capture {
+                    agent
+                        .queue_recorded_user_memory_capture_candidate(
+                            &message,
+                            &user_message_for_link_capture,
+                            &channel,
+                            &conversation_key,
+                            project_id.as_deref(),
+                            Some(&source_message_id),
+                        )
+                        .await;
+                }
+            }
+        );
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "Shared turn request envelope spans chat, streaming resume, and task follow-up entrypoints"
@@ -973,9 +1149,43 @@ impl Agent {
                 .await?
             {
                 InboundSecurityPrecheck::Respond(processed) => return Ok(processed),
-                InboundSecurityPrecheck::Continue => {}
+                InboundSecurityPrecheck::Continue { memory_capture } => {
+                    request_hints.memory_capture = memory_capture;
+                }
             }
         }
+
+        let memory_capture_queued_before_persistence =
+            if request_hints.memory_capture.should_capture && request_hints.direct_user_intent {
+                self.queue_recorded_user_memory_capture_candidate(
+                    message_storage.as_str(),
+                    message_storage.as_str(),
+                    channel,
+                    &conversation_key,
+                    project_id,
+                    request_hints.recorded_user_message_id.as_deref(),
+                )
+                .await
+            } else {
+                if request_hints.direct_user_intent
+                    && matches!(
+                        &request_hints.execution_surface,
+                        ActionExecutionSurface::Chat
+                    )
+                {
+                    self.spawn_deferred_user_memory_capture_triage(
+                        message_storage.as_str(),
+                        message_storage.as_str(),
+                        channel,
+                        &conversation_key,
+                        project_id,
+                        request_hints.recorded_user_message_id.as_deref(),
+                        is_new_conversation,
+                        user_message_already_recorded,
+                    );
+                }
+                false
+            };
 
         if is_new_conversation && !user_message_already_recorded && !conversation_key.is_empty() {
             self.ensure_conversation_row_for_turn(
@@ -1022,7 +1232,8 @@ impl Agent {
                         model_used: "model_routed_spine",
                         user_message_already_recorded,
                         recorded_user_message_id: request_hints.recorded_user_message_id.clone(),
-                        memory_capture_allowed: true,
+                        memory_capture_allowed: request_hints.memory_capture.should_capture
+                            && !memory_capture_queued_before_persistence,
                         memory_capture_source: None,
                         user_message_for_link_capture: Some(message_storage.as_str()),
                     },
@@ -1064,7 +1275,8 @@ impl Agent {
                         model_used: "model_routed_spine_failed",
                         user_message_already_recorded,
                         recorded_user_message_id: request_hints.recorded_user_message_id.clone(),
-                        memory_capture_allowed: true,
+                        memory_capture_allowed: request_hints.memory_capture.should_capture
+                            && !memory_capture_queued_before_persistence,
                         memory_capture_source: None,
                         user_message_for_link_capture: Some(message_storage.as_str()),
                     },
@@ -1161,7 +1373,11 @@ impl Agent {
         .ok()
     }
 
-    async fn active_tool_strategy_version_for_message(&self, message: &str) -> Option<String> {
+    async fn active_tool_strategy_version_for_conversation_message(
+        &self,
+        conversation_id: Option<&str>,
+        message: &str,
+    ) -> Option<String> {
         let mut selected = self
             .load_tool_strategy_profile_by_key(
                 crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY,
@@ -1181,7 +1397,7 @@ impl Agent {
             {
                 if state.enabled
                     && crate::core::self_evolve::strategy_runtime::should_use_canary(
-                        &Self::prompt_seed_for_message(message),
+                        &Self::prompt_seed_for_conversation_or_message(conversation_id, message),
                         state.rollout_percent,
                     )
                 {
@@ -1218,10 +1434,17 @@ impl Agent {
         let now = chrono::Utc::now().to_rfc3339();
         let tool_history = experience_tool_history_from_trace(&job.trace_snapshot);
         let tool_names = experience_tool_names(&tool_history);
-        let prompt_bundle = self.active_prompt_bundle_for_message(&job.message).await;
+        let prompt_bundle = self
+            .active_prompt_bundle_for_conversation_message(
+                Some(&job.conversation_key),
+                &job.message,
+            )
+            .await;
         let prompt_version = crate::core::self_evolve::prompt_evolution::compose_prompt_version(
             &prompt_bundle.version,
         );
+        let (tokens_in, tokens_out, wall_ms, est_cost_microusd) =
+            experience_run_measured_metrics(&job.trace_snapshot);
         let execution_run_id = match job
             .execution_run_id
             .as_deref()
@@ -1251,36 +1474,47 @@ impl Agent {
             None => None,
         };
         let strategy_version = self
-            .active_tool_strategy_version_for_message(&job.message)
+            .active_tool_strategy_version_for_conversation_message(
+                Some(&job.conversation_key),
+                &job.message,
+            )
             .await;
         let success_state = experience_run_success_state(&job.user_outcome);
         let repair_decisions = experience_repair_decisions(&tool_history);
         let tool_batches = experience_tool_batch_events(&tool_history);
         let tool_batch_count = tool_batches.len();
+        let contract_events =
+            crate::core::self_evolve::opportunities::contract_events::contract_events_from_tool_history(
+                &tool_history,
+            );
         let reports_degenerate = tool_history.iter().any(|entry| {
             entry
                 .get("result")
                 .is_some_and(super::tool_responses::structured_tool_value_reports_degenerate_output)
         });
-        let metadata = serde_json::json!({
-            "run_status": job.run_status.as_str(),
-            "flow_kind": match job.kind {
-                DeferredExchangePersistenceKind::TurnPipeline => "turn_pipeline",
-                DeferredExchangePersistenceKind::Immediate => "immediate",
-            },
-            "degenerate": reports_degenerate,
-            "tool_call_count": tool_names.len(),
-            "tool_batch_count": tool_batch_count,
-            "tool_batches": tool_batches,
-            "retries": tool_names.len().saturating_sub(tool_names.iter().collect::<HashSet<_>>().len()),
-            "repair_decisions": repair_decisions,
-            "trace_complexity": job.trace_snapshot.complexity.as_deref(),
-            "user_outcome_status": &job.user_outcome.status,
-            "learning_signal": {
-                "procedure_eligible": !tool_names.is_empty(),
-                "negative_eligible": success_state == "failed",
-            },
-        });
+        let metadata =
+            crate::core::self_evolve::opportunities::contract_events::append_contract_events(
+                serde_json::json!({
+                "run_status": job.run_status.as_str(),
+                "flow_kind": match job.kind {
+                    DeferredExchangePersistenceKind::TurnPipeline => "turn_pipeline",
+                    DeferredExchangePersistenceKind::Immediate => "immediate",
+                },
+                "degenerate": reports_degenerate,
+                "tool_call_count": tool_names.len(),
+                "tool_batch_count": tool_batch_count,
+                "tool_batches": tool_batches,
+                "retries": tool_names.len().saturating_sub(tool_names.iter().collect::<HashSet<_>>().len()),
+                "repair_decisions": repair_decisions,
+                "trace_complexity": job.trace_snapshot.complexity.as_deref(),
+                "user_outcome_status": &job.user_outcome.status,
+                "learning_signal": {
+                    "procedure_eligible": !tool_names.is_empty(),
+                    "negative_eligible": success_state == "failed",
+                },
+                }),
+                &contract_events,
+            );
         let run = crate::storage::entities::experience_run::Model {
             id: run_id,
             execution_run_id,
@@ -1309,6 +1543,10 @@ impl Agent {
             policy_version: Some(policy_version.to_string()),
             prompt_version: Some(prompt_version),
             model_slot: Some(job.model_used.clone()),
+            tokens_in,
+            tokens_out,
+            wall_ms,
+            est_cost_microusd,
             success_state: success_state.to_string(),
             correction_state: "none".to_string(),
             outcome_summary: Some(safe_truncate(
@@ -1329,7 +1567,130 @@ impl Agent {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.storage.upsert_experience_run(&run).await
+        self.storage.upsert_experience_run(&run).await?;
+        for event in contract_events {
+            let source = event.source.clone();
+            let payload = serde_json::to_string(&serde_json::json!({
+                "experience_run_id": run.id.clone(),
+                "contract_event": event,
+            }))
+            .ok();
+            let log = crate::storage::entities::operational_log::Model {
+                id: uuid::Uuid::new_v4().to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                trace_id: if trace_id.is_empty() {
+                    None
+                } else {
+                    Some(trace_id.clone())
+                },
+                conversation_id: if job.conversation_key.trim().is_empty() {
+                    None
+                } else {
+                    Some(job.conversation_key.clone())
+                },
+                channel: job.channel.clone(),
+                event_type: "operation_contract_event".to_string(),
+                success: false,
+                outcome: "captured".to_string(),
+                tool_name: Some(source),
+                latency_ms: None,
+                arguments: None,
+                payload,
+                strategy_version: run.strategy_version.clone(),
+                policy_version: Some(policy_version.to_string()),
+                prompt_version: run.prompt_version.clone(),
+                model_slot: Some(job.model_used.clone()),
+            };
+            if let Err(error) = self.storage.insert_operational_log(&log).await {
+                tracing::warn!(error = %error, "failed to persist operation contract log event");
+            }
+        }
+        Ok(())
+    }
+
+    /// Honest-label pass: judge the conversation's latest provisional run
+    /// (excluding the turn that triggered this pass) against the user's next
+    /// message. Bounded: single-flight machine-wide (skip, never queue) and at
+    /// most one helper-model call per user turn. Fail-open: any failure leaves
+    /// the run provisional for the timeout auto-accept fallback.
+    async fn judge_prior_provisional_run(
+        &self,
+        conversation_id: &str,
+        next_user_message: &str,
+        exclude_run_id: &str,
+    ) {
+        const OUTCOME_JUDGE_WINDOW_MINUTES: i64 = 240;
+        if OUTCOME_JUDGE_IN_FLIGHT
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let _guard = OutcomeJudgeInFlightGuard;
+        // Stamp the honest-label epoch at the FIRST judge pass (get-or-init),
+        // so runs labeled from here on are inside the epoch window even if no
+        // canary evaluation has happened yet.
+        let _ = self.storage.evolve_label_epoch().await;
+        let prior = match self
+            .storage
+            .latest_provisional_experience_run(
+                conversation_id,
+                (!exclude_run_id.trim().is_empty()).then_some(exclude_run_id),
+                OUTCOME_JUDGE_WINDOW_MINUTES,
+            )
+            .await
+        {
+            Ok(Some(run)) => run,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(error = %error, "outcome judge could not load prior run");
+                return;
+            }
+        };
+        let prior_request = prior.request_text.as_deref().unwrap_or_default();
+        let prior_answer = prior.outcome_summary.as_deref().unwrap_or_default();
+        if prior_request.trim().is_empty() && prior_answer.trim().is_empty() {
+            return;
+        }
+        let (verdict, reason) = super::outcome_judge::judge_prior_answer(
+            &self.llm,
+            prior_request,
+            prior_answer,
+            next_user_message,
+        )
+        .await;
+        let signal = reason.unwrap_or_else(|| "semantic outcome judge verdict".to_string());
+        let result = match verdict {
+            super::outcome_judge::OutcomeVerdict::Corrected => self
+                .storage
+                .mark_provisional_experience_run_corrected_by_id(&prior.id, &signal)
+                .await
+                .map(|updated| updated.is_some()),
+            super::outcome_judge::OutcomeVerdict::Served => self
+                .storage
+                .mark_provisional_experience_run_served(&prior.id, &signal)
+                .await
+                .map(|updated| updated.is_some()),
+            super::outcome_judge::OutcomeVerdict::Unclear => Ok(false),
+        };
+        match result {
+            Ok(true) => {
+                tracing::debug!(
+                    conversation_id,
+                    verdict = ?verdict,
+                    "outcome judge labeled prior run"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "outcome judge label write failed");
+            }
+        }
     }
 
     fn spawn_deferred_exchange_persistence(&self, job: DeferredExchangePersistence) {
@@ -1411,12 +1772,39 @@ impl Agent {
         self.persist_completed_trace_snapshot_durable(&job.trace_snapshot)
             .await?;
 
+        // Honest-label pass for the PRIOR turn's provisional run, judged
+        // against this turn's user message. Post-turn only (this pipeline runs
+        // after the response is delivered), fire-and-forget so it can never
+        // starve persistence's attempt budget, and the lookup excludes this
+        // turn's own run id so insertion order doesn't matter.
+        if !job.is_new_conversation {
+            let judge_agent = self.clone();
+            let judge_conversation_id = job.conversation_key.clone();
+            let judge_message = job.message.clone();
+            let judge_exclude_run_id = trace_id.clone();
+            crate::spawn_logged!(
+                "src/core/agent/conversation/message_processing.rs:outcome_judge",
+                async move {
+                    judge_agent
+                        .judge_prior_provisional_run(
+                            &judge_conversation_id,
+                            &judge_message,
+                            &judge_exclude_run_id,
+                        )
+                        .await;
+                }
+            );
+        }
+
         let flow_kind = match job.kind {
             DeferredExchangePersistenceKind::TurnPipeline => "turn_pipeline",
             DeferredExchangePersistenceKind::Immediate => "immediate",
         };
         let policy_version = self
-            .active_tool_strategy_version_for_message(&job.message)
+            .active_tool_strategy_version_for_conversation_message(
+                Some(&job.conversation_key),
+                &job.message,
+            )
             .await
             .unwrap_or_else(|| "model_routed_spine_v1".to_string());
         if let Err(error) = self
@@ -2291,6 +2679,7 @@ impl Agent {
                             return Ok(InboundSecurityPrecheck::Respond(processed));
                         }
                         crate::security::intent_classifier::IntentVerdict::Allow => {
+                            let memory_capture = fast.decision.memory_capture.clone();
                             emit_inbound_precheck_progress(
                                 stream_tx,
                                 "complete",
@@ -2309,11 +2698,12 @@ impl Agent {
                                 true,
                                 TURN_TIMING_SLOW_STAGE_WARN_MS,
                             );
-                            return Ok(InboundSecurityPrecheck::Continue);
+                            return Ok(InboundSecurityPrecheck::Continue { memory_capture });
                         }
                         crate::security::intent_classifier::IntentVerdict::AllowWithUncheckedTag {
                             ..
                         } => {
+                            let memory_capture = fast.decision.memory_capture.clone();
                             emit_inbound_precheck_progress(
                                 stream_tx,
                                 "complete",
@@ -2332,7 +2722,7 @@ impl Agent {
                                 true,
                                 TURN_TIMING_SLOW_STAGE_WARN_MS,
                             );
-                            return Ok(InboundSecurityPrecheck::Continue);
+                            return Ok(InboundSecurityPrecheck::Continue { memory_capture });
                         }
                         crate::security::intent_classifier::IntentVerdict::ClassifierUnavailable {
                             ..
@@ -2423,7 +2813,9 @@ impl Agent {
             true,
             TURN_TIMING_SLOW_STAGE_WARN_MS,
         );
-        Ok(InboundSecurityPrecheck::Continue)
+        Ok(InboundSecurityPrecheck::Continue {
+            memory_capture: Default::default(),
+        })
     }
 
     pub(super) async fn persist_immediate_exchange(

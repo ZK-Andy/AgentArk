@@ -120,6 +120,11 @@ import { WebhooksPanel } from "../WebhooksPanel";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import { isOmittedContentPlaceholder } from "../chat/computerPaneFileContent";
 import {
+  resolveSavedDocumentDownload,
+  savedDocumentFilenamesFromAssistantText,
+  type SavedDocumentDownloadTarget,
+} from "./chatSavedDocumentDownloads";
+import {
   getTunnelAccessMeta,
   getTunnelPanelPasswordPrompt,
   getTunnelPanelResumeMessage,
@@ -4628,9 +4633,13 @@ function modelProseTextFromActivityStep(step: JsonRecord): string {
   return "";
 }
 
+function modelNarrationTextFromActivityStep(step: JsonRecord): string {
+  return modelProseTextFromActivityStep(step);
+}
+
 function agentProseTextFromActivityStep(step: JsonRecord): string {
-  const modelProse = modelProseTextFromActivityStep(step);
-  if (modelProse) return modelProse;
+  const modelNarration = modelNarrationTextFromActivityStep(step);
+  if (modelNarration) return modelNarration;
 
   const data = activityDataRecord(step.data);
   const stepType = str(step.step_type, str(step.type, ""))
@@ -4758,6 +4767,10 @@ function isMainChatReasoningStep(step: JsonRecord): boolean {
     return isVisibleReasoningPhase(str(data.phase, str(step.phase, "")));
   }
   return false;
+}
+
+function isTranscriptPreservedActivityStep(step: JsonRecord): boolean {
+  return Boolean(modelNarrationTextFromActivityStep(step));
 }
 
 function normalizeReasoningPhase(raw: unknown): string {
@@ -6902,19 +6915,41 @@ function compactPendingRunStepForSnapshot(rawStep: JsonRecord): JsonRecord {
   return compacted;
 }
 
-function limitPendingRunStepsForSnapshot(steps: JsonRecord[]): JsonRecord[] {
-  if (steps.length <= CHAT_PENDING_STREAM_STEPS_MAX) return steps;
+function limitActivityStepsPreservingTranscript(
+  steps: JsonRecord[],
+  maxSteps: number,
+  options?: { preserveHeartbeat?: boolean },
+): JsonRecord[] {
+  if (steps.length <= maxSteps) return steps;
   const keepIndexes = new Set<number>();
+  let heartbeatIndex = -1;
   steps.forEach((step, index) => {
-    if (isMainChatReasoningStep(step)) keepIndexes.add(index);
+    if (isTranscriptPreservedActivityStep(step)) keepIndexes.add(index);
+    if (
+      options?.preserveHeartbeat &&
+      heartbeatIndex < 0 &&
+      activityStepIsHeartbeatLike(step)
+    ) {
+      heartbeatIndex = index;
+    }
   });
-  let remaining = CHAT_PENDING_STREAM_STEPS_MAX;
+  const heartbeatReserved =
+    heartbeatIndex >= 0 && !keepIndexes.has(heartbeatIndex) ? 1 : 0;
+  let remaining = Math.max(0, maxSteps - keepIndexes.size - heartbeatReserved);
   for (let index = steps.length - 1; index >= 0 && remaining > 0; index -= 1) {
-    if (keepIndexes.has(index)) continue;
+    if (keepIndexes.has(index) || index === heartbeatIndex) continue;
     keepIndexes.add(index);
     remaining -= 1;
   }
+  if (heartbeatIndex >= 0) keepIndexes.add(heartbeatIndex);
   return steps.filter((_, index) => keepIndexes.has(index));
+}
+
+function limitPendingRunStepsForSnapshot(steps: JsonRecord[]): JsonRecord[] {
+  return limitActivityStepsPreservingTranscript(
+    steps,
+    CHAT_PENDING_STREAM_STEPS_MAX,
+  );
 }
 
 function compactPendingRunStepsForSnapshot(steps: JsonRecord[]): JsonRecord[] {
@@ -10857,6 +10892,8 @@ function ChatPageInner({
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
+  const [downloadingChatDocumentUrl, setDownloadingChatDocumentUrl] =
+    useState("");
   const [chatCredentialValues, setChatCredentialValues] = useState<
     Record<string, string>
   >({});
@@ -11615,6 +11652,38 @@ function ChatPageInner({
         ? pickRecords(messagesQ.data, "messages")
         : [],
     [shouldPreparePersistedThread, messagesQ.data],
+  );
+  const savedDocumentFilenames = useMemo(() => {
+    const filenames: string[] = [];
+    for (const message of messages) {
+      const record = asRecord(message);
+      if (str(record.role, "").toLowerCase() !== "assistant") continue;
+      for (const filename of savedDocumentFilenamesFromAssistantText(
+        stripAgentInternalReasoningLeaks(str(record.content, "")),
+      )) {
+        if (
+          !filenames.some(
+            (existing) => existing.toLowerCase() === filename.toLowerCase(),
+          )
+        ) {
+          filenames.push(filename);
+        }
+      }
+    }
+    return filenames;
+  }, [messages]);
+  const chatDocumentsQ = useQuery({
+    queryKey: ["chat-saved-document-downloads", savedDocumentFilenames.join("|")],
+    queryFn: () => api.rawGet("/documents?limit=100"),
+    enabled: savedDocumentFilenames.length > 0,
+    refetchInterval:
+      savedDocumentFilenames.length > 0 && chatPassiveRefresh
+        ? REFRESH_MS
+        : false,
+  });
+  const chatDownloadDocuments = useMemo(
+    () => pickRecords(chatDocumentsQ.data, "documents"),
+    [chatDocumentsQ.data],
   );
   const activeConversationMessageCount = Math.max(
     selectedMessageCount,
@@ -14129,7 +14198,7 @@ function ChatPageInner({
     sourceSteps: JsonRecord[],
     keyPrefix: string,
     maxItems = 28,
-    options?: { complete?: boolean },
+    options?: { complete?: boolean; preserveProse?: boolean },
   ): ChatTranscriptItem[] => {
     const steps = compressActivitySteps(
       trimTrailingHeartbeatSteps(sourceSteps),
@@ -14317,6 +14386,27 @@ function ChatPageInner({
           ),
         };
       });
+    const limitTranscriptItemsForDisplay = (
+      value: ChatTranscriptItem[],
+      limit: number,
+      opts?: { preserveProse?: boolean },
+    ) => {
+      const normalizedLimit = Math.max(1, limit);
+      if (!opts?.preserveProse) return value.slice(-normalizedLimit);
+      const keepIndexes = new Set<number>();
+      let remainingNonProse = normalizedLimit;
+      for (let idx = value.length - 1; idx >= 0; idx -= 1) {
+        if (value[idx].kind === "prose") {
+          keepIndexes.add(idx);
+          continue;
+        }
+        if (remainingNonProse > 0) {
+          keepIndexes.add(idx);
+          remainingNonProse -= 1;
+        }
+      }
+      return value.filter((_, idx) => keepIndexes.has(idx));
+    };
 
     for (let idx = 0; idx < steps.length; idx += 1) {
       const step = steps[idx];
@@ -14330,7 +14420,7 @@ function ChatPageInner({
         // transient chat transcript row that disappears when streaming ends.
         continue;
       }
-      const proseText = modelProseTextFromActivityStep(step);
+      const proseText = modelNarrationTextFromActivityStep(step);
       if (proseText) {
         pendingProse = {
           kind: "prose",
@@ -14340,11 +14430,6 @@ function ChatPageInner({
         continue;
       }
       const agentLoopPhase = agentLoopProgressPhaseFromStep(step);
-      if (isMainChatReasoningStep(step)) {
-        // Planning/classifier/model reasoning is useful diagnostic context,
-        // but the chat lane should stay stable and response-focused.
-        continue;
-      }
       if (agentLoopPhase === "tool_execution") {
         pushPendingProse();
         const actionNames = agentLoopProgressActionNamesFromStep(step);
@@ -14549,12 +14634,13 @@ function ChatPageInner({
       }
     }
 
+    pushPendingProse();
     const finalItems = runLooksComplete() ? completeTranscriptItems(items) : items;
     // Keep each tool action as its own sequential row. Collapsing consecutive
     // same-tool actions into a single counted row (×N) hid the individual
     // calls — expanding the group only ever surfaced one — so we render them
     // unmerged in execution order.
-    return finalItems.slice(-Math.max(1, maxItems));
+    return limitTranscriptItemsForDisplay(finalItems, maxItems, options);
   }, [safeBuildStepCard]);
 
   const streamingTraceCards = useMemo(
@@ -14663,9 +14749,10 @@ function ChatPageInner({
         sourceSteps,
       ),
     );
-    return steps.length > CHAT_STREAMING_STEPS_UI_MAX
-      ? steps.slice(-CHAT_STREAMING_STEPS_UI_MAX)
-      : steps;
+    return limitActivityStepsPreservingTranscript(
+      steps,
+      CHAT_STREAMING_STEPS_UI_MAX,
+    );
   };
 
   const loadTraceForId = async (traceId: string) => {
@@ -15595,6 +15682,22 @@ function ChatPageInner({
       traceId: str(message.trace_id, "").trim(),
       deepResearchHint: isDeepResearchAssistantMessage(message),
     });
+  };
+
+  const downloadSavedChatDocument = async (
+    target: SavedDocumentDownloadTarget,
+  ) => {
+    if (!target.downloadUrl || downloadingChatDocumentUrl) return;
+    setChatError(null);
+    setDownloadingChatDocumentUrl(target.downloadUrl);
+    try {
+      await downloadApiFile(target.downloadUrl, { filename: target.filename });
+      setChatNotice(`Downloading ${target.filename}.`);
+    } catch (err) {
+      setChatError(normalizeChatError(errMessage(err)));
+    } finally {
+      setDownloadingChatDocumentUrl("");
+    }
   };
 
   const openResearchReportPreview = ({
@@ -16805,7 +16908,7 @@ function ChatPageInner({
     const keepIndexes = new Set<number>();
     let heartbeatIndex = -1;
     steps.forEach((step, index) => {
-      if (isMainChatReasoningStep(step)) keepIndexes.add(index);
+      if (isTranscriptPreservedActivityStep(step)) keepIndexes.add(index);
       if (heartbeatIndex < 0 && isHeartbeatStreamingStep(step)) {
         heartbeatIndex = index;
       }
@@ -16835,6 +16938,42 @@ function ChatPageInner({
     return limitStepsPreservingReasoning(
       steps,
       CHAT_WORKSPACE_ACTIVITY_RENDER_MAX,
+    );
+  };
+
+  const mergeActivityStepSourcesForLiveTranscript = (
+    primarySteps: JsonRecord[],
+    preservedSourceSteps: JsonRecord[],
+  ): JsonRecord[] => {
+    const out: JsonRecord[] = [];
+    const keyForStep = (step: JsonRecord): string => {
+      const stableKey = streamingStepStructuralStableKey(step);
+      if (stableKey) return `stable:${stableKey}`;
+      const narrationKey = normalizeAgentProseKey(
+        modelNarrationTextFromActivityStep(step),
+      );
+      if (narrationKey) return `narration:${narrationKey}`;
+      return `step:${streamingStepDedupKey(step)}`;
+    };
+    const upsertStep = (step: JsonRecord) => {
+      const key = keyForStep(step);
+      const existingIndex = out.findIndex((candidate) => keyForStep(candidate) === key);
+      if (existingIndex >= 0) {
+        out[existingIndex] = step;
+        return;
+      }
+      out.push(step);
+    };
+
+    trimTrailingHeartbeatSteps(preservedSourceSteps)
+      .filter(isTranscriptPreservedActivityStep)
+      .forEach(upsertStep);
+    trimTrailingHeartbeatSteps(primarySteps).forEach(upsertStep);
+
+    return limitActivityStepsPreservingTranscript(
+      out,
+      CHAT_STREAMING_STEPS_UI_MAX,
+      { preserveHeartbeat: true },
     );
   };
 
@@ -20123,20 +20262,6 @@ function ChatPageInner({
   const deferredStreamingMarkdownText = useDeferredValue(
     visibleStreamingResponse,
   );
-  const visibleLiveModelEmit = useMemo(() => {
-    if (!hasLivePendingThread || visibleStreamingResponse.trim()) return "";
-    const content = reasoningStream?.content || "";
-    const normalized = content.replace(/\r\n/g, "\n").trim();
-    if (!normalized) return "";
-    const blocks = normalized
-      .split(/\n{2,}/)
-      .map((block) => block.trim())
-      .filter(Boolean);
-    const latestBlock = blocks[blocks.length - 1] || normalized;
-    return latestBlock.length > 1400
-      ? latestBlock.slice(-1400).trim()
-      : latestBlock;
-  }, [hasLivePendingThread, reasoningStream?.content, visibleStreamingResponse]);
   // Latest interleaved model narration (model_prose ToolProgress) for live
   // display in the work panel during a tool-using run. Rendered directly in the
   // panel branch (which is proven to mount during the run) rather than via the
@@ -20144,15 +20269,12 @@ function ChatPageInner({
   const liveModelProseText = useMemo(() => {
     if (!hasLivePendingThread) return "";
     for (let i = streamingSteps.length - 1; i >= 0; i -= 1) {
-      const t = modelProseTextFromActivityStep(streamingSteps[i] as JsonRecord);
+      const t = modelNarrationTextFromActivityStep(streamingSteps[i] as JsonRecord);
       if (t && t.trim()) return t.trim();
     }
     return "";
   }, [hasLivePendingThread, streamingSteps]);
-  const deferredLiveModelEmitText = useDeferredValue(visibleLiveModelEmit);
-  const visibleStreamingMarkdownText = visibleStreamingResponse.trim()
-    ? deferredStreamingMarkdownText
-    : deferredLiveModelEmitText;
+  const visibleStreamingMarkdownText = deferredStreamingMarkdownText;
   const computerTokenPreview = useMemo(() => {
     if (!visibleStreamingResponse) return "";
     return visibleStreamingResponse.length > CHAT_COMPUTER_TOKEN_PREVIEW_MAX_CHARS
@@ -20431,6 +20553,12 @@ function ChatPageInner({
             conversationTitle: str(selectedConversation?.title, ""),
           })
         : null;
+      const savedDocumentDownload = isAssistant
+        ? resolveSavedDocumentDownload(
+            savedDocumentFilenamesFromAssistantText(renderedContent),
+            chatDownloadDocuments,
+          )
+        : null;
       const traceId = str(message.trace_id, "").trim();
       const hasTrace = !isUser && !!traceId;
       const markdownNode =
@@ -20459,6 +20587,7 @@ function ChatPageInner({
         attachments,
         messageChoices,
         researchReport,
+        savedDocumentDownload,
         previousUserPrompt,
         traceId,
         hasTrace,
@@ -20472,6 +20601,7 @@ function ChatPageInner({
     previousUserPromptByIndex,
     openCodePreviewInWorkspace,
     selectedConversation?.title,
+    chatDownloadDocuments,
   ]);
   const latestAssistantTraceSteps = useMemo(
     () => (latestAssistantTraceId ? traceStepsById[latestAssistantTraceId] || [] : []),
@@ -20997,16 +21127,30 @@ function ChatPageInner({
       );
     }
   }, [conversationId, workspaceActivityRestoreState, workspaceStepsUseActiveRun]);
+  const liveTranscriptSourceSteps = useMemo(
+    () =>
+      mergeActivityStepSourcesForLiveTranscript(
+        streamingSteps.length > 0 ? streamingSteps : workspaceStepsSource,
+        asRecords(pendingRunSnapshot?.streamingSteps ?? workspaceStepsSource),
+      ),
+    [
+      pendingRunSnapshot?.streamingSteps,
+      streamingSteps,
+      workspaceStepsSource,
+    ],
+  );
   const liveChatTranscriptItems = useMemo(
     () =>
       buildChatTranscriptItemsFromSteps(
-        trimTrailingHeartbeatSteps(
-          streamingSteps.length > 0 ? streamingSteps : workspaceStepsSource,
-        ),
+        liveTranscriptSourceSteps,
         "live-transcript",
         8,
+        { preserveProse: true },
       ).filter((item) => item.kind === "action" || item.kind === "prose"),
-    [buildChatTranscriptItemsFromSteps, streamingSteps, workspaceStepsSource],
+    [buildChatTranscriptItemsFromSteps, liveTranscriptSourceSteps],
+  );
+  const liveChatTranscriptHasProse = liveChatTranscriptItems.some(
+    (item) => item.kind === "prose",
   );
   const livePlanPhaseStatuses = useMemo(() => {
     const plan =
@@ -21289,9 +21433,7 @@ function ChatPageInner({
   );
   const streamingRunMetricItems =
     !currentRunStillActiveForMetrics ? computerRunMetricItems : [];
-  const hasVisibleStreamingReply = Boolean(
-    visibleStreamingResponse.trim() || visibleLiveModelEmit.trim(),
-  );
+  const hasVisibleStreamingReply = Boolean(visibleStreamingResponse.trim());
   const showLiveExecutionPanel = liveChatTranscriptItems.length > 0;
   const resolvedActiveFileContent = choosePreferredWorkspaceFileContent(
     activeCodeFile ? liveFileWrites[activeCodeFile.name]?.content || "" : "",
@@ -23359,6 +23501,7 @@ function ChatPageInner({
                       attachments,
                       messageChoices,
                       researchReport,
+                      savedDocumentDownload,
                       previousUserPrompt,
                       traceId,
                       hasTrace,
@@ -23459,15 +23602,31 @@ function ChatPageInner({
                                     }}
                                   >
                                     {!isUser ? (
-                                      <Tooltip title="Download reply">
+                                      <Tooltip
+                                        title={
+                                          savedDocumentDownload
+                                            ? `Download ${savedDocumentDownload.filename}`
+                                            : "Download reply"
+                                        }
+                                      >
                                         <IconButton
                                           size="small"
                                           onClick={() => {
-                                            void exportAssistantMessage(
-                                              message,
-                                              previousUserPrompt,
-                                            );
+                                            if (savedDocumentDownload) {
+                                              void downloadSavedChatDocument(
+                                                savedDocumentDownload,
+                                              );
+                                            } else {
+                                              void exportAssistantMessage(
+                                                message,
+                                                previousUserPrompt,
+                                              );
+                                            }
                                           }}
+                                          disabled={Boolean(
+                                            savedDocumentDownload &&
+                                              downloadingChatDocumentUrl,
+                                          )}
                                           sx={{
                                             color: "var(--ui-rgba-189-216-249-900)",
                                           }}
@@ -23769,7 +23928,7 @@ function ChatPageInner({
                                     : " has-status-copy"
                                 }${CHAT_LAYOUT_MODE === "split" ? " is-split" : ""}`}
                               >
-                                {liveModelProseText ? (
+                                {liveModelProseText && !liveChatTranscriptHasProse ? (
                                   <Typography
                                     variant="body2"
                                     className="chat-live-model-prose"
@@ -23867,7 +24026,7 @@ function ChatPageInner({
                                 {renderClarificationChoiceGroup(
                                   `streaming-clarification:${str(
                                     pendingRunSnapshot?.runId,
-                                    (visibleStreamingResponse || visibleLiveModelEmit).slice(0, 80),
+                                    visibleStreamingResponse.slice(0, 80),
                                   )}`,
                                   streamingResponseChoices,
                                 )}

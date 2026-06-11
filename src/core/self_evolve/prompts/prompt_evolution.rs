@@ -107,6 +107,11 @@ pub struct PromptEvolutionConfig {
     pub max_sign_test_p_value: f64,
     pub max_prompt_token_regression_ratio: f64,
     pub max_cache_sensitive_token_regression_ratio: f64,
+    /// Usage-derived semantic eval cases (the user's own distribution).
+    /// Empty = static benchmark only.
+    pub usage_cases: Vec<crate::core::self_evolve::opportunities::eval_sets::UsageEvalCase>,
+    /// Shadow mode when false: usage evals score and log but never decide.
+    pub usage_cases_deciding: bool,
 }
 
 impl Default for PromptEvolutionConfig {
@@ -119,8 +124,41 @@ impl Default for PromptEvolutionConfig {
             max_prompt_token_regression_ratio: DEFAULT_MAX_PROMPT_TOKEN_REGRESSION_RATIO,
             max_cache_sensitive_token_regression_ratio:
                 DEFAULT_MAX_CACHE_SENSITIVE_TOKEN_REGRESSION_RATIO,
+            usage_cases: Vec::new(),
+            usage_cases_deciding: false,
         }
     }
+}
+
+/// Candidate may not regress the user's own distribution by more than this
+/// when usage evals are deciding.
+const USAGE_EVAL_REGRESSION_EPSILON: f64 = 0.02;
+/// Hard cap on cases scored per gate evaluation (each case costs two model
+/// calls per bundle; gate runs are rare and quiet-time, but still bounded).
+const USAGE_EVAL_MAX_CASES_PER_EVAL: usize = 12;
+
+const USAGE_EVAL_JUDGE_SYSTEM: &str = "You score how well a candidate answer satisfies a \
+semantic expectation for a user's real request. Judge meaning and usefulness, not wording, \
+formatting, or style; phrasing differences must not change the score. 1.0 = fully satisfies \
+the expectation; 0.5 = partially; 0.0 = misses it or repeats the failure the expectation \
+forbids. Return only JSON: {\"score\":0.0}";
+
+fn parse_usage_eval_score(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    let value = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .or_else(|| {
+            trimmed
+                .find('{')
+                .zip(trimmed.rfind('}'))
+                .and_then(|(start, end)| {
+                    serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()
+                })
+        })?;
+    value
+        .get("score")
+        .and_then(|score| score.as_f64())
+        .map(|score| score.clamp(0.0, 1.0))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -447,17 +485,68 @@ impl PromptEvolutionEngine {
 
         let promotion_checks =
             prompt_promotion_checks(&self.config, &baseline_eval, &best_eval, &best_stats);
-        let promoted = promotion_checks.iter().all(|check| check.passed);
+        // Usage-derived semantic evals over the user's own distribution.
+        // Shadow unless deciding: always scored and logged, only gating when
+        // the deciding flag is on (the static benchmark stays as a floor via
+        // promotion_checks either way).
+        let mut usage_eval_note: Option<String> = None;
+        let mut usage_gate_passed = true;
+        if !self.config.usage_cases.is_empty() {
+            let baseline_usage = self.evaluate_usage_cases(&baseline_bundle).await;
+            let candidate_usage = self.evaluate_usage_cases(&best_candidate.bundle).await;
+            if let (Some(baseline_score), Some(candidate_score)) = (baseline_usage, candidate_usage)
+            {
+                let mode = if self.config.usage_cases_deciding {
+                    "deciding"
+                } else {
+                    "shadow"
+                };
+                tracing::info!(
+                    baseline = baseline_score,
+                    candidate = candidate_score,
+                    cases = self
+                        .config
+                        .usage_cases
+                        .len()
+                        .min(USAGE_EVAL_MAX_CASES_PER_EVAL),
+                    mode,
+                    "usage-eval comparison for prompt candidate"
+                );
+                usage_eval_note = Some(format!(
+                    "Usage evals ({} cases, {}): baseline {:.3} vs candidate {:.3}.",
+                    self.config
+                        .usage_cases
+                        .len()
+                        .min(USAGE_EVAL_MAX_CASES_PER_EVAL),
+                    mode,
+                    baseline_score,
+                    candidate_score
+                ));
+                if self.config.usage_cases_deciding {
+                    usage_gate_passed =
+                        candidate_score + USAGE_EVAL_REGRESSION_EPSILON >= baseline_score;
+                }
+            }
+        }
+        let promoted = promotion_checks.iter().all(|check| check.passed) && usage_gate_passed;
         let promotion_gate = render_prompt_promotion_gate(&promotion_checks);
         let promotion_gate_report = promotion_gate_report(&promotion_checks);
         let promotion_gate_summary = promotion_gate_report.summary.clone();
-        let notes = build_prompt_notes(
+        let mut notes = build_prompt_notes(
             &baseline_eval,
             &best_eval,
             &best_stats,
             &best_candidate.source,
             &diff_summary,
         );
+        if let Some(note) = usage_eval_note {
+            notes.push(note);
+        }
+        if !usage_gate_passed {
+            notes.push(
+                "Promotion blocked: candidate regressed the usage-derived evals.".to_string(),
+            );
+        }
 
         let lineage_entry = PromptLineageEntry {
             entry_id: format!("prm-{}", uuid::Uuid::new_v4()),
@@ -647,8 +736,17 @@ impl PromptEvolutionEngine {
     }
 
     async fn load_benchmark_suite(&self) -> Result<PromptBenchmarkProfile> {
-        let profile: PromptBenchmarkProfile = serde_json::from_str(BENCHMARK_PROFILE_JSON)
+        let mut profile: PromptBenchmarkProfile = serde_json::from_str(BENCHMARK_PROFILE_JSON)
             .context("failed to parse embedded prompt benchmark JSON")?;
+        profile.usage_case_count = self.config.usage_cases.len();
+        profile.usage_cases_deciding = self.config.usage_cases_deciding;
+        if profile.usage_case_count > 0 {
+            tracing::debug!(
+                usage_cases = profile.usage_case_count,
+                deciding = profile.usage_cases_deciding,
+                "prompt benchmark suite loaded with storage-backed usage evals"
+            );
+        }
         if profile.target_key != PROMPT_BUNDLE_PROFILE_KEY {
             tracing::warn!(
                 "prompt evolution benchmark target_key mismatch: got '{}', expected '{}'",
@@ -1047,6 +1145,51 @@ Do not return commentary or markdown.",
         }
     }
 
+    /// Mean semantic score of the bundle over the usage-case distribution
+    /// (capped). None when no case produced a judgable score (fail-open:
+    /// usage evals never block on infrastructure failure).
+    async fn evaluate_usage_cases(&self, bundle: &PromptBundleProfile) -> Option<f64> {
+        let mut total = 0.0;
+        let mut counted = 0usize;
+        for case in self
+            .config
+            .usage_cases
+            .iter()
+            .take(USAGE_EVAL_MAX_CASES_PER_EVAL)
+        {
+            if let Some(score) = self.evaluate_usage_case(bundle, case).await {
+                total += score;
+                counted += 1;
+            }
+        }
+        (counted > 0).then(|| total / counted as f64)
+    }
+
+    async fn evaluate_usage_case(
+        &self,
+        bundle: &PromptBundleProfile,
+        case: &crate::core::self_evolve::opportunities::eval_sets::UsageEvalCase,
+    ) -> Option<f64> {
+        let system_prompt = render_primary_response_system_prompt(bundle);
+        let response = self
+            .llm
+            .chat(&system_prompt, case.request.as_str(), &[], &[])
+            .await
+            .ok()?;
+        let judged = self
+            .llm
+            .chat_with_system(
+                USAGE_EVAL_JUDGE_SYSTEM,
+                &format!(
+                    "User request:\n{}\n\nExpectation:\n{}\n\nCandidate answer:\n{}",
+                    case.request, case.expectation, response.content
+                ),
+            )
+            .await
+            .ok()?;
+        parse_usage_eval_score(&judged.content)
+    }
+
     async fn evaluate_primary_response_case(
         &self,
         bundle: &PromptBundleProfile,
@@ -1180,6 +1323,10 @@ struct PromptBenchmarkProfile {
     target_key: String,
     #[serde(rename = "version")]
     _version: u32,
+    #[serde(default)]
+    usage_case_count: usize,
+    #[serde(default)]
+    usage_cases_deciding: bool,
     router_cases: Vec<RouterBenchmarkCase>,
     primary_response_cases: Vec<PrimaryResponseBenchmarkCase>,
     synthesis_cases: Vec<SynthesisBenchmarkCase>,

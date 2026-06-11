@@ -341,6 +341,148 @@ impl ActionRuntime {
         serde_json::json!({ "keys": keys })
     }
 
+    pub(in crate::runtime) fn custom_api_missing_inputs_repair_contract(
+        operation: &crate::custom_apis::CustomApiOperation,
+        missing_inputs: &[String],
+    ) -> serde_json::Value {
+        let mut argument_contracts = serde_json::Map::new();
+        let mut request_arguments = serde_json::Map::new();
+        for input in missing_inputs {
+            let contract = Self::custom_api_missing_input_contract(operation, input);
+            request_arguments.insert(input.clone(), contract.clone());
+            argument_contracts.insert(input.clone(), contract);
+        }
+        serde_json::json!({
+            "required_arguments": missing_inputs,
+            "request_arguments": {
+                "arguments": request_arguments
+            },
+            "argument_contracts": argument_contracts,
+            "operation_contract": crate::custom_apis::operation_contract(operation),
+        })
+    }
+
+    fn custom_api_missing_input_contract(
+        operation: &crate::custom_apis::CustomApiOperation,
+        input: &str,
+    ) -> serde_json::Value {
+        let parameter = Self::custom_api_parameter_for_missing_input(operation, input);
+        let location =
+            parameter
+                .map(|parameter| parameter.location)
+                .unwrap_or(if input == "body" {
+                    crate::custom_apis::CustomApiParameterLocation::Body
+                } else {
+                    crate::custom_apis::CustomApiParameterLocation::Query
+                });
+        let schema_type = parameter
+            .and_then(|parameter| parameter.schema_type.as_deref())
+            .unwrap_or(
+                if matches!(
+                    location,
+                    crate::custom_apis::CustomApiParameterLocation::Body
+                ) {
+                    "object"
+                } else {
+                    "string"
+                },
+            );
+        let description = parameter
+            .and_then(|parameter| parameter.description.as_deref())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if matches!(
+                    location,
+                    crate::custom_apis::CustomApiParameterLocation::Body
+                ) {
+                    "Request body required by this operation.".to_string()
+                } else {
+                    format!(
+                        "{} argument required by this operation.",
+                        Self::custom_api_parameter_location_label(location)
+                    )
+                }
+            });
+        let mut contract = serde_json::json!({
+            "name": input,
+            "location": Self::custom_api_parameter_location_label(location),
+            "required": true,
+            "schema_type": schema_type,
+            "description": description,
+            "accepted_argument_paths": [
+                ["arguments", input],
+                [input]
+            ]
+        });
+        if matches!(
+            location,
+            crate::custom_apis::CustomApiParameterLocation::Body
+        ) {
+            contract["body_shape"] = Self::custom_api_body_argument_shape(operation);
+        }
+        contract
+    }
+
+    fn custom_api_parameter_for_missing_input<'a>(
+        operation: &'a crate::custom_apis::CustomApiOperation,
+        input: &str,
+    ) -> Option<&'a crate::custom_apis::CustomApiParameter> {
+        operation.draft.parameters.iter().find(|parameter| {
+            if input == "body" {
+                matches!(
+                    parameter.location,
+                    crate::custom_apis::CustomApiParameterLocation::Body
+                )
+            } else {
+                parameter.name == input
+            }
+        })
+    }
+
+    fn custom_api_parameter_location_label(
+        location: crate::custom_apis::CustomApiParameterLocation,
+    ) -> &'static str {
+        match location {
+            crate::custom_apis::CustomApiParameterLocation::Path => "path",
+            crate::custom_apis::CustomApiParameterLocation::Query => "query",
+            crate::custom_apis::CustomApiParameterLocation::Header => "header",
+            crate::custom_apis::CustomApiParameterLocation::Body => "body",
+        }
+    }
+
+    fn custom_api_body_argument_shape(
+        operation: &crate::custom_apis::CustomApiOperation,
+    ) -> serde_json::Value {
+        if crate::custom_apis::custom_api_operation_supports_graphql_body(
+            &operation.draft.method,
+            &operation.draft.path,
+            &operation.draft.default_headers,
+            operation.draft.body_required || operation.draft.default_body.is_some(),
+        ) {
+            return serde_json::json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "GraphQL query document for the requested read operation."
+                    },
+                    "variables": {
+                        "type": "object",
+                        "description": "Optional GraphQL variables object."
+                    }
+                },
+                "constraints": [
+                    "Read-only operations require a GraphQL query operation."
+                ]
+            });
+        }
+        serde_json::json!({
+            "type": "object",
+            "description": "JSON request body matching this operation's documented body contract."
+        })
+    }
+
     pub(in crate::runtime) async fn execute_custom_api_request(
         &self,
         arguments: &serde_json::Value,
@@ -458,6 +600,8 @@ impl ActionRuntime {
         let missing_inputs =
             crate::custom_apis::operation_missing_required_inputs(operation, &action_arguments);
         if !missing_inputs.is_empty() {
+            let expected_contract =
+                Self::custom_api_missing_inputs_repair_contract(operation, &missing_inputs);
             return Ok(structured_tool_completion_output(
                 "custom_api_request",
                 "needs_arguments",
@@ -469,7 +613,12 @@ impl ActionRuntime {
                     "action_name": action_name,
                     "missing_inputs": missing_inputs,
                     "operation_contract": crate::custom_apis::operation_contract(operation),
+                    "expected_contract": expected_contract,
+                    "provided": Self::capability_payload_key_summary(&action_arguments),
+                    "recoverable_by_model": true,
+                    "retryable": false,
                     "message": "This saved operation requires additional non-secret request arguments before it can run.",
+                    "assistant_instruction": "Treat this as a repairable integration argument contract failure. Make one corrected custom_api_request call with all required non-secret arguments when the user's goal plus the operation contract are enough; otherwise ask one concise question for the missing non-secret value. Do not answer with future intent.",
                 }),
             ));
         }

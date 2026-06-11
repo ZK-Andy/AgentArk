@@ -1581,6 +1581,10 @@ pub(super) struct EvolutionDevResponse {
     pub(super) prompt_telemetry_summary: PromptTelemetrySummary,
     pub(super) arkdistill_context_summary: ArkDistillContextSummary,
     pub(super) prompt_optimization_opportunities: Vec<PromptOptimizationProposal>,
+    pub(super) usage_candidates: Vec<serde_json::Value>,
+    pub(super) usage_opportunities: Vec<serde_json::Value>,
+    pub(super) prompt_stable_recommendation: Option<serde_json::Value>,
+    pub(super) prompt_snapshot_history: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

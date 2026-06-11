@@ -465,7 +465,7 @@ fn sanitize_model_request_bundle(
     runtime_timezone: Option<&str>,
 ) -> (String, String, Vec<ConversationMessage>) {
     let system_context = crate::security::ModelInputContext::InternalHelperPrompt;
-    let user_context = crate::security::ModelInputContext::InternalHelperPrompt;
+    let user_context = crate::security::ModelInputContext::CurrentUserMessage;
     let current_turn_targets =
         render_current_turn_execution_targets(user_message, policy).unwrap_or_default();
     let (system_prompt, user_message) =

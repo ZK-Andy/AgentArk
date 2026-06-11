@@ -21,12 +21,15 @@ MAX_EXPORT_BYTES = 12 * 1024 * 1024
 DEFAULT_GEPA_LM_TIMEOUT_SECONDS = 60
 DEFAULT_GEPA_LM_MAX_TOKENS = 2048
 DEFAULT_GEPA_LM_RETRIES = 0
-DEFAULT_GEPA_MAX_EXAMPLES = 1
-DEFAULT_GEPA_VALSET_SIZE = 1
+# Non-degenerate search floor (was 1/1/current_best/no-merge, which made the
+# optimizer a single-shot rubber stamp). Env vars still override via
+# _bounded_int within their min/max bounds.
+DEFAULT_GEPA_MAX_EXAMPLES = 8
+DEFAULT_GEPA_VALSET_SIZE = 4
 DEFAULT_GEPA_MAX_MEMORY_MB = 1536
-DEFAULT_GEPA_REFLECTION_MINIBATCH_SIZE = 1
-DEFAULT_GEPA_MAX_MERGE_INVOCATIONS = 0
-DEFAULT_GEPA_CANDIDATE_SELECTION_STRATEGY = "current_best"
+DEFAULT_GEPA_REFLECTION_MINIBATCH_SIZE = 2
+DEFAULT_GEPA_MAX_MERGE_INVOCATIONS = 1
+DEFAULT_GEPA_CANDIDATE_SELECTION_STRATEGY = "pareto"
 
 
 def _bounded_int(
@@ -680,10 +683,12 @@ def run(args: argparse.Namespace) -> int:
     export_path = Path(args.export)
     out_path = Path(args.out)
     export = _load_export(export_path)
+    used_fallback = False
     try:
         raw = _run_dspy_gepa(export)
         records = _records_from_text(raw, str(export["run_id"]))
     except Exception as exc:
+        used_fallback = True
         records = _fallback_candidate_records(export, type(exc).__name__)
         if records:
             print(
@@ -700,12 +705,17 @@ def run(args: argparse.Namespace) -> int:
         else:
             raise
     if not records:
+        used_fallback = True
         records = _fallback_candidate_records(export, "no_parseable_candidate_records")
     if not records:
         raise RuntimeError("GEPA completed but produced no valid AgentArk candidates")
     _write_jsonl(out_path, records)
-    print(json.dumps({"status": "completed", "records": len(records), "out": str(out_path)}))
-    return 0
+    # Schema-fallback output is an optimizer FAILURE, not a success: the
+    # candidates are baseline copies. Report it honestly so the bridge and UI
+    # never count a no-op as a completed optimization.
+    status = "failed_fallback" if used_fallback else "completed"
+    print(json.dumps({"status": status, "records": len(records), "out": str(out_path)}))
+    return 0 if not used_fallback else 3
 
 
 def main(argv: list[str] | None = None) -> int:

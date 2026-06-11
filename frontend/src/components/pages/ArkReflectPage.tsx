@@ -104,7 +104,6 @@ type ReflectCluster = {
   unit_count: number;
   message_count: number;
   source_mix: Record<string, number>;
-  color: string;
   related_history: ReflectRelatedHistory;
   units: ReflectUnit[];
 };
@@ -176,7 +175,9 @@ type ChatPendingLaunch = {
 const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
 const OPPORTUNITY_PAGE_SIZE = 6;
 const OPPORTUNITY_SETTLE_POLL_MS = 5000;
-const OPPORTUNITY_SETTLE_WINDOW_MS = 90000;
+// Must exceed one backend planning pass (120s LLM timeout) so polling does
+// not stop while a pass is still legitimately running.
+const OPPORTUNITY_SETTLE_WINDOW_MS = 150000;
 const TOPIC_PAGE_SIZE = 6;
 
 type ReflectResponse = {
@@ -224,6 +225,12 @@ type ReflectResponse = {
     last_error: string;
   };
   suggested_followups: ReflectSuggestedFollowup[];
+  followup_planning: {
+    pending_count: number;
+    planning_active: boolean;
+    last_attempt_at: string | null;
+    last_error: string | null;
+  };
   clusters: ReflectCluster[];
   unclustered_units: ReflectUnit[];
 };
@@ -242,18 +249,18 @@ const PERIOD_OPTIONS: { value: ReflectPeriod; label: string }[] = [
   { value: "monthly", label: "Month" },
 ];
 
-const SOURCE_DISPLAY: Record<string, { label: string; group: string; color: string }> = {
-  conversation: { label: "Chat", group: "Conversation work", color: "#B7BCC2" },
-  orbit_chat: { label: "ArkOrbit", group: "Orbit conversations", color: "#AAB0B7" },
-  experience_item: { label: "Memory", group: "What AgentArk learned", color: "#9EA5AC" },
-  procedural_pattern: { label: "Workflows", group: "Working patterns", color: "#C1C5CA" },
-  app: { label: "Apps", group: "Apps built", color: "#949BA3" },
-  goal: { label: "Goals", group: "Goals and progress", color: "#A5ABB2" },
-  watcher: { label: "Watchers", group: "Background watchers", color: "#868E96" },
-  sentinel: { label: "Sentinel", group: "Safety and checks", color: "#9AA1A9" },
-  arkpulse: { label: "Pulse", group: "System health", color: "#AEB4BB" },
-  arkevolve: { label: "Evolve", group: "Agent improvements", color: "#A1A8AF" },
-  llm_usage: { label: "Usage", group: "Agent usage", color: "#C9CDD2" },
+const SOURCE_DISPLAY: Record<string, { label: string; group: string }> = {
+  conversation: { label: "Chat", group: "Conversation work" },
+  orbit_chat: { label: "ArkOrbit", group: "Orbit conversations" },
+  experience_item: { label: "Memory", group: "What AgentArk learned" },
+  procedural_pattern: { label: "Workflows", group: "Working patterns" },
+  app: { label: "Apps", group: "Apps built" },
+  goal: { label: "Goals", group: "Goals and progress" },
+  watcher: { label: "Watchers", group: "Background watchers" },
+  sentinel: { label: "Sentinel", group: "Safety and checks" },
+  arkpulse: { label: "Pulse", group: "System health" },
+  arkevolve: { label: "Evolve", group: "Agent improvements" },
+  llm_usage: { label: "Usage", group: "Agent usage" },
 };
 
 const SOURCE_ORDER = [
@@ -448,7 +455,6 @@ function asReflectCluster(value: unknown): ReflectCluster | null {
     unit_count: num(raw.unit_count, 0),
     message_count: num(raw.message_count, 0),
     source_mix,
-    color: str(raw.color, "#AEB4BB"),
     related_history: asRelatedHistory(raw.related_history),
     units: pickRecords(raw, "units")
       .map(asReflectUnit)
@@ -524,6 +530,12 @@ function parseReflectResponse(value: unknown, period: ReflectPeriod): ReflectRes
     suggested_followups: pickRecords(raw, "suggested_followups")
       .map(asSuggestedFollowup)
       .filter((item): item is ReflectSuggestedFollowup => item !== null),
+    followup_planning: {
+      pending_count: num(asRecord(raw.followup_planning).pending_count, 0),
+      planning_active: Boolean(asRecord(raw.followup_planning).planning_active),
+      last_attempt_at: str(asRecord(raw.followup_planning).last_attempt_at, "") || null,
+      last_error: str(asRecord(raw.followup_planning).last_error, "") || null,
+    },
     clusters: pickRecords(raw, "clusters")
       .map(asReflectCluster)
       .filter((cluster): cluster is ReflectCluster => cluster !== null),
@@ -709,7 +721,7 @@ function meaningfulForSourceCounts(counts: ReflectSourceCounts | undefined): num
 }
 
 function sourceMeta(source: string) {
-  return SOURCE_DISPLAY[source] ?? { label: "Work", group: "Mixed work", color: "#C8D8C9" };
+  return SOURCE_DISPLAY[source] ?? { label: "Work", group: "Mixed work" };
 }
 
 function dominantSource(cluster: ReflectCluster): string {
@@ -741,49 +753,32 @@ function isReviewThreadFollowup(item: ReflectSuggestedFollowup): boolean {
   return false;
 }
 
-function hexToHsl(hex: string): { h: number; s: number; l: number } | null {
-  const m = hex.match(/^#([0-9a-f]{6})$/i);
-  if (!m) return null;
-  const n = parseInt(m[1], 16);
-  const r = ((n >> 16) & 0xff) / 255;
-  const g = ((n >> 8) & 0xff) / 255;
-  const b = (n & 0xff) / 255;
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const l = (max + min) / 2;
-  if (max === min) return { h: 0, s: 0, l };
-  const d = max - min;
-  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h = 0;
-  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
-  else if (max === g) h = ((b - r) / d + 2) / 6;
-  else h = ((r - g) / d + 4) / 6;
-  return { h, s, l };
-}
+// Per-source accent hues for the Topics tab (graph nodes, source mix, theme
+// cards, legend) — keyed by source kind so every surface stays in sync. The
+// hues sit in the app's pastel-glow family (00-foundation.css tokens).
+// Hue spacing matters most WITHIN a shape group (sources sharing a
+// tacticalSymbol can only be told apart by color): hexagon mint vs teal,
+// diamond periwinkle vs cyan, square gold vs peach.
+const TACTICAL_ACCENTS: Record<string, string> = {
+  conversation: "#78f2b0",
+  orbit_chat: "#4fd6d0",
+  experience_item: "#b7a7ff",
+  procedural_pattern: "#ff9ec7",
+  app: "#ffd166",
+  goal: "#ffab7a",
+  watcher: "#9bb1ff",
+  sentinel: "#ff9b9b",
+  arkpulse: "#6fd4f2",
+  arkevolve: "#e3a7ff",
+  llm_usage: "#ded9b0",
+};
 
-function hslToHex(h: number, s: number, l: number): string {
-  const hue2rgb = (p: number, q: number, t: number) => {
-    let tt = t;
-    if (tt < 0) tt += 1;
-    if (tt > 1) tt -= 1;
-    if (tt < 1 / 6) return p + (q - p) * 6 * tt;
-    if (tt < 1 / 2) return q;
-    if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6;
-    return p;
-  };
-  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-  const p = 2 * l - q;
-  const r = Math.round(hue2rgb(p, q, h + 1 / 3) * 255);
-  const g = Math.round(hue2rgb(p, q, h) * 255);
-  const b = Math.round(hue2rgb(p, q, h - 1 / 3) * 255);
-  const toHex = (x: number) => x.toString(16).padStart(2, "0");
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
-}
+// The hub is source-neutral chrome — it must stay outside every accent above
+// so "All activity" never reads as a source-coded node.
+const CENTER_ACCENT = "#8cd2b4";
 
-function tacticalAccent(hex: string): string {
-  const hsl = hexToHsl(hex);
-  if (!hsl) return "#AEB4BB";
-  return hslToHex(0, 0, Math.min(0.82, Math.max(0.42, hsl.l * 0.9 + 0.14)));
+function tacticalAccent(source: string): string {
+  return TACTICAL_ACCENTS[source] ?? "#aab8b0";
 }
 
 function tacticalSymbol(source: string): string {
@@ -1567,6 +1562,13 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
   const topicRows = topicSortMode === "recent" ? recentTopicRows : rankedTopicRows;
   const topClusters = rankedTopicRows.slice(0, 5);
   const graphTopicRows = useMemo(() => topicRows.slice(0, 8), [topicRows]);
+  // Legend mirrors the sources actually coloring the displayed nodes, not the
+  // window-wide source list — accent hues are semantic now, so a swatch with
+  // no matching node (or vice versa) would mislead.
+  const graphLegendSources = useMemo(() => {
+    const used = new Set(graphTopicRows.map((cluster) => dominantSource(cluster)));
+    return sourceRows.filter((row) => used.has(row.source));
+  }, [graphTopicRows, sourceRows]);
   const maxTopicUnits = Math.max(1, ...topicRows.map((cluster) => cluster.unit_count));
   const topicPageCount = showAllTopics ? 1 : Math.max(1, Math.ceil(topicRows.length / TOPIC_PAGE_SIZE));
   const visibleTopicRows = showAllTopics
@@ -1582,69 +1584,73 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
     const links: Array<Record<string, unknown>> = [];
     const seen = new Set<string>();
     const clusterNodeIds: string[] = [];
-    const centerName = leadCluster ? clusterTopicTitle(leadCluster) : "Reflect focus";
+    // The centre node stands for the whole reflect window, not the lead
+    // theme — naming it after the lead cluster duplicated the same title
+    // three times on screen (header, centre, top spoke).
     nodes.push({
       id: "reflect-center",
-      name: centerName,
+      name: "All activity",
       value: totalUnits,
-      symbol: "path://M50,8 C72,8 88,24 88,46 C88,70 66,86 50,94 C34,86 12,70 12,46 C12,24 28,8 50,8 Z",
-      symbolSize: 88,
+      symbol: "circle",
+      symbolSize: 64,
       category: 0,
       x: 0,
       y: 0,
       itemStyle: {
-        color: "rgba(174, 180, 187, 0.12)",
-        borderColor: "#B7BCC2",
+        color: "rgba(140, 210, 180, 0.08)",
+        borderColor: CENTER_ACCENT,
         borderWidth: 2,
-        shadowBlur: 18,
-        shadowColor: "rgba(174, 180, 187, 0.38)",
+        shadowBlur: 22,
+        shadowColor: "rgba(140, 210, 180, 0.35)",
       },
       label: {
         show: true,
         position: "bottom",
-        distance: 10,
-        formatter: `{center|${compactText(centerName, 28)}}\n{count|${totalUnits} trace${totalUnits === 1 ? "" : "s"}}`,
+        distance: 14,
+        backgroundColor: "rgba(5, 9, 7, 0.86)",
+        borderColor: "rgba(140, 210, 180, 0.3)",
+        borderWidth: 1,
+        borderRadius: 4,
+        padding: [5, 9],
+        formatter: `{center|ALL ACTIVITY}\n{count|${totalUnits} TRACE${totalUnits === 1 ? "" : "S"} - ${sourceRows.length} SOURCE${sourceRows.length === 1 ? "" : "S"}}`,
         rich: {
           center: {
-            color: "#F7FEFF",
-            fontSize: 15,
+            color: "#f4faf7",
+            fontSize: 12.5,
             fontWeight: 800,
-            fontFamily: "Inter, system-ui, sans-serif",
-            lineHeight: 22,
+            fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+            lineHeight: 19,
           },
           count: {
-            color: "#C6CAD0",
-            fontSize: 10,
+            color: CENTER_ACCENT,
+            fontSize: 9.5,
             fontWeight: 700,
             fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
-            lineHeight: 16,
-            backgroundColor: "rgba(255, 255, 255, 0.075)",
-            padding: [3, 7, 3, 7],
-            borderRadius: 4,
+            lineHeight: 15,
           },
         },
       },
       emphasis: {
-        scale: 1.08,
+        scale: 1.06,
         itemStyle: {
-          shadowBlur: 24,
-          shadowColor: "rgba(174, 180, 187, 0.46)",
+          shadowBlur: 30,
+          shadowColor: "rgba(140, 210, 180, 0.45)",
         },
       },
     });
     graphTopicRows.forEach((cluster, index) => {
       const source = dominantSource(cluster);
       const meta = sourceMeta(source);
-      const clusterName = clusterTopicTitle(cluster) || clusterLabelById[cluster.id] || sourceMeta(source).group;
+      const clusterName = clusterTopicTitle(cluster) || clusterLabelById[cluster.id] || meta.group;
       const nodeId = `cluster-${cluster.id}`;
       seen.add(nodeId);
       clusterNodeIds.push(nodeId);
-      const stroke = tacticalAccent(meta.color);
+      const stroke = tacticalAccent(source);
       const ratio = cluster.unit_count / maxTopicUnits;
       const nodeSize = Math.max(48, Math.min(74, 46 + ratio * 28));
       const code = tacticalCode(source);
       const idx = String(index + 1).padStart(2, "0");
-      const truncated = compactText(clusterName, 44);
+      const truncated = compactText(clusterName, 36);
       const angle = (index / Math.max(graphTopicRows.length, 1)) * Math.PI * 2 - Math.PI / 2;
       const radiusX = 300 + (index % 2) * 32;
       const radiusY = 170 + ((index + 1) % 2) * 26;
@@ -1659,41 +1665,38 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
         symbolSize: nodeSize,
         category: 1,
         itemStyle: {
-          color: hexToRgba(stroke, 0.12),
+          color: hexToRgba(stroke, 0.16),
           borderColor: stroke,
-          borderWidth: 2,
-          shadowBlur: 14,
-          shadowColor: hexToRgba(stroke, 0.28),
+          borderWidth: 2.2,
+          shadowBlur: 18,
+          shadowColor: hexToRgba(stroke, 0.5),
         },
+        // The label sits on a dark HUD plate — readable over grid lines,
+        // edges, and other chrome at any position.
         label: {
           show: true,
           position: labelPosition,
-          distance: 12,
-          formatter: `{code|${idx} - ${code}}\n{name|${truncated}}\n{count|${cluster.unit_count} traces}`,
+          distance: 14,
+          backgroundColor: "rgba(5, 9, 7, 0.86)",
+          borderColor: hexToRgba(stroke, 0.36),
+          borderWidth: 1,
+          borderRadius: 4,
+          padding: [5, 9],
+          formatter: `{code|${idx} ${code} - ${cluster.unit_count} TRACE${cluster.unit_count === 1 ? "" : "S"}}\n{name|${truncated}}`,
           rich: {
             code: {
               color: stroke,
-              fontSize: 11,
-              fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
-              fontWeight: 800,
-              lineHeight: 18,
-            },
-            name: {
-              color: "rgba(246, 251, 255, 0.96)",
-              fontSize: 13,
-              fontFamily: "Inter, system-ui, sans-serif",
-              fontWeight: 750,
-              lineHeight: 18,
-            },
-            count: {
-              color: stroke,
-              fontSize: 10,
+              fontSize: 9.5,
               fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
               fontWeight: 700,
+              lineHeight: 16,
+            },
+            name: {
+              color: "#f4faf7",
+              fontSize: 12.5,
+              fontFamily: "Inter, system-ui, sans-serif",
+              fontWeight: 700,
               lineHeight: 17,
-              backgroundColor: hexToRgba(stroke, 0.12),
-              padding: [2, 6, 2, 6],
-              borderRadius: 4,
             },
           },
         },
@@ -1701,15 +1704,13 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           scale: 1.12,
           itemStyle: {
             borderColor: stroke,
-            borderWidth: 2.4,
-            shadowBlur: 18,
-            shadowColor: hexToRgba(stroke, 0.36),
+            borderWidth: 2.6,
+            shadowBlur: 24,
+            shadowColor: hexToRgba(stroke, 0.6),
           },
           label: {
-            rich: {
-              name: { color: "#f4fbff" },
-              code: { color: stroke },
-            },
+            backgroundColor: "rgba(7, 13, 10, 0.94)",
+            borderColor: hexToRgba(stroke, 0.6),
           },
         },
         x,
@@ -1720,12 +1721,12 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
         target: nodeId,
         value: cluster.unit_count,
         lineStyle: {
-          width: 1.3 + ratio * 2.7,
+          width: 1.4 + ratio * 2.7,
           color: stroke,
-          opacity: 0.72,
+          opacity: 0.82,
           curveness: index % 2 === 0 ? 0.18 : -0.18,
-          shadowBlur: 12,
-          shadowColor: hexToRgba(stroke, 0.28),
+          shadowBlur: 10,
+          shadowColor: hexToRgba(stroke, 0.32),
         },
       });
       cluster.related_history.items.slice(0, 2).forEach((item, itemIndex) => {
@@ -1750,14 +1751,14 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             }),
             value: 1,
             symbol: "circle",
-            symbolSize: 8,
+            symbolSize: 9,
             category: 2,
             itemStyle: {
-              color: hexToRgba(stroke, 0.18),
-              borderColor: hexToRgba(stroke, 0.62),
+              color: hexToRgba(stroke, 0.2),
+              borderColor: hexToRgba(stroke, 0.7),
               borderWidth: 1.2,
-              shadowBlur: 4,
-              shadowColor: hexToRgba(stroke, 0.24),
+              shadowBlur: 6,
+              shadowColor: hexToRgba(stroke, 0.3),
             },
             label: { show: false },
             x: x + Math.cos(satAngle) * satOffset,
@@ -1786,8 +1787,8 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           target: next,
           lineStyle: {
             width: 0.7,
-            color: "rgba(150, 180, 215, 0.22)",
-            opacity: 0.48,
+            color: "rgba(140, 205, 175, 0.24)",
+            opacity: 0.5,
             curveness: i % 2 === 0 ? 0.22 : -0.22,
             type: [3, 6],
             dashOffset: 0,
@@ -1807,11 +1808,18 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
           fontSize: 11.5,
           fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
         },
-        formatter: (info: { data?: { name?: string; value?: number } }) => {
+        formatter: (info: {
+          dataType?: string;
+          data?: { id?: string; name?: string; value?: number };
+        }) => {
+          if (info.dataType === "edge") return "";
           const name = (info.data?.name || "node").toUpperCase();
           const v = info.data?.value;
+          const id = info.data?.id ?? "";
+          const kind =
+            id === "reflect-center" ? "WINDOW" : id.startsWith("history-") ? "EVIDENCE" : "THEME";
           return v
-            ? `<span style="opacity:0.6">THEME</span> ${name}<br/><span style="opacity:0.6">TRACES</span> ${v}`
+            ? `<span style="opacity:0.6">${kind}</span> ${name}<br/><span style="opacity:0.6">TRACES</span> ${v}`
             : `<span style="opacity:0.6">NODE</span> ${name}`;
         },
       },
@@ -1822,12 +1830,12 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             left: "center",
             top: "middle",
             children: [
-              { type: "circle", shape: { cx: 0, cy: 0, r: 3 }, style: { fill: "transparent", stroke: "rgba(130,170,160,0.55)", lineWidth: 1 } },
-              { type: "circle", shape: { cx: 0, cy: 0, r: 1 }, style: { fill: "rgba(130,170,160,0.7)" } },
-              { type: "line", shape: { x1: -10, y1: 0, x2: -5, y2: 0 }, style: { stroke: "rgba(130,170,160,0.45)", lineWidth: 1 } },
-              { type: "line", shape: { x1: 5, y1: 0, x2: 10, y2: 0 }, style: { stroke: "rgba(130,170,160,0.45)", lineWidth: 1 } },
-              { type: "line", shape: { x1: 0, y1: -10, x2: 0, y2: -5 }, style: { stroke: "rgba(130,170,160,0.45)", lineWidth: 1 } },
-              { type: "line", shape: { x1: 0, y1: 5, x2: 0, y2: 10 }, style: { stroke: "rgba(130,170,160,0.45)", lineWidth: 1 } },
+              { type: "circle", shape: { cx: 0, cy: 0, r: 3 }, style: { fill: "transparent", stroke: "rgba(140,210,180,0.55)", lineWidth: 1 } },
+              { type: "circle", shape: { cx: 0, cy: 0, r: 1 }, style: { fill: "rgba(140,210,180,0.7)" } },
+              { type: "line", shape: { x1: -10, y1: 0, x2: -5, y2: 0 }, style: { stroke: "rgba(140,210,180,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 5, y1: 0, x2: 10, y2: 0 }, style: { stroke: "rgba(140,210,180,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 0, y1: -10, x2: 0, y2: -5 }, style: { stroke: "rgba(140,210,180,0.45)", lineWidth: 1 } },
+              { type: "line", shape: { x1: 0, y1: 5, x2: 0, y2: 10 }, style: { stroke: "rgba(140,210,180,0.45)", lineWidth: 1 } },
             ],
           },
           {
@@ -1835,7 +1843,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             left: "center",
             top: "middle",
             shape: { cx: 0, cy: 0, r: 82 },
-            style: { fill: "transparent", stroke: "rgba(174,180,187,0.16)", lineWidth: 1 },
+            style: { fill: "transparent", stroke: "rgba(140,210,180,0.15)", lineWidth: 1 },
             silent: true,
           },
           {
@@ -1843,7 +1851,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             left: "center",
             top: "middle",
             shape: { cx: 0, cy: 0, r: 132 },
-            style: { fill: "transparent", stroke: "rgba(174,180,187,0.11)", lineWidth: 1 },
+            style: { fill: "transparent", stroke: "rgba(140,210,180,0.1)", lineWidth: 1 },
             silent: true,
           },
           {
@@ -1851,7 +1859,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
             left: "center",
             top: "middle",
             shape: { cx: 0, cy: 0, r: 184 },
-            style: { fill: "transparent", stroke: "rgba(174,180,187,0.08)", lineWidth: 1 },
+            style: { fill: "transparent", stroke: "rgba(140,210,180,0.07)", lineWidth: 1 },
             silent: true,
           },
           {
@@ -1894,7 +1902,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
         },
       ],
     };
-  }, [allUnits.length, clusterLabelById, graphTopicRows, leadCluster, maxTopicUnits, topicRows.length, totalUnits]);
+  }, [allUnits.length, clusterLabelById, graphTopicRows, maxTopicUnits, sourceRows.length, topicRows.length, totalUnits]);
 
   const activityOption = useMemo(() => {
     const TIMELINE_BUCKETS = period === "daily" ? 24 : period === "weekly" ? 28 : 36;
@@ -2012,16 +2020,18 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
   const latestSourceCount = latestFollowups.reduce((sum, item) => sum + item.search_results.length, 0);
   const latestReadyCount = sourceBackedLatestFollowups.filter((item) => item.status === "ready").length;
   const latestQueuedCount = latestFollowups.filter((item) => item.status === "queued").length;
-  const latestFailedCount = latestFollowups.filter((item) => item.status === "failed" && followupHasSourceEvidence(item)).length;
-  const opportunitySettleRefreshKey =
-    response?.refresh_status.completed_at ||
-    response?.refresh_status.started_at ||
-    response?.refresh_status.requested_at ||
-    "initial";
-  const opportunitySettleKey = `${period}:${fromIso}:${toIso}:${opportunitySettleRefreshKey}`;
+  const latestFailedCount = latestFollowups.filter((item) => item.status === "failed").length;
+  const pendingPlanCount = response?.followup_planning.pending_count ?? 0;
+  const planningActive = Boolean(response?.followup_planning.planning_active);
+  const planningError = response?.followup_planning.last_error || null;
+  const planningAttemptAt = response?.followup_planning.last_attempt_at || "none";
+  // Keyed on real backend state: a new planning attempt or a pending/queued
+  // transition re-arms the poll window; an exhausted window stays exhausted
+  // until the backend state actually changes.
+  const opportunitySettleKey = `${period}:${fromIso}:${toIso}:p${pendingPlanCount}:q${latestQueuedCount}:a${planningAttemptAt}`;
   const shouldSettleOpportunityPoll = shouldPollForOpportunitySettlement({
-    sourceCounts: response?.source_counts,
-    opportunityCount: opportunityFollowups.length,
+    pendingPlanCount,
+    planningActive,
     queuedSourceCheckCount: latestQueuedCount,
     refreshRunning: isReflectRunning,
   });
@@ -2085,7 +2095,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
   const sourceMixOption = useMemo(
     () => ({
       backgroundColor: "transparent",
-      color: sourceRows.map((source) => tacticalAccent(source.color)),
+      color: sourceRows.map((source) => tacticalAccent(source.source)),
       tooltip: {
         trigger: "item",
         backgroundColor: "rgba(6, 11, 16, 0.96)",
@@ -2326,7 +2336,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                         <Typography variant="caption">{source.count}</Typography>
                       </Stack>
                       <Box sx={{ height: 5, borderRadius: 999, bgcolor: "var(--ui-rgba-255-255-255-040)", overflow: "hidden" }}>
-                        <Box sx={{ height: "100%", width: `${Math.max(6, pct)}%`, bgcolor: tacticalAccent(source.color) }} />
+                        <Box sx={{ height: "100%", width: `${Math.max(6, pct)}%`, bgcolor: tacticalAccent(source.source) }} />
                       </Box>
                     </Box>
                   );
@@ -2488,9 +2498,9 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                 sx={{ position: "relative", zIndex: 2, justifyContent: "space-between", alignItems: { xs: "flex-start", md: "center" } }}
               >
                 <Stack direction="row" spacing={1.2} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
-                  {sourceRows.slice(0, 6).map((source) => (
+                  {graphLegendSources.map((source) => (
                     <Box key={source.source} className="arkreflect-memory-legend-item">
-                      <Box sx={{ bgcolor: tacticalAccent(source.color) }} />
+                      <Box sx={{ bgcolor: tacticalAccent(source.source) }} />
                       <Typography variant="caption">{source.label}</Typography>
                     </Box>
                   ))}
@@ -2554,7 +2564,7 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                   const name = clusterTopicTitle(cluster);
                   const sourceKey = dominantSource(cluster);
                   const source = sourceMeta(sourceKey);
-                  const accent = tacticalAccent(source.color);
+                  const accent = tacticalAccent(sourceKey);
                   const displayIndex = topicPage * TOPIC_PAGE_SIZE + index;
                   const strength = topicStrength(cluster, maxTopicUnits);
                   const strengthColor = topicStrengthColor(strength.label);
@@ -2683,12 +2693,15 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
               {sourceBackedLatestFollowups.length > 0 ? (
                 <Chip className="arkreflect-pill" icon={<SearchRoundedIcon />} label={`${latestSourceCount || sourceBackedLatestFollowups.length} source-backed`} />
               ) : null}
-              {latestQueuedCount > 0 || isOpportunitySettling ? (
+              {pendingPlanCount > 0 || planningActive ? (
                 <Chip
                   size="small"
                   variant="outlined"
-                  label={latestQueuedCount > 0 ? `${latestQueuedCount} checking` : "checking"}
+                  label={pendingPlanCount > 0 ? `${pendingPlanCount} evaluating` : "evaluating"}
                 />
+              ) : null}
+              {latestQueuedCount > 0 ? (
+                <Chip size="small" variant="outlined" label={`${latestQueuedCount} checking sources`} />
               ) : null}
               {latestReadyCount > 0 ? <Chip size="small" variant="outlined" label={`${latestReadyCount} ready`} /> : null}
               {latestFailedCount > 0 ? <Chip size="small" variant="outlined" label={`${latestFailedCount} failed`} /> : null}
@@ -2719,16 +2732,24 @@ export default function ReflectPage({ autoRefresh, onNavigateToView }: ReflectPa
                   <Typography sx={{ ...titleSx, fontSize: "1rem" }}>
                     {isReflectRunning || isOpportunitySettling
                       ? "Looking for useful opportunities"
-                      : "No opportunities for this range yet"}
+                      : planningError
+                        ? "Opportunity check hit a snag"
+                        : "No opportunities for this range yet"}
                   </Typography>
                   <Typography sx={{ ...bodySx, fontSize: "0.78rem" }}>
                     {isReflectRunning
-                      ? "Reflect is refreshing this range — anything worth acting on shows up here."
-                      : isOpportunitySettling
-                        ? "Waiting for source checks to finish. Updates automatically."
-                      : totalUnits > 0
-                        ? "There's activity here, but nothing's been promoted yet. Use Run Reflect to re-check."
-                        : "No activity cached for this range yet."}
+                      ? "ArkReflect is refreshing this range — anything worth acting on shows up here."
+                      : pendingPlanCount > 0 || planningActive
+                        ? isOpportunitySettling
+                          ? "ArkReflect is deciding which recent topics deserve a current-info check. Updates automatically."
+                          : "ArkReflect is still evaluating recent topics. Refresh to re-check."
+                        : isOpportunitySettling
+                          ? "ArkReflect is checking current sources for promoted topics. Updates automatically."
+                          : planningError
+                            ? `${planningError} ArkReflect retries on the next visit.`
+                            : totalUnits > 0
+                              ? "Nothing in this range needed a current-info follow-up. New chats, searches, and browsing refresh this automatically."
+                              : "No activity cached for this range yet."}
                   </Typography>
                 </Stack>
               </Box>

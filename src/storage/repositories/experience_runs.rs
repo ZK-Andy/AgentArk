@@ -1,7 +1,39 @@
 use super::super::*;
 
+/// KV key marking when honest outcome labels began (RFC3339). Runs created
+/// before this carried blanket auto-accept labels and must never feed canary
+/// evaluation.
+const EVOLVE_LABEL_EPOCH_KEY: &str = "evolve_label_epoch_v1";
+
 impl Storage {
     // ==================== Experience Graph ====================
+
+    /// Get-or-initialize the honest-label epoch. First call stamps now.
+    pub async fn evolve_label_epoch(&self) -> String {
+        if let Ok(Some(bytes)) = self.get(EVOLVE_LABEL_EPOCH_KEY).await {
+            if let Ok(value) = String::from_utf8(bytes) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Err(error) = self.set(EVOLVE_LABEL_EPOCH_KEY, now.as_bytes()).await {
+            tracing::warn!(error = %error, "failed to persist evolve label epoch");
+        }
+        now
+    }
+
+    pub async fn current_evolve_label_epoch(&self) -> Option<String> {
+        self.get(EVOLVE_LABEL_EPOCH_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
 
     pub async fn upsert_experience_run(&self, run: &experience_run::Model) -> Result<()> {
         let txn = self.db.begin().await?;
@@ -22,6 +54,10 @@ impl Storage {
             policy_version: Set(run.policy_version.clone()),
             prompt_version: Set(run.prompt_version.clone()),
             model_slot: Set(run.model_slot.clone()),
+            tokens_in: Set(run.tokens_in),
+            tokens_out: Set(run.tokens_out),
+            wall_ms: Set(run.wall_ms),
+            est_cost_microusd: Set(run.est_cost_microusd),
             success_state: Set(run.success_state.clone()),
             correction_state: Set(run.correction_state.clone()),
             outcome_summary: Set(run.outcome_summary.clone()),
@@ -211,6 +247,129 @@ impl Storage {
         Ok(Some(updated))
     }
 
+    /// Latest still-provisional run in a conversation, optionally excluding a
+    /// run id (the in-flight turn whose persistence may race this lookup).
+    /// Returns None unless exactly one candidate matches, mirroring the
+    /// correction markers' ambiguity guard.
+    pub async fn latest_provisional_experience_run(
+        &self,
+        conversation_id: &str,
+        exclude_run_id: Option<&str>,
+        within_minutes: i64,
+    ) -> Result<Option<experience_run::Model>> {
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::minutes(within_minutes.max(1))).to_rfc3339();
+        let mut query = experience_run::Entity::find()
+            .filter(experience_run::Column::ConversationId.eq(conversation_id.to_string()))
+            .filter(experience_run::Column::SuccessState.eq("provisional"))
+            .filter(experience_run::Column::CorrectionState.eq("none"))
+            .filter(experience_run::Column::CreatedAt.gte(cutoff));
+        if let Some(exclude_run_id) = exclude_run_id {
+            query = query.filter(experience_run::Column::Id.ne(exclude_run_id.to_string()));
+        }
+        let candidates = query
+            .order_by_desc(experience_run::Column::CreatedAt)
+            .limit(2)
+            .all(&self.db)
+            .await?;
+        if candidates.len() != 1 {
+            return Ok(None);
+        }
+        Ok(candidates.into_iter().next())
+    }
+
+    /// Outcome-judge label: the user's next message semantically corrected the
+    /// answer. Flips the run to failed/corrected exactly like the legacy
+    /// correction markers, bound precisely by run id.
+    pub async fn mark_provisional_experience_run_corrected_by_id(
+        &self,
+        run_id: &str,
+        correction_signal: &str,
+    ) -> Result<Option<experience_run::Model>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let Some(target) = experience_run::Entity::find_by_id(run_id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if target.success_state != "provisional" || target.correction_state != "none" {
+            return Ok(None);
+        }
+        let payload = serde_json::json!({
+            "correction_signal": correction_signal,
+            "correction_recorded_at": now,
+            "correction_bound_by": "run_id",
+        });
+        let mut metadata = target.metadata.clone();
+        if let Some(existing) = metadata.as_object_mut() {
+            if let Some(payload_map) = payload.as_object() {
+                for (key, value) in payload_map {
+                    existing.insert(key.clone(), value.clone());
+                }
+            }
+        } else {
+            metadata = payload;
+        }
+        let updated = experience_run::ActiveModel {
+            id: Unchanged(target.id),
+            success_state: Set("failed".to_string()),
+            correction_state: Set("corrected".to_string()),
+            corrected_at: Set(Some(now.clone())),
+            updated_at: Set(now),
+            metadata: Set(metadata),
+            ..Default::default()
+        }
+        .update(&self.db)
+        .await?;
+        Ok(Some(updated))
+    }
+
+    /// Outcome-judge label: the user's next message shows the answer served
+    /// them. Accepts the run immediately instead of waiting for the stale
+    /// timeout fallback.
+    pub async fn mark_provisional_experience_run_served(
+        &self,
+        run_id: &str,
+        served_signal: &str,
+    ) -> Result<Option<experience_run::Model>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let Some(target) = experience_run::Entity::find_by_id(run_id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if target.success_state != "provisional" || target.correction_state != "none" {
+            return Ok(None);
+        }
+        let payload = serde_json::json!({
+            "served_signal": served_signal,
+            "served_recorded_at": now,
+        });
+        let mut metadata = target.metadata.clone();
+        if let Some(existing) = metadata.as_object_mut() {
+            if let Some(payload_map) = payload.as_object() {
+                for (key, value) in payload_map {
+                    existing.insert(key.clone(), value.clone());
+                }
+            }
+        } else {
+            metadata = payload;
+        }
+        let updated = experience_run::ActiveModel {
+            id: Unchanged(target.id),
+            success_state: Set("accepted".to_string()),
+            accepted_at: Set(Some(now.clone())),
+            updated_at: Set(now),
+            metadata: Set(metadata),
+            ..Default::default()
+        }
+        .update(&self.db)
+        .await?;
+        Ok(Some(updated))
+    }
+
     pub async fn finalize_stale_provisional_experience_runs(
         &self,
         older_than_minutes: i64,
@@ -274,6 +433,28 @@ impl Storage {
     ) -> Result<Vec<experience_run::Model>> {
         let capped_limit = limit.min(Self::MAX_EXPERIENCE_RUN_ROWS_PER_QUERY);
         experience_run::Entity::find()
+            .order_by_desc(experience_run::Column::UpdatedAt)
+            .limit(Self::db_limit(capped_limit))
+            .all(&self.db)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Recent runs for CANARY EVALUATION only: rows created after the
+    /// honest-label epoch, so pre-epoch blanket auto-accepted labels never
+    /// feed promotion/regression gates. Other readers (mining, export,
+    /// inspection) keep the unfiltered listing.
+    pub async fn list_recent_experience_runs_for_canary_eval(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<experience_run::Model>> {
+        let epoch = self.current_evolve_label_epoch().await;
+        let capped_limit = limit.min(Self::MAX_EXPERIENCE_RUN_ROWS_PER_QUERY);
+        let mut query = experience_run::Entity::find();
+        if let Some(epoch) = epoch {
+            query = query.filter(experience_run::Column::CreatedAt.gte(epoch));
+        }
+        query
             .order_by_desc(experience_run::Column::UpdatedAt)
             .limit(Self::db_limit(capped_limit))
             .all(&self.db)

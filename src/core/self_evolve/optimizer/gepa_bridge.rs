@@ -1147,8 +1147,13 @@ pub async fn run_python_optimizer(
             });
         }
     };
+    // Exit code 3 = the optimizer fell back to schema-preserving baseline
+    // copies (no real search happened). That is a failure for accounting and
+    // UI purposes, never a completed optimization.
     let status = if output.status.success() {
         "completed"
+    } else if output.status.code() == Some(3) {
+        "failed_fallback"
     } else {
         "failed"
     };
@@ -2054,7 +2059,9 @@ fn default_gepa_enabled() -> bool {
 }
 
 fn default_gepa_max_metric_calls() -> u32 {
-    2
+    // Floor for a real search: 2 made every run a single-shot rubber stamp.
+    // Still bounded by the per-run/daily budget guards either way.
+    24
 }
 
 fn default_gepa_daily_budget_usd() -> f64 {
@@ -2259,7 +2266,8 @@ mod tests {
 
     #[test]
     fn gepa_default_metric_call_budget_keeps_background_runs_bounded() {
-        assert_eq!(GepaOptimizerConfig::default().max_metric_calls, 2);
+        // Non-degenerate search floor; budget guards still bound spend.
+        assert_eq!(GepaOptimizerConfig::default().max_metric_calls, 24);
     }
 
     #[test]
@@ -2281,6 +2289,10 @@ mod tests {
             policy_version: None,
             prompt_version: None,
             model_slot: None,
+            tokens_in: None,
+            tokens_out: None,
+            wall_ms: None,
+            est_cost_microusd: None,
             success_state: "accepted".to_string(),
             correction_state: "none".to_string(),
             outcome_summary: None,

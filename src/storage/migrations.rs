@@ -354,6 +354,106 @@ macro_rules! ensure_table_list {
     };
 }
 
+/// Idempotent additive DDL applied unconditionally (no schema-version bump).
+/// Only `ADD COLUMN IF NOT EXISTS` / `CREATE TABLE IF NOT EXISTS` belongs
+/// here; column statements are savepoint-wrapped so a failure degrades to a
+/// logged skip.
+async fn ensure_additive_columns<C>(db: &C, backend: DbBackend) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    // Tables added after the schema-version freeze: the gated bootstrap below
+    // never runs on existing databases, so new tables must be ensured here.
+    let schema = Schema::new(backend);
+    ensure_table(db, backend, &schema, evolve_eval_case::Entity).await?;
+    ensure_table(db, backend, &schema, evolve_opportunity::Entity).await?;
+    ensure_table(db, backend, &schema, evolve_value_ledger::Entity).await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_evolve_opportunities_status_updated")
+            .table(evolve_opportunity::Entity)
+            .col(evolve_opportunity::Column::Status)
+            .col(evolve_opportunity::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_evolve_opportunities_surface_status")
+            .table(evolve_opportunity::Entity)
+            .col(evolve_opportunity::Column::TargetSurface)
+            .col(evolve_opportunity::Column::Status)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_evolve_eval_cases_opportunity_status")
+            .table(evolve_eval_case::Entity)
+            .col(evolve_eval_case::Column::OpportunityId)
+            .col(evolve_eval_case::Column::Status)
+            .col(evolve_eval_case::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_evolve_eval_cases_source")
+            .table(evolve_eval_case::Entity)
+            .col(evolve_eval_case::Column::SourceKind)
+            .col(evolve_eval_case::Column::SourceRef)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_evolve_value_ledger_opportunity_phase")
+            .table(evolve_value_ledger::Entity)
+            .col(evolve_value_ledger::Column::OpportunityId)
+            .col(evolve_value_ledger::Column::Phase)
+            .col(evolve_value_ledger::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+
+    for (sql, description) in [
+        (
+            "ALTER TABLE experience_runs ADD COLUMN IF NOT EXISTS tokens_in BIGINT",
+            "experience_runs.tokens_in column",
+        ),
+        (
+            "ALTER TABLE experience_runs ADD COLUMN IF NOT EXISTS tokens_out BIGINT",
+            "experience_runs.tokens_out column",
+        ),
+        (
+            "ALTER TABLE experience_runs ADD COLUMN IF NOT EXISTS wall_ms BIGINT",
+            "experience_runs.wall_ms column",
+        ),
+        (
+            "ALTER TABLE experience_runs ADD COLUMN IF NOT EXISTS est_cost_microusd BIGINT",
+            "experience_runs.est_cost_microusd column",
+        ),
+    ] {
+        ensure_optional_sql(db, backend, sql, description).await?;
+    }
+    Ok(())
+}
+
 pub async fn run(db: &DatabaseConnection) -> Result<()> {
     if db.get_database_backend() != DbBackend::Postgres {
         anyhow::bail!("storage bootstrap requires a postgres database backend");
@@ -391,6 +491,11 @@ where
     let backend = db.get_database_backend();
     let schema = Schema::new(backend);
     ensure_schema_migrations_table(db, backend).await?;
+    // Additive columns run on EVERY boot, ahead of the version gate: the gate
+    // early-returns on bootstrapped databases, and the schema version stays at
+    // CURRENT_SCHEMA_VERSION by policy (idempotent ALTERs instead of bumps so
+    // existing data is never wiped).
+    ensure_additive_columns(db, backend).await?;
     if let Some(version) = latest_recorded_schema_version(db, backend).await? {
         if version == CURRENT_SCHEMA_VERSION {
             return Ok(());
@@ -455,6 +560,9 @@ where
             run_checkpoint::Entity,
             tool_attempt::Entity,
             experience_run::Entity,
+            evolve_eval_case::Entity,
+            evolve_opportunity::Entity,
+            evolve_value_ledger::Entity,
             experience_item::Entity,
             experience_edge::Entity,
             procedural_pattern::Entity,

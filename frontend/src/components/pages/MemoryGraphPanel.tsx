@@ -41,18 +41,27 @@ const GRAPH_RELATION_STATUSES = ["candidate", "confirmed"];
 
 const TWO_PI = Math.PI * 2;
 
+const MONO_FONT = '"JetBrains Mono", ui-monospace, monospace';
+const ACCENT = "#78f2b0";
+
 // Node fields we derive once at merge time and stash on the simulation object so
-// the per-frame paint never recomputes them.
+// the per-frame paint never recomputes them (no string building per frame).
 type MemoryNodeExtra = MemoryGraphNode & {
   __color?: string;
+  __rim?: string;
+  __ring?: string;
   __r?: number;
   __label?: string;
   __degree?: number;
 };
 
+type MemoryEdgeExtra = MemoryGraphEdge & {
+  __tone?: "semantic" | "supersedes" | "evidence" | "relation" | "explicit";
+};
+
 // The simulation augments these objects in place with x/y/vx/vy/fx/fy.
 type GNode = NodeObject<MemoryNodeExtra>;
-type GLink = LinkObject<MemoryNodeExtra, MemoryGraphEdge>;
+type GLink = LinkObject<MemoryNodeExtra, MemoryEdgeExtra>;
 
 type MemoryGraphPanelProps = {
   focusMemoryId?: string | null;
@@ -71,48 +80,122 @@ function idOf(endpoint: unknown): string {
   return endpoint == null ? "" : String(endpoint);
 }
 
-function graphNodeCategory(node: MemoryGraphNode): string {
+function nodeMarkSize(node: MemoryGraphNode, degree: number): number {
   const type = str(node.node_type, "memory");
-  if (type === "entity") return "Entity";
-  if (type === "source") return "Source";
-  return "Memory";
+  const base = type === "entity" ? 4.8 : type === "source" ? 3.2 : 3.5;
+  const degreeGain = Math.sqrt(Math.max(0, degree)) * 1.18;
+  const pinnedGain = node.pinned ? 0.9 : 0;
+  const max = type === "entity" ? 11 : 8.8;
+  return clamp(base + degreeGain + pinnedGain, 3.1, max);
 }
 
-function graphNodeSize(node: MemoryGraphNode): number {
-  if (node.pinned) return 30;
-  if (node.node_type === "entity") return 24;
-  if (node.node_type === "source") return 14;
-  const confidence = num(node.confidence, 0.7);
-  const support = Math.min(5, Math.max(0, num(node.support_count, 0)));
-  return 15 + confidence * 8 + support;
-}
+// Palette tuned to the app's mint-on-black token system (see 00-foundation.css):
+// muted technical markers instead of saturated chart primaries.
+// Shared by the paint code and the legend so they cannot drift.
+const CATEGORY_COLORS: Record<string, string> = {
+  assistant_preference: "#ff9ec7",
+  work_preference: "#549bf0",
+  project_domain_memory: "#ffbe63",
+  ephemeral_context: "#f5e08a",
+  knowledge: "#b7a7ff",
+  other: "#ffab7a",
+};
 
-// Convert the legacy symbol diameter into a force-graph world-unit radius.
-function nodeRadius(node: MemoryGraphNode): number {
-  return graphNodeSize(node) / 2.6;
-}
+const CATEGORY_SHORT: Record<string, string> = {
+  assistant_preference: "assistant",
+  work_preference: "work",
+  project_domain_memory: "project",
+  ephemeral_context: "ephemeral",
+  knowledge: "knowledge",
+  other: "other",
+};
+
+const MEMORY_DEFAULT = "#8fc6ff";
+const PINNED_COLOR = "#ff9b9b";
+const ENTITY_COLOR = ACCENT;
+const SOURCE_COLOR = "#93a59c";
 
 function graphNodeColor(node: MemoryGraphNode): string {
-  if (node.pinned) return "#f25555";
-  if (node.node_type === "entity") return "#25b99a";
-  if (node.node_type === "source") return "#a8b0b8";
-  const category = str(node.category, "");
-  if (category === "assistant_preference") return "#f4728f";
-  if (category === "work_preference") return "#4b91e2";
-  if (category === "project_domain_memory") return "#d49b0b";
-  if (category === "ephemeral_context") return "#f3dc4d";
-  if (category === "knowledge") return "#8b5cf6";
-  if (category === "other") return "#f9733f";
-  return "#6ea8ff";
+  if (node.pinned) return PINNED_COLOR;
+  if (node.node_type === "entity") return ENTITY_COLOR;
+  if (node.node_type === "source") return SOURCE_COLOR;
+  return CATEGORY_COLORS[str(node.category, "")] ?? MEMORY_DEFAULT;
 }
 
-function edgeColor(edge: MemoryGraphEdge): string {
-  const tone = memoryGraphEdgeTone(edge);
-  if (tone === "semantic") return "rgba(243, 220, 77, 0.42)";
-  if (tone === "supersedes") return "rgba(242, 85, 85, 0.48)";
-  if (tone === "evidence") return "rgba(168, 176, 184, 0.34)";
-  if (edge.edge_type === "knowledge_relation") return "rgba(37, 185, 154, 0.56)";
-  return "rgba(110, 168, 255, 0.38)";
+function hexChannels(hex: string): [number, number, number] {
+  const value = Number.parseInt(hex.slice(1), 16);
+  return [(value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff];
+}
+
+function withAlpha(hex: string, alpha: number): string {
+  const [r, g, b] = hexChannels(hex);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function lighten(hex: string, amount: number): string {
+  const [r, g, b] = hexChannels(hex);
+  const mix = (channel: number) => Math.round(channel + (255 - channel) * amount);
+  return `rgb(${mix(r)}, ${mix(g)}, ${mix(b)})`;
+}
+
+// knowledge_relation gets its own tone so confirmed relations read as the
+// graph's mint "structure"; everything else follows memoryGraphEdgeTone.
+function edgeTone(edge: MemoryGraphEdge): MemoryEdgeExtra["__tone"] {
+  if (edge.edge_type === "knowledge_relation") return "relation";
+  return memoryGraphEdgeTone(edge);
+}
+
+const EDGE_HOT: Record<string, string> = {
+  semantic: "rgba(245, 224, 138, 0.78)",
+  supersedes: "rgba(255, 155, 155, 0.84)",
+  evidence: "rgba(190, 205, 197, 0.68)",
+  relation: "rgba(120, 242, 176, 0.82)",
+  explicit: "rgba(163, 210, 255, 0.72)",
+};
+
+const LINK_BASE: Record<string, string> = {
+  semantic: "rgba(200, 186, 126, 0.08)",
+  supersedes: "rgba(255, 155, 155, 0.18)",
+  evidence: "rgba(154, 170, 162, 0.1)",
+  relation: "rgba(120, 242, 176, 0.18)",
+  explicit: "rgba(143, 198, 255, 0.12)",
+};
+
+const EDGE_DIMMED = "rgba(140, 165, 150, 0.035)";
+
+function traceHex(ctx: CanvasRenderingContext2D, r: number): void {
+  ctx.beginPath();
+  for (let i = 0; i < 6; i += 1) {
+    const angle = Math.PI / 6 + i * (Math.PI / 3);
+    const x = Math.cos(angle) * r;
+    const y = Math.sin(angle) * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+function traceDiamond(ctx: CanvasRenderingContext2D, r: number): void {
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.lineTo(r * 0.82, 0);
+  ctx.lineTo(0, r);
+  ctx.lineTo(-r * 0.82, 0);
+  ctx.closePath();
+}
+
+function traceSlate(ctx: CanvasRenderingContext2D, r: number): void {
+  const w = r * 1.7;
+  const h = r * 1.05;
+  ctx.beginPath();
+  ctx.rect(-w / 2, -h / 2, w, h);
+}
+
+function traceNodeMark(ctx: CanvasRenderingContext2D, node: MemoryGraphNode, r: number): void {
+  const type = str(node.node_type, "memory");
+  if (type === "entity") traceHex(ctx, r);
+  else if (type === "source") traceSlate(ctx, r);
+  else traceDiamond(ctx, r);
 }
 
 function graphTooltip(params: { dataType?: string; data?: unknown }): string {
@@ -141,11 +224,6 @@ function inspectorEvidence(edge: MemoryGraphEdge): JsonRecord[] {
   return values.map(asRecord).filter((item) => Object.keys(item).length > 0);
 }
 
-const GRAPH_LEGEND: Array<{ label: string; color: string }> = [
-  { label: "Memory", color: "#6ea8ff" },
-  { label: "Entity", color: "#25b99a" },
-  { label: "Source", color: "#a8b0b8" },
-];
 
 export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProps) {
   const queryClient = useQueryClient();
@@ -201,12 +279,46 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
   const edges = payload.edges || [];
   const summary = memoryGraphVisibleSummary(payload);
 
+  // One legend entry per memory category actually present (unknown categories
+  // fold into "memory"), plus pinned/entity/source buckets.
+  const legendEntries = useMemo(() => {
+    const categoryCounts = new Map<string, number>();
+    let entity = 0;
+    let source = 0;
+    let pinned = 0;
+    for (const node of nodes) {
+      const type = str(node.node_type, "memory");
+      if (type === "entity") entity += 1;
+      else if (type === "source") source += 1;
+      else if (node.pinned) pinned += 1;
+      else {
+        const category = str(node.category, "");
+        const key = CATEGORY_COLORS[category] ? category : "";
+        categoryCounts.set(key, (categoryCounts.get(key) ?? 0) + 1);
+      }
+    }
+    const entries: Array<{ label: string; color: string; count: number }> = [];
+    for (const [category, count] of categoryCounts) {
+      entries.push({
+        label: CATEGORY_SHORT[category] ?? "memory",
+        color: CATEGORY_COLORS[category] ?? MEMORY_DEFAULT,
+        count,
+      });
+    }
+    entries.sort((a, b) => b.count - a.count);
+    if (pinned > 0) entries.push({ label: "pinned", color: PINNED_COLOR, count: pinned });
+    if (entity > 0) entries.push({ label: "entity", color: ENTITY_COLOR, count: entity });
+    if (source > 0) entries.push({ label: "source", color: SOURCE_COLOR, count: source });
+    return entries;
+  }, [nodes]);
+
   // --- Force-graph plumbing (refs so hover/selection never trigger React re-renders) ---
   const fgRef = useRef<ForceGraphMethods<GNode, GLink> | undefined>(undefined);
   const observerRef = useRef<ResizeObserver | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
 
   const nodesByIdRef = useRef<Map<string, GNode>>(new Map());
+  const linksByKeyRef = useRef<Map<string, GLink>>(new Map());
   const neighborsRef = useRef<Map<string, Set<string>>>(new Map());
   const linksByNodeRef = useRef<Map<string, Set<GLink>>>(new Map());
   const hoverRef = useRef<string | null>(null);
@@ -232,13 +344,44 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
 
     const degree = new Map<string, number>();
     const links: GLink[] = [];
+    // Links get the same identity-preserving merge as nodes: the engine
+    // resolves source/target to node objects in place, and the field-only
+    // early return below keeps the old link objects alive — without reuse,
+    // refreshed detail/metadata would never reach the rendered links.
+    const byLinkKey = linksByKeyRef.current;
+    const incomingLinkKeys = new Set<string>();
     for (const edge of edges) {
       const s = edge.source;
       const t = edge.target;
       if (!s || !t) continue;
       degree.set(s, (degree.get(s) ?? 0) + 1);
       degree.set(t, (degree.get(t) ?? 0) + 1);
-      links.push({ ...edge } as GLink);
+      const key = str(edge.id, `${s}>${t}:${str(edge.edge_type, "")}`);
+      let link: GLink;
+      if (incomingLinkKeys.has(key)) {
+        // Duplicate key in one payload: fall back to a fresh object so the
+        // engine never sees the same link twice.
+        link = { ...edge } as GLink;
+      } else {
+        incomingLinkKeys.add(key);
+        const existing = byLinkKey.get(key);
+        if (existing) {
+          // Refresh payload fields but keep the engine-resolved endpoints.
+          const fresh = { ...edge } as Partial<GLink>;
+          delete fresh.source;
+          delete fresh.target;
+          Object.assign(existing, fresh);
+          link = existing;
+        } else {
+          link = { ...edge } as GLink;
+          byLinkKey.set(key, link);
+        }
+      }
+      link.__tone = edgeTone(edge);
+      links.push(link);
+    }
+    for (const key of Array.from(byLinkKey.keys())) {
+      if (!incomingLinkKeys.has(key)) byLinkKey.delete(key);
     }
 
     const outNodes: GNode[] = [];
@@ -252,12 +395,19 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
         byId.set(node.id, obj);
       }
       const rawLabel = str(node.label, node.id);
-      obj.__color = graphNodeColor(node);
-      obj.__r = nodeRadius(node);
-      // Cap the on-canvas label length (the previous renderer truncated to ~160px).
-      // The full text still shows in the hover tooltip and the inspector panel.
-      obj.__label = rawLabel.length > 30 ? `${rawLabel.slice(0, 29)}…` : rawLabel;
-      obj.__degree = degree.get(node.id) ?? 0;
+      const color = graphNodeColor(node);
+      const degreeValue = degree.get(node.id) ?? 0;
+      obj.__color = color;
+      obj.__rim = lighten(color, 0.26);
+      obj.__ring = withAlpha(color, 0.48);
+      obj.__r = nodeMarkSize(node, degreeValue);
+      // Cap the on-canvas label length (the previous renderer truncated to
+      // ~160px); truncate by code point so surrogate pairs never split. The
+      // full text still shows in the hover tooltip and the inspector panel.
+      const codePoints = Array.from(rawLabel);
+      obj.__label =
+        codePoints.length > 30 ? `${codePoints.slice(0, 29).join("")}…` : rawLabel;
+      obj.__degree = degreeValue;
       outNodes.push(obj);
     }
     // Drop nodes that left the result so the cache can't grow unbounded or revive stale positions.
@@ -347,19 +497,20 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
     if (!fg) return;
     const setForce = fg.d3Force.bind(fg) as (name: string, force?: unknown) => unknown;
     // Repulsion is the spread driver; cap its range so far nodes stay cheap.
-    setForce("charge", forceManyBody<GNode>().strength(-140).distanceMax(500).theta(0.9));
+    setForce("charge", forceManyBody<GNode>().strength(-122).distanceMax(460).theta(0.9));
     // Keep d3's degree-aware default link strength (1/min(deg)) so hubs don't explode — only set distance.
     const linkForce = fg.d3Force("link") as { distance?: (d: number) => unknown } | undefined;
-    linkForce?.distance?.(48);
+    linkForce?.distance?.(46);
     // Positioning forces toward origin (viewport centre) give a bounded, airy cloud.
     setForce("center", null);
-    setForce("x", forceX<GNode>(0).strength(0.06));
-    setForce("y", forceY<GNode>(0).strength(0.06));
+    setForce("x", forceX<GNode>(0).strength(0.07));
+    setForce("y", forceY<GNode>(0).strength(0.07));
+    // Extra padding gives hover labels room without forcing dense graphs apart.
     setForce(
       "collide",
       forceCollide<GNode>()
-        .radius((n) => (n.__r ?? 6) + 2)
-        .strength(0.85),
+        .radius((n) => (n.__r ?? 6) + 3)
+        .strength(0.82),
     );
     // The canvas dimensions changed, so re-fit once after this reheat settles
     // (onEngineStop is otherwise guarded against re-fitting and would leave the
@@ -380,57 +531,55 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
       const x = node.x ?? 0;
       const y = node.y ?? 0;
       const r = node.__r ?? 6;
-      const baseColor = node.__color ?? "#6ea8ff";
+      const baseColor = node.__color ?? MEMORY_DEFAULT;
       const selId = selectedIdRef.current;
       const isSel = selId != null && String(node.id) === selId;
       const hovActive = hoverRef.current != null;
+      const isHoverTarget = hoverRef.current === String(node.id);
       const inHot = highlightNodesRef.current.has(String(node.id));
       // The active selection stays fully lit even while hovering an unrelated node.
       const isHot = !hovActive || inHot || isSel;
 
       ctx.save();
-      ctx.globalAlpha = isHot ? 1 : 0.12;
-      const glow = hovActive && inHot;
-      if (glow) {
-        ctx.shadowColor = baseColor;
-        ctx.shadowBlur = (isSel ? 14 : 9) / globalScale;
-      }
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, TWO_PI);
+      ctx.translate(x, y);
+      ctx.globalAlpha = isHot ? 1 : 0.18;
+
+      // nodes flat-fill — at 13% alpha the highlight is invisible anyway.
+      traceNodeMark(ctx, node, r);
       ctx.fillStyle = baseColor;
       ctx.fill();
-      // Always clear the shadow before stroke/label so it can't bleed into the next node.
-      ctx.shadowBlur = 0;
-      ctx.shadowColor = "transparent";
-      ctx.lineWidth = 1.2 / globalScale;
-      ctx.strokeStyle = "rgba(15,23,32,0.9)";
+      ctx.lineWidth = 1 / globalScale;
+      ctx.strokeStyle = node.__rim ?? baseColor;
       ctx.stroke();
 
-      if (isSel) {
-        ctx.beginPath();
-        ctx.arc(x, y, r * 1.5, 0, TWO_PI);
-        ctx.lineWidth = 1.5 / globalScale;
-        ctx.strokeStyle = "#78f2b0";
+      if (node.pinned) {
+        traceNodeMark(ctx, node, r + 2.6 / globalScale);
+        ctx.lineWidth = 1 / globalScale;
+        ctx.strokeStyle = node.__ring ?? baseColor;
         ctx.stroke();
       }
 
-      const deg = node.__degree ?? 0;
-      const degreeBoost = Math.min(deg / 10, 1);
-      const effThreshold = 1.6 * (1 - 0.6 * degreeBoost); // hubs label sooner
-      const alwaysLabel = Boolean(node.pinned) || node.node_type === "entity";
-      let labelAlpha: number;
-      if (isSel || (isHot && hovActive)) labelAlpha = 1;
-      else if (alwaysLabel) labelAlpha = 1;
-      else labelAlpha = clamp((globalScale - effThreshold) / 0.8, 0, 1);
+      if (isSel) {
+        traceNodeMark(ctx, node, r + 4 / globalScale);
+        ctx.lineWidth = 1.25 / globalScale;
+        ctx.strokeStyle = ACCENT;
+        ctx.stroke();
+      }
 
-      if (labelAlpha > 0.02 && isHot && node.__label) {
-        const fontSize = 11 / globalScale;
-        ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+      if (isHoverTarget && node.__label) {
+        const fontSize = (node.node_type === "entity" ? 10.5 : 9.6) / globalScale;
+        const fontWeight = node.node_type === "entity" ? 500 : 400;
+        ctx.font = `${fontWeight} ${fontSize}px ${MONO_FONT}`;
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
-        ctx.globalAlpha = labelAlpha;
-        ctx.fillStyle = "#edf2f7";
-        ctx.fillText(node.__label, x, y + r + 2 / globalScale);
+        const top = r + 4.5 / globalScale;
+        ctx.globalAlpha = 1;
+        ctx.lineJoin = "round";
+        ctx.lineWidth = 3 / globalScale;
+        ctx.strokeStyle = "rgba(4, 8, 6, 0.9)";
+        ctx.strokeText(node.__label, 0, top);
+        ctx.fillStyle = node.node_type === "entity" ? "#dff7ea" : "rgba(211, 224, 217, 0.92)";
+        ctx.fillText(node.__label, 0, top);
       }
       ctx.restore();
     },
@@ -451,19 +600,19 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
   );
 
   const linkColorFn = useCallback((link: GLink) => {
-    if (hoverRef.current != null && !highlightLinksRef.current.has(link)) {
-      return "rgba(140,160,200,0.06)";
-    }
-    return edgeColor(link as unknown as MemoryGraphEdge);
+    const tone = link.__tone ?? "explicit";
+    if (highlightLinksRef.current.has(link)) return EDGE_HOT[tone];
+    if (hoverRef.current != null) return EDGE_DIMMED;
+    return LINK_BASE[tone];
   }, []);
 
   const linkWidthFn = useCallback((link: GLink) => {
-    const base = link.edge_type === "knowledge_relation" ? 1.5 : 0.85;
-    return highlightLinksRef.current.has(link) ? base + 1.5 : base;
+    const base = link.__tone === "relation" ? 1.05 : 0.75;
+    return highlightLinksRef.current.has(link) ? 1.6 : base;
   }, []);
 
   const linkCurvatureFn = useCallback(
-    (link: GLink) => (link.edge_type === "knowledge_relation" ? 0.12 : 0.04),
+    () => 0,
     [],
   );
 
@@ -502,7 +651,7 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
   const handleEngineStop = useCallback(() => {
     if (!didFitRef.current) {
       didFitRef.current = true;
-      fgRef.current?.zoomToFit(400, 40);
+      fgRef.current?.zoomToFit(400, 60);
     }
   }, []);
 
@@ -538,8 +687,8 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
               sx={{
                 height: 34,
                 borderRadius: 1,
-                border: "1px solid rgba(148, 163, 184, 0.26)",
-                background: "rgba(15, 23, 32, 0.72)",
+                border: "1px solid var(--surface-border)",
+                background: "rgba(7, 11, 9, 0.6)",
                 color: "text.primary",
                 px: 1,
                 font: "inherit",
@@ -572,15 +721,11 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
 
         <Stack direction={{ xs: "column", lg: "row" }} spacing={1.25}>
           <Box
+            className="memgraph-canvas"
             sx={{
-              position: "relative",
               minHeight: { xs: 520, lg: 640 },
               height: { xs: 520, lg: 640 },
               flex: 1,
-              border: "1px solid rgba(148, 163, 184, 0.16)",
-              borderRadius: 1,
-              background: "rgba(10, 14, 18, 0.72)",
-              overflow: "hidden",
             }}
           >
             {nodes.length === 0 && !graphQ.isFetching ? (
@@ -595,44 +740,37 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
               >
                 <Search size={22} />
                 <Typography variant="body2">No memories to show yet.</Typography>
+                <Typography
+                  variant="caption"
+                  sx={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "text.disabled" }}
+                >
+                  Captured memories and entities appear here as a graph.
+                </Typography>
               </Stack>
             ) : (
               <div ref={setWrap} style={{ position: "absolute", inset: 0 }}>
-                <Stack
-                  direction="row"
-                  spacing={1.25}
-                  sx={{
-                    position: "absolute",
-                    top: 8,
-                    right: 12,
-                    zIndex: 2,
-                    pointerEvents: "none",
-                    alignItems: "center",
-                  }}
-                >
-                  {GRAPH_LEGEND.map((entry) => (
-                    <Stack
-                      key={entry.label}
-                      direction="row"
-                      spacing={0.5}
-                      sx={{ alignItems: "center" }}
-                    >
+                {legendEntries.length > 0 ? (
+                  <Box className="memgraph-legend">
+                  {legendEntries.map((entry) => (
+                    <Box key={entry.label} className="memgraph-legend-item">
                       <Box
-                        sx={{
-                          width: 8,
-                          height: 8,
-                          borderRadius: "50%",
-                          background: entry.color,
-                        }}
+                        className="memgraph-legend-dot"
+                        sx={{ background: entry.color }}
                       />
-                      <Typography variant="caption" sx={{ color: "#b8c3cf", fontSize: 11 }}>
-                        {entry.label}
-                      </Typography>
-                    </Stack>
+                      <span>{entry.label}</span>
+                      <span className="memgraph-legend-count">{entry.count}</span>
+                    </Box>
                   ))}
-                </Stack>
+                  {(payload.semantic_edge_count ?? 0) > 0 ? (
+                    <Box className="memgraph-legend-item">
+                      <Box className="memgraph-legend-dash" />
+                      <span>Semantic</span>
+                    </Box>
+                  ) : null}
+                  </Box>
+                ) : null}
                 {size.width > 0 && size.height > 0 ? (
-                  <ForceGraph2D<MemoryNodeExtra, MemoryGraphEdge>
+                  <ForceGraph2D<MemoryNodeExtra, MemoryEdgeExtra>
                     ref={fgRef}
                     width={size.width}
                     height={size.height}
@@ -646,7 +784,6 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
                     linkColor={linkColorFn}
                     linkWidth={linkWidthFn}
                     linkCurvature={linkCurvatureFn}
-                    linkDirectionalParticles={0}
                     onNodeHover={handleNodeHover}
                     onNodeClick={handleNodeClick}
                     onLinkClick={handleLinkClick}
@@ -667,16 +804,38 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
           <Box
             sx={{
               width: { xs: "100%", lg: 340 },
-              border: "1px solid rgba(148, 163, 184, 0.16)",
-              borderRadius: 1,
-              p: 1.25,
+              border: "1px solid rgba(120, 242, 176, 0.14)",
+              borderRadius: "var(--surface-radius-lg)",
+              p: 1.5,
               alignSelf: "stretch",
-              background: "rgba(15, 23, 32, 0.52)",
+              background:
+                "linear-gradient(180deg, rgba(120, 242, 176, 0.04), transparent 42%), rgba(7, 11, 9, 0.6)",
             }}
           >
+            <Typography
+              sx={{
+                fontFamily: "var(--font-mono)",
+                fontSize: 10,
+                letterSpacing: "0.14em",
+                textTransform: "uppercase",
+                color: "rgba(120, 242, 176, 0.7)",
+                mb: 1,
+              }}
+            >
+              Inspector
+            </Typography>
             {selectedEdge ? (
               <Stack spacing={1}>
                 <Stack direction="row" spacing={0.75} sx={{ alignItems: "center" }}>
+                  <Box
+                    sx={{
+                      width: 14,
+                      height: 2,
+                      borderRadius: 1,
+                      flex: "none",
+                      background: EDGE_HOT[edgeTone(selectedEdge) ?? "explicit"],
+                    }}
+                  />
                   <Typography variant="subtitle2" sx={{ fontWeight: 700, flex: 1 }}>
                     {memoryGraphEdgeLabel(selectedEdge)}
                   </Typography>
@@ -746,6 +905,16 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
             ) : selectedNode ? (
               <Stack spacing={1}>
                 <Stack direction="row" spacing={0.75} sx={{ alignItems: "center" }}>
+                  <Box
+                    sx={{
+                      width: 9,
+                      height: 9,
+                      borderRadius: str(selectedNode.node_type, "memory") === "entity" ? "2px" : "1px",
+                      flex: "none",
+                      background: graphNodeColor(selectedNode),
+                      transform: str(selectedNode.node_type, "memory") === "memory" ? "rotate(45deg)" : "none",
+                    }}
+                  />
                   <Typography variant="subtitle2" sx={{ fontWeight: 700, flex: 1 }}>
                     {str(selectedNode.label, selectedNode.id)}
                   </Typography>
@@ -759,6 +928,13 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
                     variant="outlined"
                     label={humanizeMachineLabel(str(selectedNode.node_type, "memory"))}
                   />
+                  {selectedNode.category ? (
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={humanizeMachineLabel(selectedNode.category)}
+                    />
+                  ) : null}
                   {selectedNode.status ? (
                     <Chip
                       size="small"
@@ -770,19 +946,72 @@ export default function MemoryGraphPanel({ focusMemoryId }: MemoryGraphPanelProp
                 <Typography variant="body2" sx={{ color: "text.secondary" }}>
                   {str(selectedNode.detail, "No detail recorded.")}
                 </Typography>
+                {Number.isFinite(selectedNode.confidence ?? NaN) ? (
+                  <Stack spacing={0.5}>
+                    <Stack direction="row" sx={{ justifyContent: "space-between" }}>
+                      <Typography
+                        variant="caption"
+                        sx={{ fontFamily: "var(--font-mono)", fontSize: 10.5, color: "text.secondary" }}
+                      >
+                        confidence
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        sx={{ fontFamily: "var(--font-mono)", fontSize: 10.5 }}
+                      >
+                        {Math.round(num(selectedNode.confidence, 0) * 100)}%
+                        {num(selectedNode.support_count, 0) > 0
+                          ? ` · ×${num(selectedNode.support_count, 0)}`
+                          : ""}
+                      </Typography>
+                    </Stack>
+                    <Box sx={{ height: 3, borderRadius: 2, background: "rgba(255, 255, 255, 0.07)" }}>
+                      <Box
+                        sx={{
+                          height: "100%",
+                          borderRadius: 2,
+                          width: `${Math.round(clamp(num(selectedNode.confidence, 0), 0, 1) * 100)}%`,
+                          // Same confidence bands as the Current Memory list.
+                          background:
+                            num(selectedNode.confidence, 0) >= 0.85
+                              ? ACCENT
+                              : num(selectedNode.confidence, 0) >= 0.6
+                                ? "#ffbe63"
+                                : "#ff9b9b",
+                        }}
+                      />
+                    </Box>
+                  </Stack>
+                ) : null}
                 <Typography
                   variant="caption"
-                  sx={{ color: "text.secondary", overflowWrap: "anywhere" }}
+                  sx={{
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 10,
+                    color: "text.disabled",
+                    overflowWrap: "anywhere",
+                  }}
                 >
                   {selectedNode.id}
                 </Typography>
               </Stack>
             ) : (
-              <Stack spacing={1} sx={{ color: "text.secondary" }}>
-                <Typography variant="subtitle2" sx={{ color: "text.primary" }}>
-                  Selection
-                </Typography>
-                <Typography variant="body2">No selection.</Typography>
+              <Stack spacing={1.25} sx={{ color: "text.secondary" }}>
+                <Typography variant="body2">Click a node or link to inspect it.</Typography>
+                <Divider sx={{ borderColor: "rgba(255, 255, 255, 0.06)" }} />
+                <Stack spacing={0.6}>
+                  {[
+                    ["hover", "spotlight neighbors"],
+                    ["click", "inspect details"],
+                    ["drag", "reposition node"],
+                    ["scroll", "zoom canvas"],
+                  ].map(([key, hint]) => (
+                    <Stack key={key} direction="row" spacing={1}>
+                      <span className="memgraph-hint-key">{key}</span>
+                      <span className="memgraph-hint-value">{hint}</span>
+                    </Stack>
+                  ))}
+                </Stack>
               </Stack>
             )}
           </Box>

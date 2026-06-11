@@ -467,6 +467,28 @@ fn memory_capture_signal_from_scores(
     }
 }
 
+fn memory_capture_embedding_decision(
+    top: &ScoredCanonical,
+    margin: f32,
+    memory_capture: InboundMemoryCaptureSignal,
+) -> SecurityEmbeddingDecision {
+    SecurityEmbeddingDecision {
+        decision: InboundClassificationDecision {
+            verdict: IntentVerdict::AllowWithUncheckedTag {
+                reason: "embedding memory-capture signal".to_string(),
+                intent_kinds: vec!["memory-capture-candidate".to_string()],
+            },
+            memory_capture,
+            advisory: top.advisory.clone(),
+            model_response: None,
+        },
+        category: top.category,
+        score: top.score,
+        margin,
+        concept: top.concept.to_string(),
+    }
+}
+
 fn embedding_security_quick_accepts(category: SecurityCategory, score: f32, margin: f32) -> bool {
     match category {
         SecurityCategory::SecurityBlock => score >= FAST_BLOCK_MIN_SCORE,
@@ -671,6 +693,13 @@ pub async fn classify_inbound_embedding_fast(
     // relying on an embedding-only decision. Security blocks remain eligible
     // for quick handling.
     if context_present && !matches!(top.category, SecurityCategory::SecurityBlock) {
+        if memory_capture.should_capture {
+            return Ok(Some(memory_capture_embedding_decision(
+                top,
+                margin,
+                memory_capture,
+            )));
+        }
         return Ok(None);
     }
 
@@ -709,9 +738,6 @@ fn unaccepted_embedding_fallback(
     memory_capture: InboundMemoryCaptureSignal,
     context_present: bool,
 ) -> Option<SecurityEmbeddingDecision> {
-    if context_present && !matches!(top.category, SecurityCategory::SecurityBlock) {
-        return None;
-    }
     if top.category == SecurityCategory::SecurityBlock && top.score >= FAST_BORDERLINE_BLOCK_SCORE {
         return Some(SecurityEmbeddingDecision {
             decision: block_decision(&top.concept),
@@ -720,6 +746,16 @@ fn unaccepted_embedding_fallback(
             margin,
             concept: top.concept.to_string(),
         });
+    }
+    if memory_capture.should_capture {
+        return Some(memory_capture_embedding_decision(
+            top,
+            margin,
+            memory_capture,
+        ));
+    }
+    if context_present && !matches!(top.category, SecurityCategory::SecurityBlock) {
+        return None;
     }
     if matches!(
         top.category,
@@ -731,7 +767,6 @@ fn unaccepted_embedding_fallback(
     if matches!(top.category, SecurityCategory::ToolUse)
         && top.score >= FAST_UNCHECKED_CLASSIFICATION_MIN_SCORE
     {
-        let _ = memory_capture;
         return None;
     }
     if top.category == SecurityCategory::Conversational
@@ -739,7 +774,7 @@ fn unaccepted_embedding_fallback(
     {
         return None;
     }
-    let _ = (margin, memory_capture);
+    let _ = margin;
     None
 }
 
@@ -774,6 +809,30 @@ mod tests {
         ]);
 
         assert!(!signal.should_capture);
+    }
+
+    #[test]
+    fn unaccepted_embedding_fallback_preserves_memory_capture_signal() {
+        let top = ScoredCanonical {
+            category: SecurityCategory::ToolUse,
+            concept: "live_state_or_external_lookup".to_string(),
+            score: FAST_UNCHECKED_CLASSIFICATION_MIN_SCORE + 0.05,
+            advisory: InboundAdvisorySignal::default(),
+        };
+        let memory_capture = InboundMemoryCaptureSignal {
+            should_capture: true,
+            confidence: Some(0.82),
+            reason: Some("durable_user_preference_constraint".to_string()),
+        };
+
+        let decision = unaccepted_embedding_fallback(&top, 0.01, memory_capture, true)
+            .expect("memory signal should survive inconclusive route classification");
+
+        assert!(decision.decision.memory_capture.should_capture);
+        assert!(matches!(
+            decision.decision.verdict,
+            IntentVerdict::AllowWithUncheckedTag { .. }
+        ));
     }
 
     #[test]

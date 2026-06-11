@@ -124,11 +124,20 @@ test("source summary explains cached sources when synthesis failed", () => {
   assert.doesNotMatch(latestDevelopmentSummary(item), /pending/i);
 });
 
-test("activity without displayable opportunities keeps polling during enrichment", () => {
+test("pending planner verdicts keep polling until the backend settles", () => {
   assert.equal(
     shouldPollForOpportunitySettlement({
-      sourceCounts: { main_chat: 2, memory: 0 },
-      opportunityCount: 0,
+      pendingPlanCount: 3,
+      planningActive: false,
+      queuedSourceCheckCount: 0,
+      refreshRunning: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldPollForOpportunitySettlement({
+      pendingPlanCount: 0,
+      planningActive: true,
       queuedSourceCheckCount: 0,
       refreshRunning: false,
     }),
@@ -136,20 +145,11 @@ test("activity without displayable opportunities keeps polling during enrichment
   );
 });
 
-test("opportunity settlement polling stops when already handled elsewhere", () => {
+test("opportunity settlement polling follows real backend pending state", () => {
   assert.equal(
     shouldPollForOpportunitySettlement({
-      sourceCounts: { main_chat: 2 },
-      opportunityCount: 1,
-      queuedSourceCheckCount: 0,
-      refreshRunning: false,
-    }),
-    false,
-  );
-  assert.equal(
-    shouldPollForOpportunitySettlement({
-      sourceCounts: { main_chat: 2 },
-      opportunityCount: 1,
+      pendingPlanCount: 0,
+      planningActive: false,
       queuedSourceCheckCount: 1,
       refreshRunning: false,
     }),
@@ -157,8 +157,8 @@ test("opportunity settlement polling stops when already handled elsewhere", () =
   );
   assert.equal(
     shouldPollForOpportunitySettlement({
-      sourceCounts: { main_chat: 2 },
-      opportunityCount: 0,
+      pendingPlanCount: 2,
+      planningActive: true,
       queuedSourceCheckCount: 0,
       refreshRunning: true,
     }),
@@ -166,8 +166,8 @@ test("opportunity settlement polling stops when already handled elsewhere", () =
   );
   assert.equal(
     shouldPollForOpportunitySettlement({
-      sourceCounts: { main_chat: 0, memory: 0 },
-      opportunityCount: 0,
+      pendingPlanCount: 0,
+      planningActive: false,
       queuedSourceCheckCount: 0,
       refreshRunning: false,
     }),

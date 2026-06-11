@@ -280,6 +280,7 @@ pub(super) fn build_request_execution_hints(
         execution_surface: surface,
         direct_user_intent,
         recorded_user_message_id: None,
+        memory_capture: Default::default(),
         attachments_present: false,
         attachments: Vec::new(),
         execution_profile: None,

@@ -397,6 +397,109 @@ fn pdf_text_literal_degrades_common_unicode_punctuation() {
     assert_eq!(text, "LocalAgent-Hermes \"agent\"...");
 }
 
+#[test]
+
+fn generated_pdf_extracts_text_from_pages_after_first() {
+    let content = (0..100)
+        .map(|index| format!("line {index:03} generated PDF pagination sentinel"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let pdf_bytes = ActionRuntime::generate_simple_pdf_bytes("Long Report", &content, "report");
+    let extracted = pdf_extract::extract_text_from_mem(&pdf_bytes)
+        .expect("generated PDF text should be extractable");
+
+    assert!(extracted.contains("line 000 generated PDF pagination sentinel"));
+    assert!(extracted.contains("line 099 generated PDF pagination sentinel"));
+}
+
+#[test]
+
+fn generated_pdf_normalizes_common_markdown_for_display() {
+    let pdf_bytes = ActionRuntime::generate_simple_pdf_bytes(
+        "Report",
+        "# Main Heading\n\nThis has **bold text** and [a citation](https://example.test/report).\n\n---",
+        "report",
+    );
+    let extracted = pdf_extract::extract_text_from_mem(&pdf_bytes)
+        .expect("generated PDF text should be extractable");
+
+    assert!(extracted.contains("Main Heading"));
+    assert!(extracted.contains("bold text"));
+    assert!(extracted.contains("a citation (https://example.test/report)"));
+    assert!(!extracted.contains("# Main Heading"));
+    assert!(!extracted.contains("**bold text**"));
+    assert!(!extracted.contains("[a citation]"));
+}
+
+#[test]
+
+fn generated_pdf_renders_agentark_chart_blocks_as_graphics() {
+    let content = r#"Intro paragraph.
+
+```agentark-chart
+{
+  "title": "Electricity Demand Growth",
+  "type": "bar",
+  "x": "scenario",
+  "series": [{"key": "gigawatts", "name": "GW"}],
+  "data": [
+    {"scenario": "Current", "gigawatts": 25},
+    {"scenario": "2030 forecast", "gigawatts": 80}
+  ]
+}
+```
+
+After chart conclusion."#;
+
+    let pdf_bytes = ActionRuntime::generate_simple_pdf_bytes("Chart Report", content, "report");
+    let raw_pdf = String::from_utf8_lossy(&pdf_bytes);
+    let extracted = pdf_extract::extract_text_from_mem(&pdf_bytes)
+        .expect("generated PDF text should be extractable");
+
+    assert!(extracted.contains("Electricity Demand Growth"));
+    assert!(extracted.contains("Current"));
+    assert!(extracted.contains("2030 forecast"));
+    assert!(extracted.contains("After chart conclusion."));
+    assert!(!extracted.contains("agentark-chart"));
+    assert!(!extracted.contains("\"data\""));
+    assert!(
+        raw_pdf.contains(" re\nf") || raw_pdf.contains(" re\nS"),
+        "chart should be drawn with PDF vector rectangle operators"
+    );
+}
+
+#[test]
+
+fn generated_pdf_auto_charts_research_tables_without_chart_fences() {
+    let content = r#"# Research: AI infrastructure sustainability
+
+## Semiconductor Supply-Chain Footprint
+
+| Emissions Scope | Share of Total | Reduction Strategy |
+|---|---|---|
+| Scope 1 direct fugitive gases | ~16% | PFC abatement |
+| Scope 2 purchased electricity | ~32% | Renewable procurement |
+| Scope 3 supply chain | ~52% | Supplier disclosure |
+
+The report continues after the table."#;
+
+    let pdf_bytes = ActionRuntime::generate_simple_pdf_bytes("Deep Research", content, "report");
+    let raw_pdf = String::from_utf8_lossy(&pdf_bytes);
+    let extracted = pdf_extract::extract_text_from_mem(&pdf_bytes)
+        .expect("generated PDF text should be extractable");
+
+    assert!(extracted.contains("Visual Summary"));
+    assert!(extracted.contains("Semiconductor Supply-Chain Footprint"));
+    assert!(extracted.contains("Scope 3 supply chain"));
+    assert!(extracted.contains("The report continues after the table."));
+    assert!(!extracted.contains("agentark-chart"));
+    assert!(
+        raw_pdf.contains(" re\nf") || raw_pdf.contains(" re\nS"),
+        "auto chart should be drawn with PDF vector rectangle operators"
+    );
+}
+
 #[tokio::test]
 
 async fn file_write_completion_reports_metadata_only_documents() {

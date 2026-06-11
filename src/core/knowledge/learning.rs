@@ -314,6 +314,144 @@ fn negative_lesson_summary(run: &experience_run::Model, tool_names: &[String]) -
     )
 }
 
+fn operation_contract_content(shape: &str, negative: bool) -> String {
+    if negative {
+        format!(
+            "Before executing a similar operation, inspect the operation contract for {} requirements; fill inferable non-secret fields in the expected shape, ask only for missing non-secret fields, and route credentials through the secure setup path.",
+            shape
+        )
+    } else {
+        format!(
+            "For similar operations, the reusable procedure is to satisfy the {} contract shape before calling the tool and preserve secure credential handling.",
+            shape
+        )
+    }
+    .chars()
+    .take(360)
+    .collect::<String>()
+}
+
+async fn upsert_operation_contract_experience_item(
+    storage: &Storage,
+    run: &experience_run::Model,
+    event: &crate::core::self_evolve::opportunities::contract_events::ContractEvent,
+    negative: bool,
+) -> Result<String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let kind = if negative { "lesson" } else { "procedure" };
+    let scope = "global";
+    let project_id = None;
+    let conversation_id = None;
+    let shape = event.operation_descriptor.trim();
+    let shape = if shape.is_empty() {
+        format!("{} {}", event.surface, event.contract_kind)
+    } else {
+        shape.to_string()
+    };
+    let identity =
+        crate::core::self_evolve::opportunities::contract_events::contract_event_identity(event);
+    let normalized_key = format!(
+        "operation_contract::{}::{}",
+        event.contract_kind,
+        short_hash(&[identity.as_str()])
+    );
+    let id = build_item_id(kind, scope, project_id, conversation_id, &normalized_key);
+    let existing = storage.get_experience_item(&id).await?;
+    let support_count = existing
+        .as_ref()
+        .map(|item| item.support_count.saturating_add(1))
+        .unwrap_or(1);
+    let contradiction_count = existing
+        .as_ref()
+        .map(|item| item.contradiction_count)
+        .unwrap_or_default();
+    let confidence = existing
+        .as_ref()
+        .map(|item| (item.confidence + 0.06).min(0.96))
+        .unwrap_or(if negative { 0.68 } else { 0.72 });
+    let mut support_run_ids = existing
+        .as_ref()
+        .and_then(|item| item.metadata.get("support_run_ids"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !support_run_ids
+        .iter()
+        .any(|value| value.as_str() == Some(run.id.as_str()))
+    {
+        support_run_ids.push(Value::String(run.id.clone()));
+    }
+    support_run_ids.truncate(12);
+    storage
+        .upsert_experience_item(&experience_item::Model {
+            id: id.clone(),
+            kind: kind.to_string(),
+            scope: scope.to_string(),
+            project_id: None,
+            conversation_id: None,
+            title: if negative {
+                "Operation contract repair lesson".to_string()
+            } else {
+                "Operation contract procedure".to_string()
+            },
+            content: operation_contract_content(&shape, negative),
+            normalized_key,
+            confidence,
+            support_count,
+            contradiction_count,
+            status: "active".to_string(),
+            metadata: json!({
+                "operation_contract_learning": true,
+                "operation_shape": shape,
+                "contract_kind": event.contract_kind,
+                "schema_hash": event.schema_hash,
+                "surface": event.surface,
+                "requires_user_secret": event.requires_user_secret,
+                "recoverable_by_model": event.recoverable_by_model,
+                "support_run_ids": support_run_ids,
+                "source_run_id": run.id,
+                "task_type": run.task_type,
+                "polarity": if negative { "negative" } else { "positive" },
+                "confidence": confidence,
+            }),
+            last_supported_at: Some(now.clone()),
+            last_contradicted_at: existing
+                .as_ref()
+                .and_then(|item| item.last_contradicted_at.clone()),
+            created_at: existing
+                .as_ref()
+                .map(|item| item.created_at.clone())
+                .unwrap_or_else(|| now.clone()),
+            updated_at: now.clone(),
+            embedding: existing.as_ref().and_then(|item| item.embedding.clone()),
+        })
+        .await?;
+    storage
+        .upsert_experience_edge(&experience_edge::Model {
+            id: stable_id(
+                "edge",
+                &[run.id.as_str(), "operation_contract", id.as_str()],
+            ),
+            source_ref: id.clone(),
+            source_kind: "experience_item".to_string(),
+            target_ref: run.id.clone(),
+            target_kind: "experience_run".to_string(),
+            edge_type: "derived_from".to_string(),
+            weight: confidence.clamp(0.25, 1.0),
+            source_run_id: Some(run.id.clone()),
+            metadata: json!({
+                "operation_contract_learning": true,
+                "contract_kind": event.contract_kind,
+                "success_state": run.success_state,
+                "correction_state": run.correction_state,
+            }),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await?;
+    Ok(id)
+}
+
 fn experience_run_learning_signal_bool(run: &experience_run::Model, key: &str) -> bool {
     run.metadata
         .get("learning_signal")
@@ -511,6 +649,22 @@ async fn consolidate_run(storage: &Storage, run: &experience_run::Model) -> Resu
             procedure.last_contradicted_at = Some(now.clone());
             procedure.updated_at = now.clone();
             storage.upsert_experience_item(&procedure).await?;
+        }
+    }
+    let contract_events =
+        crate::core::self_evolve::opportunities::contract_events::contract_events_from_metadata(
+            &run.metadata,
+        );
+    for event in &contract_events {
+        let negative_event = is_negative || event.result_state == "failed";
+        if let Err(error) =
+            upsert_operation_contract_experience_item(storage, run, event, negative_event).await
+        {
+            tracing::warn!(
+                error = %error,
+                run_id = %run.id,
+                "operation-contract learning consolidation skipped one event"
+            );
         }
     }
     let kind = if is_negative { "lesson" } else { "procedure" };

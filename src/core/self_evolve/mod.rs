@@ -1,6 +1,7 @@
-//! Self-Evolve: policy-first behavior evolution engine
+//! Self-Evolve: behavior evolution engine
 //!
-//! Default path evolves runtime strategy/policy with benchmark + lineage + gates.
+//! Active paths evolve prompt, specialist-prompt, strategy, and GEPA surfaces
+//! with benchmark + lineage + gates.
 //! Source-code mutation is intentionally not available on user machines.
 
 use anyhow::Result;
@@ -10,8 +11,8 @@ use std::path::Path;
 pub mod deployment_cadence;
 #[path = "optimizer/gepa_bridge.rs"]
 pub mod gepa_bridge;
-#[path = "policies/policy_evolution.rs"]
-pub mod policy_evolution;
+#[path = "opportunities/mod.rs"]
+pub mod opportunities;
 #[path = "gates/promotion_gate.rs"]
 pub mod promotion_gate;
 #[path = "prompts/prompt_evolution.rs"]
@@ -31,9 +32,6 @@ pub mod specialist_prompt_evolution;
 #[path = "runtime/strategy_runtime.rs"]
 pub mod strategy_runtime;
 
-pub use policy_evolution::{
-    PolicyEvolutionConfig, PolicyEvolutionEngine, ROUTING_COMPLEXITY_POLICY_KEY,
-};
 pub use promotion_gate::{PromotionGateReason, PromotionGateReport};
 pub use prompt_evolution::{
     PromptBundleDiffSummary, PromptBundleProfile, PromptEvolutionConfig, PromptEvolutionEngine,

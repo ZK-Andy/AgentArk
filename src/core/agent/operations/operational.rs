@@ -360,6 +360,20 @@ Rules:\n\
         }
     }
 
+    /// Canary bucketing seed. Conversation-stable when a conversation exists
+    /// (a conversation stays in one canary arm for its whole life, so A/B
+    /// comparison measures consistent slices); falls back to the message-text
+    /// seed for one-shot callers without a conversation.
+    pub(super) fn prompt_seed_for_conversation_or_message(
+        conversation_id: Option<&str>,
+        message: &str,
+    ) -> String {
+        match conversation_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(conversation_id) => format!("conversation:{}", conversation_id),
+            None => Self::prompt_seed_for_message(message),
+        }
+    }
+
     pub(crate) async fn run_heuristic_reflection_pass(
         &self,
     ) -> Result<HeuristicReflectionPassStats> {
@@ -477,6 +491,15 @@ Rules:\n\
         &self,
         message: &str,
     ) -> crate::core::self_evolve::PromptBundleProfile {
+        self.active_prompt_bundle_for_conversation_message(None, message)
+            .await
+    }
+
+    pub(crate) async fn active_prompt_bundle_for_conversation_message(
+        &self,
+        conversation_id: Option<&str>,
+        message: &str,
+    ) -> crate::core::self_evolve::PromptBundleProfile {
         let mut selected = self
             .load_prompt_bundle_by_key(crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_KEY)
             .await
@@ -495,7 +518,7 @@ Rules:\n\
             {
                 if state.enabled
                     && crate::core::self_evolve::strategy_runtime::should_use_canary(
-                        &Self::prompt_seed_for_message(message),
+                        &Self::prompt_seed_for_conversation_or_message(conversation_id, message),
                         state.rollout_percent,
                     )
                 {
@@ -518,6 +541,15 @@ Rules:\n\
         &self,
         message: &str,
     ) -> crate::core::self_evolve::SpecialistPromptBundleProfile {
+        self.active_specialist_prompt_bundle_for_conversation_message(None, message)
+            .await
+    }
+
+    pub(crate) async fn active_specialist_prompt_bundle_for_conversation_message(
+        &self,
+        conversation_id: Option<&str>,
+        message: &str,
+    ) -> crate::core::self_evolve::SpecialistPromptBundleProfile {
         let mut selected = self
             .load_specialist_prompt_bundle_by_key(
                 crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
@@ -538,7 +570,7 @@ Rules:\n\
             {
                 if state.enabled
                     && crate::core::self_evolve::strategy_runtime::should_use_canary(
-                        &Self::prompt_seed_for_message(message),
+                        &Self::prompt_seed_for_conversation_or_message(conversation_id, message),
                         state.rollout_percent,
                     )
                 {
@@ -562,6 +594,15 @@ Rules:\n\
         &self,
         message: &str,
     ) -> crate::core::model::prompt_fragments::PromptFragmentBundleProfile {
+        self.active_prompt_fragment_bundle_for_conversation_message(None, message)
+            .await
+    }
+
+    pub(crate) async fn active_prompt_fragment_bundle_for_conversation_message(
+        &self,
+        conversation_id: Option<&str>,
+        message: &str,
+    ) -> crate::core::model::prompt_fragments::PromptFragmentBundleProfile {
         let mut selected = self
             .load_prompt_fragment_bundle_by_key(
                 crate::core::model::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
@@ -582,7 +623,7 @@ Rules:\n\
             {
                 if state.enabled
                     && crate::core::self_evolve::strategy_runtime::should_use_canary(
-                        &Self::prompt_seed_for_message(message),
+                        &Self::prompt_seed_for_conversation_or_message(conversation_id, message),
                         state.rollout_percent,
                     )
                 {
@@ -605,6 +646,33 @@ Rules:\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canary_seed_is_stable_across_messages_within_a_conversation() {
+        let seed_a =
+            Agent::prompt_seed_for_conversation_or_message(Some("conv-1"), "first question");
+        let seed_b = Agent::prompt_seed_for_conversation_or_message(
+            Some("conv-1"),
+            "totally different follow-up, new wording, same conversation",
+        );
+        assert_eq!(seed_a, seed_b);
+
+        let other =
+            Agent::prompt_seed_for_conversation_or_message(Some("conv-2"), "first question");
+        assert_ne!(seed_a, other);
+    }
+
+    #[test]
+    fn canary_seed_falls_back_to_message_text_without_a_conversation() {
+        assert_eq!(
+            Agent::prompt_seed_for_conversation_or_message(None, "Hello THERE"),
+            Agent::prompt_seed_for_message("Hello THERE"),
+        );
+        assert_eq!(
+            Agent::prompt_seed_for_conversation_or_message(Some("   "), "Hello"),
+            Agent::prompt_seed_for_message("Hello"),
+        );
+    }
 
     #[test]
     fn operational_reference_ids_are_not_secret_redacted() {

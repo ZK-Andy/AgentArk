@@ -739,6 +739,27 @@ mod memory_control_tests {
     }
 
     #[test]
+    fn health_finding_ack_event_id_is_stable_and_project_scoped() {
+        let global = arkmemory_health_finding_ack_event_id(None, "embedding:memory-1");
+        assert_eq!(
+            global,
+            arkmemory_stable_event_id(&[
+                "health_finding_acknowledged",
+                "global",
+                "embedding:memory-1"
+            ])
+        );
+        assert_ne!(
+            global,
+            arkmemory_health_finding_ack_event_id(Some("project-a"), "embedding:memory-1")
+        );
+        assert_eq!(
+            arkmemory_health_finding_ack_event_id(Some(" project-a "), "embedding:memory-1"),
+            arkmemory_health_finding_ack_event_id(Some("project-a"), "embedding:memory-1")
+        );
+    }
+
+    #[test]
     fn expired_memory_cleanup_candidate_requires_temporary_metadata_expiry() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
             .expect("valid timestamp")
@@ -824,6 +845,65 @@ mod memory_control_tests {
             arkmemory_capture_event_semantic_key(&event),
             "semantic-source-key"
         );
+    }
+
+    #[test]
+    fn capture_source_resolution_key_ignores_casing_and_spacing() {
+        let context = MemoryCaptureReviewContext {
+            source_semantic_text: "  My   NAME is Indrani  ".to_string(),
+            source_redactions: Vec::new(),
+            status: "failed".to_string(),
+            capture_kind: "user_fact_memory_capture".to_string(),
+            channel: "web".to_string(),
+            last_error_code: Some("schema_recovery_failed".to_string()),
+        };
+        let resolved = MemoryCaptureReviewContext {
+            source_semantic_text: "my name is indrani".to_string(),
+            status: "applied".to_string(),
+            last_error_code: None,
+            ..context.clone()
+        };
+
+        assert_eq!(
+            arkmemory_capture_source_resolution_key(&context),
+            arkmemory_capture_source_resolution_key(&resolved)
+        );
+    }
+
+    #[test]
+    fn newer_resolved_capture_suppresses_stale_failed_finding() {
+        let failed_event = memory_capture_event_with_status("failed");
+        let failed_context = MemoryCaptureReviewContext {
+            source_semantic_text: "I prefer concise answers".to_string(),
+            source_redactions: Vec::new(),
+            status: "failed".to_string(),
+            capture_kind: failed_event.capture_kind.clone(),
+            channel: failed_event.channel.clone(),
+            last_error_code: Some("schema_recovery_failed".to_string()),
+        };
+        let resolved_event = crate::storage::memory_capture_event::Model {
+            id: "memory-capture-applied".to_string(),
+            status: "applied".to_string(),
+            created_at: "2026-05-03T00:01:00Z".to_string(),
+            updated_at: "2026-05-03T00:01:00Z".to_string(),
+            ..failed_event.clone()
+        };
+        let resolved_context = MemoryCaptureReviewContext {
+            status: "applied".to_string(),
+            last_error_code: None,
+            ..failed_context.clone()
+        };
+        let resolved = [ResolvedCaptureSource {
+            event: resolved_event,
+            source_key: arkmemory_capture_source_resolution_key(&resolved_context)
+                .expect("resolved source key"),
+        }];
+
+        assert!(arkmemory_failed_capture_is_resolved_by_newer_success(
+            &failed_event,
+            &failed_context,
+            &resolved
+        ));
     }
 
     #[test]
@@ -1380,6 +1460,8 @@ pub(super) const ARKMEMORY_PENDING_CAPTURE_STATUSES: &[&str] =
     &["pending_consolidation", "processing_deferred", "processing"];
 pub(super) const ARKMEMORY_FAILED_CAPTURE_STATUSES: &[&str] =
     &["failed", "failed_deferred", "rejected_sensitive_input"];
+pub(super) const ARKMEMORY_RESOLVED_CAPTURE_STATUSES: &[&str] =
+    &["applied", "queued_review", "noop", "rejected_sensitive"];
 pub(super) const ARKMEMORY_REVIEWED_CAPTURE_STATUSES: &[&str] = &[
     "reviewed_failed_capture",
     "reviewed_false_positive_capture",
@@ -1414,6 +1496,12 @@ struct MemoryCaptureReviewContext {
     capture_kind: String,
     channel: String,
     last_error_code: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedCaptureSource {
+    event: crate::storage::memory_capture_event::Model,
+    source_key: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1650,6 +1738,106 @@ fn arkmemory_capture_review_context_embedding_text(context: &MemoryCaptureReview
         context.channel,
         context.last_error_code.as_deref().unwrap_or("")
     )
+}
+
+fn arkmemory_canonical_capture_source_text(raw: &str) -> Option<String> {
+    let normalized = crate::security::normalize_for_analysis(raw);
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let canonical = collapsed.trim().to_ascii_lowercase();
+    (!canonical.is_empty()).then_some(canonical)
+}
+
+fn arkmemory_capture_source_resolution_key(context: &MemoryCaptureReviewContext) -> Option<String> {
+    let source = arkmemory_canonical_capture_source_text(&context.source_semantic_text)?;
+    let mut redactions = context
+        .source_redactions
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    redactions.sort();
+    redactions.dedup();
+    let redaction_key = redactions.join("|");
+    Some(arkmemory_stable_event_id(&[
+        "capture_source_resolution",
+        context.capture_kind.trim(),
+        context.channel.trim(),
+        redaction_key.as_str(),
+        source.as_str(),
+    ]))
+}
+
+fn arkmemory_capture_event_sort_time(
+    event: &crate::storage::memory_capture_event::Model,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    arkmemory_capture_event_timestamp(&event.updated_at)
+        .or_else(|| arkmemory_capture_event_timestamp(&event.created_at))
+}
+
+fn arkmemory_capture_event_is_newer_than(
+    candidate: &crate::storage::memory_capture_event::Model,
+    previous: &crate::storage::memory_capture_event::Model,
+) -> bool {
+    match (
+        arkmemory_capture_event_sort_time(candidate),
+        arkmemory_capture_event_sort_time(previous),
+    ) {
+        (Some(candidate_time), Some(previous_time)) => candidate_time > previous_time,
+        _ => {
+            candidate.updated_at > previous.updated_at || candidate.created_at > previous.created_at
+        }
+    }
+}
+
+fn arkmemory_capture_event_is_resolved_success(
+    event: &crate::storage::memory_capture_event::Model,
+) -> bool {
+    ARKMEMORY_RESOLVED_CAPTURE_STATUSES.contains(&event.status.trim())
+}
+
+fn arkmemory_failed_capture_is_resolved_by_newer_success(
+    failed_event: &crate::storage::memory_capture_event::Model,
+    failed_context: &MemoryCaptureReviewContext,
+    resolved_sources: &[ResolvedCaptureSource],
+) -> bool {
+    let Some(failed_source_key) = arkmemory_capture_source_resolution_key(failed_context) else {
+        return false;
+    };
+    resolved_sources.iter().any(|resolved| {
+        resolved.event.id != failed_event.id
+            && resolved.source_key == failed_source_key
+            && arkmemory_capture_event_is_resolved_success(&resolved.event)
+            && arkmemory_capture_event_is_newer_than(&resolved.event, failed_event)
+    })
+}
+
+async fn arkmemory_resolved_capture_sources(
+    storage: &crate::storage::Storage,
+    project_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<ResolvedCaptureSource>> {
+    let mut resolved = Vec::new();
+    for event in storage
+        .list_memory_capture_events_by_statuses(
+            ARKMEMORY_RESOLVED_CAPTURE_STATUSES,
+            project_id,
+            limit,
+        )
+        .await?
+    {
+        if !arkmemory_capture_event_is_resolved_success(&event) {
+            continue;
+        }
+        let Some(context) = arkmemory_capture_review_context(storage, &event).await else {
+            continue;
+        };
+        let Some(source_key) = arkmemory_capture_source_resolution_key(&context) else {
+            continue;
+        };
+        resolved.push(ResolvedCaptureSource { event, source_key });
+    }
+    Ok(resolved)
 }
 
 fn arkmemory_extract_json_object(text: &str) -> Option<serde_json::Value> {
@@ -2710,6 +2898,27 @@ pub(super) fn arkmemory_stable_event_id(parts: &[&str]) -> String {
     format!("arkmemory-event-{}", hex::encode(hasher.finalize()))
 }
 
+fn arkmemory_health_finding_ack_event_id(project_id: Option<&str>, finding_id: &str) -> String {
+    let project_part = project_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("global");
+    arkmemory_stable_event_id(&[
+        "health_finding_acknowledged",
+        project_part,
+        finding_id.trim(),
+    ])
+}
+
+async fn arkmemory_health_finding_is_acknowledged(
+    storage: &crate::storage::Storage,
+    project_id: Option<&str>,
+    finding_id: &str,
+) -> Result<bool> {
+    let event_id = arkmemory_health_finding_ack_event_id(project_id, finding_id);
+    Ok(storage.get_recall_event(&event_id).await?.is_some())
+}
+
 pub(super) fn arkmemory_candidate_payload(
     candidate: &crate::storage::learning_candidate::Model,
     replay_gate: Option<&crate::core::self_evolve::replay_gate::CandidateReplayGateResult>,
@@ -3177,6 +3386,8 @@ pub(super) async fn arkmemory_build_health_findings(
         .await
         .map(|events| arkmemory_capture_review_pattern_summary(&events))
         .unwrap_or_default();
+    let resolved_capture_sources =
+        arkmemory_resolved_capture_sources(storage, project_id, 200).await?;
     for event in storage
         .list_memory_capture_events_by_statuses(
             ARKMEMORY_FAILED_CAPTURE_STATUSES,
@@ -3185,6 +3396,15 @@ pub(super) async fn arkmemory_build_health_findings(
         )
         .await?
     {
+        if let Some(review_context) = arkmemory_capture_review_context(storage, &event).await {
+            if arkmemory_failed_capture_is_resolved_by_newer_success(
+                &event,
+                &review_context,
+                &resolved_capture_sources,
+            ) {
+                continue;
+            }
+        }
         let pattern_key = arkmemory_capture_event_failure_signature_key(&event);
         let review_pattern = reviewed_capture_patterns.get(&pattern_key);
         let source_context = arkmemory_capture_source_context(storage, &event).await;
@@ -3225,29 +3445,42 @@ pub(super) async fn arkmemory_build_health_findings(
         .list_active_experience_items(&["personal_fact", "constraint"], project_id, None, limit)
         .await?;
     for item in memory_items {
+        let item_id = item.id.clone();
+        let item_title = item.title.clone();
+        let item_updated_at = item.updated_at.clone();
         if item.embedding.is_none() {
-            findings.push(serde_json::json!({
-                "id": format!("embedding:{}", item.id),
-                "kind": "missing_embedding",
-                "severity": "warning",
-                "memory_id": item.id,
-                "title": item.title,
-                "detail": "This memory has no semantic vector yet, so retrieval and dedup quality can be lower until it is refreshed.",
-                "action": "refresh_on_next_write",
-                "created_at": item.updated_at,
-            }));
+            let finding_id = format!("embedding:{}", item_id);
+            if !arkmemory_health_finding_is_acknowledged(storage, project_id, &finding_id).await? {
+                findings.push(serde_json::json!({
+                    "id": finding_id,
+                    "kind": "missing_embedding",
+                    "severity": "info",
+                    "memory_id": item_id.clone(),
+                    "title": item_title.clone(),
+                    "detail": "This memory has no semantic vector yet, so retrieval and dedup quality can be lower until it is refreshed.",
+                    "action": "refresh_on_next_write",
+                    "dismissible": true,
+                    "review_action_label": "Dismiss",
+                    "created_at": item_updated_at.clone(),
+                }));
+            }
         }
         if item.confidence < 0.55 {
-            findings.push(serde_json::json!({
-                "id": format!("confidence:{}", item.id),
-                "kind": "low_confidence",
-                "severity": "review",
-                "memory_id": item.id,
-                "title": item.title,
-                "detail": "This memory is below the normal confidence floor and should be reviewed before it shapes future answers.",
-                "action": "review_memory",
-                "created_at": item.updated_at,
-            }));
+            let finding_id = format!("confidence:{}", item_id);
+            if !arkmemory_health_finding_is_acknowledged(storage, project_id, &finding_id).await? {
+                findings.push(serde_json::json!({
+                    "id": finding_id,
+                    "kind": "low_confidence",
+                    "severity": "review",
+                    "memory_id": item_id.clone(),
+                    "title": item_title.clone(),
+                    "detail": "This memory is below the normal confidence floor and should be reviewed before it shapes future answers.",
+                    "action": "review_memory",
+                    "dismissible": true,
+                    "review_action_label": "Dismiss",
+                    "created_at": item_updated_at.clone(),
+                }));
+            }
         }
         let evidence_links = storage
             .list_memory_evidence_links_for_memory(&item.id, project_id, 16)
@@ -6401,9 +6634,7 @@ pub(super) async fn arkmemory_apply_health(
         } else {
             None
         };
-        let project_part = project_id.unwrap_or("global");
-        let event_id =
-            arkmemory_stable_event_id(&["health_finding_acknowledged", project_part, id.as_str()]);
+        let event_id = arkmemory_health_finding_ack_event_id(project_id, id.as_str());
         arkmemory_record_event_once(
             &agent.storage,
             event_id,

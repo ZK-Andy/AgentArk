@@ -16,23 +16,23 @@ import {
   Stack,
   Switch,
   Tab,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
   Tabs,
   Typography,
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import ReactECharts from "echarts-for-react";
 import { api } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
-import EvolveHero from "../arkEvolve/EvolveHero";
 import {
   asRecord,
   errMessage,
@@ -42,7 +42,6 @@ import {
   toBool,
   type JsonRecord,
 } from "./pageHelpers";
-import { humanTs } from "./workspaceUiBits";
 import {
   DEVELOPER_MODE_EVENT,
   EVOLUTION_DEV_QUERY_LIMIT,
@@ -52,14 +51,10 @@ import {
   REFRESH_MS,
 } from "./workspaceCore";
 import {
-  buildEvolutionEvidenceCards,
-  buildEvolutionFocusCaseLabel,
   canonicalSkillIdentifier,
   clampPercent,
-  EVOLUTION_PAGE_TABS,
   evolutionExperimentStatusText,
   evolutionGainLabel,
-  evolutionPatternStatusExplanation,
   evolutionSurfaceAudienceLabel,
   evolutionSurfaceBenefit,
   evolutionSurfaceStableSummary,
@@ -67,27 +62,12 @@ import {
   evolutionTraceIdHint,
   EvolutionReviewEvidenceStrip,
   EvolutionRolloutBar,
-  EvolutionStatStrip,
-  type EvolutionPageTab,
-  type EvolutionPatternCard,
-  formatTraceDuration,
   learningCandidateReviewEvidence,
-  learningEvidenceStatusColor,
-  normalizeLearningEvidenceState,
   percentageLabel,
   promptCanaryActionSummary,
   promptCanaryReviewEvidence,
   ratioPercent,
-  skillEvolutionActionLabel,
-  skillEvolutionAlertSeverity,
-  skillEvolutionChipColor,
-  skillEvolutionMetricRows,
-  skillReviewEvidence,
   stringList,
-  summarizeEvolutionPatternRun,
-  summarizeLearningEvidenceTools,
-  titleCaseLabel,
-  uniqueNonEmptyStrings,
 } from "./traceEvolutionHelpers";
 import {
   formatTimestampForHumans,
@@ -98,6 +78,28 @@ import {
   promptHoldoutCaseLabel,
   promptHoldoutFootprintRows,
 } from "./evolutionReviewQueueHelpers";
+import {
+  aggregateRealizedSavings,
+  expectedBenefitDimensions,
+  filterEvolveCandidatesForTab,
+  measuredLedgerView,
+  evolveCandidateConfidence,
+  evolveCandidateEvidenceView,
+  evolveCandidateKindLabel,
+  evolveCandidateRiskSummary,
+  evolveCandidateSegmentChipLabel,
+  evolveCandidateStatus,
+  evolveCandidateStatusPresentation,
+  evolveCandidateVerdictReason,
+  pageSlice,
+  realizedLedgerView,
+  realizedSavingsHeadline,
+  snapshotHistoryRows,
+  stableRecommendationView,
+  formatPercent01,
+  formatSignedPoints,
+  type EvolutionCandidateTab,
+} from "./evolutionCandidateHelpers";
 
 type ReadinessDialogState = {
   title: string;
@@ -305,43 +307,6 @@ function formatPromptLifecycleReason(reason: string): string {
     .replace(/\s+\./g, ".");
 }
 
-function backgroundImprovementReason(reason: string) {
-  const blockerMessage = promptLifecycleBlockerMessage(reason);
-  if (blockerMessage) return blockerMessage;
-  switch (reason) {
-    case "learning_paused":
-      return "Evolve is paused.";
-    case "gepa_disabled":
-      return "GEPA background optimizer is disabled.";
-    case "model_or_runtime_not_ready":
-      return "Finish model setup before background improvements can start.";
-    case "budget_paused":
-      return "Paused by the daily cost guardrail.";
-    case "work_already_scheduled":
-      return "A background improvement is already scheduled.";
-    case "waiting_for_quiet_time":
-      return "Waiting until AgentArk is quiet.";
-    case "cooling_down":
-      return "The last check ran recently.";
-    case "waiting_for_more_evidence":
-      return "Collecting more completed work before the next check.";
-    case "queued_for_quiet_time":
-      return "Queued and waiting for quiet time.";
-    case "blocked":
-      return "The last background improvement was blocked by readiness or budget gates.";
-    case "failed":
-      return "The last background improvement failed.";
-    case "timed_out":
-      return "The last background improvement timed out.";
-    case "retry_pending":
-      return "A failed background improvement will retry after AgentArk is quiet.";
-    case "completed":
-      return "The last background improvement completed.";
-    default:
-      return reason ? "Background improvement is waiting." : "Watching recent work.";
-  }
-}
-
 type ExperimentSurfaceItem = {
   key: string;
   name: string;
@@ -494,23 +459,6 @@ function findVersionMetric(rows: JsonRecord[], version: string): JsonRecord | nu
   );
 }
 
-function findMatchingCanarySafetyEvent(
-  rows: JsonRecord[],
-  item: ExperimentSurfaceItem,
-): JsonRecord | null {
-  const candidate = item.candidate.trim();
-  const baseline = item.baseline.trim();
-  if (!candidate || candidate === "-") return null;
-  return (
-    rows.find((row) => {
-      const rowCandidate = str(row.candidate_version, "").trim();
-      if (rowCandidate !== candidate) return false;
-      const rowBaseline = str(row.baseline_version, "").trim();
-      return !baseline || baseline === "-" || !rowBaseline || rowBaseline === baseline;
-    }) ?? null
-  );
-}
-
 function formatSampleCount(value: number | null): string {
   if (value == null) return "No samples yet";
   const count = Math.max(0, Math.round(value));
@@ -528,13 +476,49 @@ function formatApproxMoney(value: number | null): string {
   return `$${value.toFixed(4)}`;
 }
 
+function escapeTooltipText(value: unknown): string {
+  return str(value, "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function graphKindLabel(kind: string): string {
+  if (kind === "experience_run") return "Run evidence";
+  if (kind === "experience_item") return "Learned item";
+  if (kind === "procedural_pattern") return "Reusable pattern";
+  if (kind === "learning_candidate") return "Review candidate";
+  return humanizeStatusLabel(kind || "node");
+}
+
+function experienceGraphNodeTitle(node: JsonRecord): string {
+  const kind = str(node.kind, "");
+  const status = str(node.status, "").trim();
+  if (kind === "experience_run") {
+    return status ? `${humanizeStatusLabel(status)} run` : "Run evidence";
+  }
+  return str(node.label || node.name, graphKindLabel(kind));
+}
+
+function graphDetailRows(rows: Array<[string, unknown]>): string {
+  return rows
+    .map(([label, value]) => {
+      const text = str(value, "").trim();
+      return text ? `${escapeTooltipText(label)}: ${escapeTooltipText(text)}` : "";
+    })
+    .filter(Boolean)
+    .join("<br/>");
+}
+
 function formatEstimatedTokenSavings(value: number | null): string {
   if (value == null || value <= 0) return "Pending";
   return `~${Math.round(value).toLocaleString()} tokens`;
 }
 
 function promptOptimizationRankLabel(index: number): string {
-  return index === 0 ? "Top opportunity" : `Priority #${index + 1}`;
+  return index === 0 ? "Top candidate" : `Priority #${index + 1}`;
 }
 
 function promptOptimizationShareLabel(opportunity: JsonRecord): string {
@@ -1007,6 +991,830 @@ function EvolveStat({
   );
 }
 
+function workbenchToneChipColor(
+  tone: "default" | "good" | "warn" | "info",
+): "default" | "success" | "warning" | "info" {
+  if (tone === "good") return "success";
+  if (tone === "warn") return "warning";
+  if (tone === "info") return "info";
+  return "default";
+}
+
+function workbenchToneAccent(tone: "default" | "good" | "warn" | "info"): string {
+  if (tone === "good") return "#78f2b0";
+  if (tone === "warn") return "#ffbe63";
+  if (tone === "info") return "#9cc0ff";
+  return "var(--text-faint)";
+}
+
+type EvolveCandidateStatTile = {
+  key: string;
+  label: string;
+  value: string;
+  helper?: string;
+  tone: "default" | "good" | "warn" | "info";
+  accent?: string;
+  unit?: string;
+  progress?: number | null;
+};
+
+/**
+ * Row tiles: measured deltas once the canary judge has real numbers,
+ * expected-benefit dimensions before that, plus a confidence gauge.
+ */
+function evolveCandidateRowTiles(row: JsonRecord): EvolveCandidateStatTile[] {
+  const measured = measuredLedgerView(row);
+  const tiles: EvolveCandidateStatTile[] =
+    measured && measured.deltas.length > 0
+      ? measured.deltas.slice(0, 3).map((delta) => ({
+          key: `measured-${delta.key}`,
+          label: delta.label,
+          value: delta.delta,
+          helper: `${delta.baseline} -> ${delta.candidate} measured`,
+          tone:
+            delta.improved == null ? "info" : delta.improved ? "good" : "warn",
+          accent: delta.accent,
+          unit: delta.unit,
+        }))
+      : expectedBenefitDimensions(row)
+          .slice(0, 3)
+          .map((dimension) => ({
+            key: `expected-${dimension.key}`,
+            label: dimension.label,
+            value: dimension.value,
+            helper: dimension.helper,
+            tone: dimension.tone,
+            accent: dimension.accent,
+            unit: dimension.unit,
+          }));
+  if (tiles.length === 0) {
+    const status = evolveCandidateStatus(row);
+    tiles.push(
+      status === "approved" || status === "testing"
+        ? {
+            key: "measuring",
+            label: "Measured",
+            value: "Measuring on real usage",
+            helper: "Numbers appear after enough judged runs",
+            tone: "info",
+          }
+        : {
+            key: "unquantified",
+            label: "Expected",
+            value: "Not quantified",
+            helper: "No dimension evidence recorded",
+            tone: "default",
+          },
+    );
+  }
+  const confidence = evolveCandidateConfidence(row);
+  if (confidence != null) {
+    tiles.push({
+      key: "confidence",
+      label: "Confidence",
+      value: formatPercent01(confidence),
+      helper: "Evidence weight",
+      tone: "info",
+      accent: formatPercent01(confidence),
+      progress: confidence,
+    });
+  }
+  return tiles.slice(0, 4);
+}
+
+/** Compact mono pager shared by the workbench lists. */
+const ListPager = memo(function ListPager({
+  page,
+  pageCount,
+  rangeStart,
+  rangeEnd,
+  total,
+  noun,
+  onPage,
+}: {
+  page: number;
+  pageCount: number;
+  rangeStart: number;
+  rangeEnd: number;
+  total: number;
+  noun: string;
+  onPage: (page: number) => void;
+}) {
+  if (pageCount <= 1) return null;
+  const navButtonSx = {
+    minWidth: 28,
+    height: 28,
+    px: 0.75,
+    borderRadius: "7px",
+    fontFamily: "var(--font-mono)",
+    fontSize: "0.95rem",
+    color: "var(--text-faint)",
+    border: "1px solid transparent",
+    "&:hover": {
+      borderColor: "var(--ui-rgba-145-170-205-120)",
+      color: "#78f2b0",
+    },
+    "&.Mui-disabled": { opacity: 0.35 },
+  } as const;
+  return (
+    <Box
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 2,
+        mt: 1.5,
+        pt: 1,
+        borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+      }}
+    >
+      <Typography
+        sx={{
+          fontFamily: "var(--font-mono)",
+          fontSize: "0.66rem",
+          color: "var(--text-faint)",
+          letterSpacing: 0.04,
+        }}
+      >
+        {`Showing ${rangeStart}–${rangeEnd} of ${total} ${noun}`}
+      </Typography>
+      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+        <Button
+          size="small"
+          variant="text"
+          disabled={page <= 0}
+          onClick={() => onPage(Math.max(0, page - 1))}
+          sx={navButtonSx}
+          aria-label="Previous page"
+        >
+          ‹
+        </Button>
+        {Array.from({ length: pageCount }).map((_unused, i) => (
+          <Button
+            key={`list-page-${i}`}
+            size="small"
+            variant="text"
+            onClick={() => onPage(i)}
+            sx={{
+              minWidth: 30,
+              height: 28,
+              px: 0.75,
+              borderRadius: "7px",
+              fontFamily: "var(--font-mono)",
+              fontSize: "0.72rem",
+              color: i === page ? "#78f2b0" : "var(--text-secondary)",
+              border:
+                i === page
+                  ? "1px solid rgba(120, 242, 176, 0.4)"
+                  : "1px solid transparent",
+              background:
+                i === page ? "rgba(120, 242, 176, 0.08)" : "transparent",
+              "&:hover": {
+                borderColor:
+                  i === page
+                    ? "rgba(120, 242, 176, 0.4)"
+                    : "var(--ui-rgba-145-170-205-120)",
+                color: i === page ? "#78f2b0" : "var(--text-primary)",
+              },
+            }}
+          >
+            {i + 1}
+          </Button>
+        ))}
+        <Button
+          size="small"
+          variant="text"
+          disabled={page >= pageCount - 1}
+          onClick={() => onPage(Math.min(pageCount - 1, page + 1))}
+          sx={navButtonSx}
+          aria-label="Next page"
+        >
+          ›
+        </Button>
+      </Box>
+    </Box>
+  );
+});
+
+/**
+ * One ArkEvolve candidate as a clickable row: status, title, segment
+ * chip, multidimensional stat tiles, risk rail. Opens the shared detail
+ * dialog via the stable `onOpen` callback.
+ */
+const EvolveCandidateRow = memo(function EvolveCandidateRow({
+  row,
+  onOpen,
+}: {
+  row: JsonRecord;
+  onOpen: (id: string) => void;
+}) {
+  const id = str(row.id, "");
+  const status = evolveCandidateStatus(row);
+  const statusView = evolveCandidateStatusPresentation(status);
+  const statusAccent = workbenchToneAccent(statusView.tone);
+  const kindLabel = evolveCandidateKindLabel(row);
+  const tiles = evolveCandidateRowTiles(row);
+  const realized = realizedLedgerView(row);
+  const riskSummary = evolveCandidateRiskSummary(row);
+  const decidedAt = str(row.decided_at, "").trim();
+  const footLine =
+    status === "deployed" && realized?.promotedAt
+      ? `Live since ${formatTimestampForHumans(realized.promotedAt).label}`
+      : (status === "dismissed" || status === "reverted") && decidedAt
+        ? `Decided ${formatTimestampForHumans(decidedAt).label}`
+        : "";
+  return (
+    <Box
+      component="button"
+      type="button"
+      onClick={() => onOpen(id)}
+      sx={{
+        width: "100%",
+        border: "1px solid rgba(255, 255, 255, 0.075)",
+        borderLeft: `3px solid ${statusAccent}`,
+        borderRadius: 1.5,
+        background:
+          "linear-gradient(135deg, rgba(20, 20, 22, 0.62), rgba(9, 9, 10, 0.42))",
+        px: 1.9,
+        py: 1.4,
+        appearance: "none",
+        color: "inherit",
+        fontFamily: "inherit",
+        textAlign: "left",
+        cursor: id ? "pointer" : "default",
+        display: "flex",
+        flexDirection: { xs: "column", md: "row" },
+        alignItems: { xs: "stretch", md: "flex-start" },
+        gap: 1.5,
+        transition: "background 140ms ease, border-color 140ms ease",
+        "&:hover": {
+          background:
+            "linear-gradient(135deg, rgba(26, 26, 28, 0.70), rgba(12, 12, 13, 0.48))",
+          borderColor: "rgba(255, 255, 255, 0.11)",
+          borderLeftColor: statusAccent,
+        },
+        "&:focus-visible": {
+          outline: "2px solid rgba(120, 242, 176, 0.8)",
+          outlineOffset: 2,
+        },
+      }}
+    >
+      <Box
+        sx={{
+          flex: 1,
+          minWidth: 0,
+          display: "flex",
+          flexDirection: "column",
+          gap: 0.45,
+        }}
+      >
+        <Box
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: 0.85,
+            minWidth: 0,
+            flexWrap: "wrap",
+          }}
+        >
+          <Box
+            component="span"
+            sx={{
+              color: statusAccent,
+              fontFamily: "var(--font-mono)",
+              fontSize: "0.6rem",
+              fontWeight: 700,
+              textTransform: "uppercase",
+              letterSpacing: 0.12,
+              lineHeight: 1.2,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {statusView.label}
+          </Box>
+          <Box
+            component="span"
+            sx={{ color: "var(--text-faint)", fontSize: "0.6rem", opacity: 0.7 }}
+          >
+            ·
+          </Box>
+          <Box
+            component="span"
+            sx={{
+              color: "var(--text-faint)",
+              fontFamily: "var(--font-mono)",
+              fontSize: "0.6rem",
+              textTransform: "uppercase",
+              letterSpacing: 0.1,
+              lineHeight: 1.2,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {kindLabel}
+          </Box>
+        </Box>
+        <Typography
+          variant="subtitle2"
+          sx={{
+            color: "#e8f4ff",
+            fontWeight: 600,
+            fontSize: "0.92rem",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            lineHeight: 1.3,
+          }}
+        >
+          {str(row.title, "Evolve candidate")}
+        </Typography>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          useFlexGap
+          sx={{ alignItems: "center", flexWrap: "wrap" }}
+        >
+          <Chip
+            size="small"
+            variant="outlined"
+            label={evolveCandidateSegmentChipLabel(row)}
+            sx={{
+              maxWidth: 320,
+              fontSize: "0.66rem",
+              color: "var(--text-secondary)",
+              borderColor: "var(--ui-rgba-145-170-205-120)",
+            }}
+          />
+          {footLine ? (
+            <Typography
+              variant="caption"
+              sx={{ color: "var(--text-faint)", fontSize: "0.66rem" }}
+            >
+              {footLine}
+            </Typography>
+          ) : null}
+        </Stack>
+      </Box>
+      <Box
+        sx={{
+          display: "flex",
+          alignItems: "flex-start",
+          flexWrap: { xs: "wrap", md: "nowrap" },
+          gap: { xs: 1.75, md: 0 },
+          width: { xs: "100%", md: "min(46%, 540px)" },
+          flex: { md: "0 0 min(46%, 540px)" },
+          alignSelf: "center",
+        }}
+      >
+        {tiles.map((tile, tileIdx) => (
+          <EvolveStat
+            key={`${id}-${tile.key}`}
+            label={tile.label}
+            value={tile.value}
+            helper={tile.helper}
+            tone={tile.tone}
+            accent={tile.accent}
+            unit={tile.unit}
+            progress={tile.progress}
+            divider={tileIdx > 0}
+          />
+        ))}
+      </Box>
+      {riskSummary ? (
+        <Box
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: 0.65,
+            flex: "0 0 auto",
+            alignSelf: "center",
+            pr: 1,
+            maxWidth: 180,
+          }}
+          title={riskSummary}
+        >
+          <Box
+            sx={{
+              width: 7,
+              height: 7,
+              borderRadius: "50%",
+              background: statusAccent,
+              flex: "0 0 auto",
+            }}
+          />
+          <Typography
+            variant="caption"
+            sx={{
+              color: "var(--text-secondary)",
+              fontFamily: "var(--font-mono)",
+              fontSize: "0.62rem",
+              letterSpacing: 0.12,
+              textTransform: "uppercase",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {riskSummary}
+          </Typography>
+        </Box>
+      ) : null}
+      <Box
+        aria-hidden
+        sx={{
+          flex: "0 0 auto",
+          alignSelf: "center",
+          color: "var(--text-faint)",
+          fontFamily: "var(--font-mono)",
+          fontSize: "1.1rem",
+          lineHeight: 1,
+          pr: 0.5,
+        }}
+      >
+        ›
+      </Box>
+    </Box>
+  );
+});
+
+/**
+ * Shared detail dialog for ArkEvolve candidates: description, evidence,
+ * verdict reason, measured/realized ledger, and approve/dismiss actions for
+ * surfaced rows.
+ */
+const EvolveCandidateDialog = memo(function EvolveCandidateDialog({
+  row,
+  actionPending,
+  onClose,
+  onAction,
+}: {
+  row: JsonRecord | null;
+  actionPending: boolean;
+  onClose: () => void;
+  onAction: (payload: JsonRecord, message: string, confirm?: string) => void;
+}) {
+  if (!row) return null;
+  const id = str(row.id, "");
+  const status = evolveCandidateStatus(row);
+  const statusView = evolveCandidateStatusPresentation(status);
+  const kindLabel = evolveCandidateKindLabel(row);
+  const evidence = evolveCandidateEvidenceView(row);
+  const benefit = expectedBenefitDimensions(row);
+  const confidence = evolveCandidateConfidence(row);
+  const measured = measuredLedgerView(row);
+  const realized = realizedLedgerView(row);
+  const verdictReason = evolveCandidateVerdictReason(row);
+  const riskSummary = evolveCandidateRiskSummary(row);
+  const description = str(row.description, "").trim();
+  const evidenceTiles: EvolveCandidateStatTile[] = [];
+  if (evidence.sampleRuns != null) {
+    evidenceTiles.push({
+      key: "samples",
+      label: "Sample runs",
+      value: `${Math.round(evidence.sampleRuns).toLocaleString()}`,
+      helper:
+        evidence.windowRuns != null
+          ? `of ${Math.round(evidence.windowRuns).toLocaleString()} in window`
+          : "Matched in the usage window",
+      tone: "info",
+      accent: Math.round(evidence.sampleRuns).toLocaleString(),
+      unit: "runs",
+    });
+  }
+  if (evidence.correctedRate != null) {
+    evidenceTiles.push({
+      key: "corrected",
+      label: "Corrected",
+      value: formatPercent01(evidence.correctedRate, 1),
+      helper:
+        evidence.correctedRuns != null
+          ? `${Math.round(evidence.correctedRuns).toLocaleString()} corrected runs`
+          : "Honest-label corrections",
+      tone: "warn",
+      accent: formatPercent01(evidence.correctedRate, 1),
+    });
+  }
+  if (evidence.avgTokensPerTurn != null) {
+    evidenceTiles.push({
+      key: "tokens",
+      label: "Tokens/turn",
+      value: Math.round(evidence.avgTokensPerTurn).toLocaleString(),
+      helper: "Average in this segment",
+      tone: "info",
+      accent: Math.round(evidence.avgTokensPerTurn).toLocaleString(),
+      unit: "tok",
+    });
+  }
+  if (evidence.p95WallMs != null) {
+    evidenceTiles.push({
+      key: "wall",
+      label: "p95 wall",
+      value: `${Math.round(evidence.p95WallMs).toLocaleString()} ms`,
+      helper: "Slowest turns in this segment",
+      tone: "info",
+      accent: `${Math.round(evidence.p95WallMs / 1000)}`,
+      unit: "s p95",
+    });
+  }
+  if (evidence.avgCostMicrousd != null) {
+    evidenceTiles.push({
+      key: "cost",
+      label: "Cost/turn",
+      value: `$${(evidence.avgCostMicrousd / 1_000_000).toFixed(4)}`,
+      helper: "Average measured cost",
+      tone: "info",
+      accent: `$${(evidence.avgCostMicrousd / 1_000_000).toFixed(4)}`,
+    });
+  }
+  const canDecide = status === "surfaced" && !!id;
+  return (
+    <Dialog open onClose={onClose} maxWidth="md" fullWidth>
+      <DialogTitle>
+        <Stack spacing={0.6}>
+          <Stack
+            direction={{ xs: "column", md: "row" }}
+            spacing={1}
+            sx={{
+              alignItems: { xs: "flex-start", md: "center" },
+              justifyContent: "space-between",
+            }}
+          >
+            <Typography variant="h6" sx={{ color: "#e8f4ff", fontWeight: 750 }}>
+              {str(row.title, "Evolve candidate")}
+            </Typography>
+            <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap" }}>
+              <Chip
+                size="small"
+                color={workbenchToneChipColor(statusView.tone)}
+                label={statusView.label}
+              />
+              <Chip
+                size="small"
+                variant="outlined"
+                label={kindLabel}
+              />
+              <Chip
+                size="small"
+                variant="outlined"
+                label={str(row.target_surface, "prompt")}
+              />
+            </Stack>
+          </Stack>
+          <Typography variant="body2" sx={{ color: "text.secondary" }}>
+            {evolveCandidateSegmentChipLabel(row)}
+          </Typography>
+        </Stack>
+      </DialogTitle>
+      <DialogContent>
+        <Stack spacing={1.5} sx={{ mt: 0.5 }}>
+          {description ? (
+            <Typography variant="body2" sx={{ color: "#fff8ed" }}>
+              {description}
+            </Typography>
+          ) : null}
+          {evidenceTiles.length > 0 ? (
+            <Box
+              sx={{
+                display: "flex",
+                flexWrap: { xs: "wrap", md: "nowrap" },
+                gap: { xs: 1.5, md: 0 },
+                border: "1px solid var(--ui-rgba-145-170-205-120)",
+                borderRadius: 1,
+                bgcolor: "rgba(8, 14, 24, 0.34)",
+                px: 1.5,
+                py: 1.1,
+              }}
+            >
+              {evidenceTiles.map((tile, tileIdx) => (
+                <EvolveStat
+                  key={`evidence-${tile.key}`}
+                  label={tile.label}
+                  value={tile.value}
+                  helper={tile.helper}
+                  tone={tile.tone}
+                  accent={tile.accent}
+                  unit={tile.unit}
+                  divider={tileIdx > 0}
+                />
+              ))}
+            </Box>
+          ) : (
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              ArkEvolve has not recorded aggregate evidence for this segment
+              yet.
+            </Typography>
+          )}
+          {benefit.length > 0 ? (
+            <Box>
+              <Typography
+                variant="caption"
+                sx={{
+                  color: "var(--text-faint)",
+                  display: "block",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "0.62rem",
+                  textTransform: "uppercase",
+                  letterSpacing: 0.12,
+                  mb: 0.6,
+                }}
+              >
+                Expected benefit
+              </Typography>
+              <Box
+                sx={{
+                  display: "flex",
+                  flexWrap: { xs: "wrap", md: "nowrap" },
+                  gap: { xs: 1.5, md: 0 },
+                }}
+              >
+                {benefit.map((dimension, dimensionIdx) => (
+                  <EvolveStat
+                    key={`benefit-${dimension.key}`}
+                    label={dimension.label}
+                    value={dimension.value}
+                    helper={dimension.helper}
+                    tone={dimension.tone}
+                    accent={dimension.accent}
+                    unit={dimension.unit}
+                    divider={dimensionIdx > 0}
+                  />
+                ))}
+                {confidence != null ? (
+                  <EvolveStat
+                    label="Confidence"
+                    value={formatPercent01(confidence)}
+                    helper="Evidence weight"
+                    tone="info"
+                    accent={formatPercent01(confidence)}
+                    progress={confidence}
+                    divider={benefit.length > 0}
+                  />
+                ) : null}
+              </Box>
+            </Box>
+          ) : null}
+          {measured && measured.deltas.length > 0 ? (
+            <Box>
+              <Typography
+                variant="caption"
+                sx={{
+                  color: "var(--text-faint)",
+                  display: "block",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "0.62rem",
+                  textTransform: "uppercase",
+                  letterSpacing: 0.12,
+                  mb: 0.6,
+                }}
+              >
+                Measured on real usage
+              </Typography>
+              <Box
+                sx={{
+                  display: "flex",
+                  flexWrap: { xs: "wrap", md: "nowrap" },
+                  gap: { xs: 1.5, md: 0 },
+                  border: "1px solid var(--ui-rgba-145-170-205-120)",
+                  borderRadius: 1,
+                  bgcolor: "rgba(8, 14, 24, 0.34)",
+                  px: 1.5,
+                  py: 1.1,
+                }}
+              >
+                {measured.deltas.map((delta, deltaIdx) => (
+                  <EvolveStat
+                    key={`measured-${delta.key}`}
+                    label={delta.label}
+                    value={delta.delta}
+                    helper={`${delta.baseline} -> ${delta.candidate}`}
+                    tone={
+                      delta.improved == null
+                        ? "info"
+                        : delta.improved
+                          ? "good"
+                          : "warn"
+                    }
+                    accent={delta.accent}
+                    unit={delta.unit}
+                    divider={deltaIdx > 0}
+                  />
+                ))}
+              </Box>
+              <Typography
+                variant="caption"
+                sx={{ color: "text.secondary", display: "block", mt: 0.6 }}
+              >
+                {[
+                  measured.baselineSamples != null &&
+                  measured.candidateSamples != null
+                    ? `${Math.round(measured.baselineSamples).toLocaleString()} baseline vs ${Math.round(measured.candidateSamples).toLocaleString()} candidate runs`
+                    : "",
+                  measured.wins != null && measured.losses != null
+                    ? `${measured.wins} wins / ${measured.losses} losses`
+                    : "",
+                  measured.pValue != null
+                    ? `p=${measured.pValue.toFixed(3)}`
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </Typography>
+            </Box>
+          ) : status === "approved" || status === "testing" ? (
+            <Alert severity="info" sx={{ borderRadius: 1 }}>
+              ArkEvolve is measuring this change on real usage. Baseline vs
+              candidate numbers appear after enough judged runs.
+            </Alert>
+          ) : null}
+          {realized ? (
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Promoted to stable{" "}
+              {realized.promotedAt
+                ? formatTimestampForHumans(realized.promotedAt).label
+                : ""}
+              {realized.candidateVersion
+                ? ` · version ${realized.candidateVersion}`
+                : ""}
+              {realized.surface ? ` · ${realized.surface} surface` : ""}
+            </Typography>
+          ) : null}
+          {verdictReason ? (
+            <Box
+              sx={{
+                p: 1.1,
+                border: "1px solid var(--ui-rgba-145-170-205-120)",
+                borderLeft: "3px solid #9cc0ff",
+                borderRadius: 1,
+                background: "rgba(8, 14, 24, 0.36)",
+              }}
+            >
+              <Typography
+                variant="caption"
+                sx={{
+                  color: "#9cc0ff",
+                  display: "block",
+                  fontFamily: "var(--font-mono)",
+                  fontWeight: 700,
+                  letterSpacing: 0.12,
+                  textTransform: "uppercase",
+                  mb: 0.35,
+                }}
+              >
+                Why ArkEvolve surfaced this
+              </Typography>
+              <Typography variant="body2" sx={{ color: "#e8f4ff" }}>
+                {verdictReason}
+              </Typography>
+            </Box>
+          ) : null}
+          {riskSummary ? (
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Risk: {riskSummary}
+            </Typography>
+          ) : null}
+          {evidence.exampleRunCount > 0 ? (
+            <Typography variant="caption" sx={{ color: "var(--text-faint)" }}>
+              Backed by {evidence.exampleRunCount} example run
+              {evidence.exampleRunCount === 1 ? "" : "s"} kept for evaluation.
+            </Typography>
+          ) : null}
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        {canDecide ? (
+          <Button
+            color="inherit"
+            disabled={actionPending}
+            onClick={() =>
+              onAction(
+                { action: "dismiss_evolve_candidate", proposal_id: id },
+                "Candidate dismissed.",
+                "Dismiss this candidate? It moves to History; ArkEvolve only revisits the segment if its evidence changes.",
+              )
+            }
+          >
+            Dismiss
+          </Button>
+        ) : null}
+        {canDecide ? (
+          <Button
+            variant="contained"
+            disabled={actionPending}
+            onClick={() =>
+              onAction(
+                { action: "approve_evolve_candidate", proposal_id: id },
+                "Candidate approved; optimization queued for quiet time.",
+              )
+            }
+          >
+            Approve
+          </Button>
+        ) : null}
+        <Button onClick={onClose}>Close</Button>
+      </DialogActions>
+    </Dialog>
+  );
+});
+
 function promptOpportunityIssueChartOption(opportunity: JsonRecord) {
   const labels = ["Failed", "Corrected", "Slow", "Expensive"];
   const values = [
@@ -1253,15 +2061,6 @@ function formatLatencyMs(value: unknown): string {
   return `${Math.round(parsed).toLocaleString()}ms`;
 }
 
-function promotionGateSummary(data: JsonRecord): string {
-  const report = asRecord(data.promotion_gate_report);
-  return (
-    str(report.summary, "").trim() ||
-    str(data.promotion_gate_summary, "").trim() ||
-    str(data.promotion_gate, "").trim()
-  );
-}
-
 function replayGateReasonLabels(item: ExperimentSurfaceItem): string[] {
   return item.replayGateReasons
     .map((reason) => str(reason.label, "").trim())
@@ -1364,70 +2163,27 @@ function buildExperimentMetricSummaries(
   return cards.slice(0, 6);
 }
 
-function experimentStageText(
-  item: ExperimentSurfaceItem,
-  safetyEvent: JsonRecord | null,
-): string {
-  const reviewStatus = str(safetyEvent?.review_status, "").trim();
-  if (reviewStatus === "open" || reviewStatus === "review_recommended") {
-    return "Needs decision";
-  }
-  if (reviewStatus) return humanizeStatusLabel(reviewStatus);
-  const gate = item.gate.trim();
-  if (gate && gate !== "-") {
-    return gate === "passed" ? "Gate passed" : "Evaluating gate";
-  }
-  const candidateSamples = finiteNumber(
-    findVersionMetric(item.metrics, item.candidate)?.samples,
-  );
-  const minSamples = finiteNumber(item.canaryState.min_samples_per_version);
-  if (candidateSamples != null && minSamples != null && candidateSamples < minSamples) {
-    return "Collecting samples";
-  }
-  return "Testing candidate";
-}
-
-function experimentGuardrailText(item: ExperimentSurfaceItem): string {
-  const minSamples = finiteNumber(item.canaryState.min_samples_per_version);
-  const minGain = finiteNumber(item.canaryState.min_success_gain);
-  const maxP = finiteNumber(item.canaryState.max_sign_test_p_value);
-  const rules = [
-    minSamples != null && minSamples > 0
-      ? `${Math.round(minSamples).toLocaleString()} samples per version`
-      : "",
-    minGain != null ? `${evolutionGainLabel(minGain)} minimum success lift` : "",
-    maxP != null ? `p <= ${maxP.toFixed(2)} sign test` : "",
-  ].filter(Boolean);
-  if (rules.length === 0) {
-    return "Guardrail: candidate stays limited until evidence shows it is safe.";
-  }
-  return `Guardrail: promotion needs ${rules.join(", ")}.`;
-}
-
-function experimentLastActivityText(
-  item: ExperimentSurfaceItem,
-  safetyEvent: JsonRecord | null,
-): string {
-  const eventAt = str(safetyEvent?.created_at, "").trim();
-  if (eventAt) return `Safety check ${humanTs(eventAt).label}`;
-  const activatedAt = str(item.canaryState.activated_at, "").trim();
-  if (activatedAt) return `Started ${humanTs(activatedAt).label}`;
-  return "Waiting for the first recorded run";
-}
-
 export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<EvolutionPageTab>("review");
+  const [tab, setTab] = useState<EvolutionCandidateTab>("review");
   const [showSuperseded, setShowSuperseded] = useState(false);
   const PROMPT_REVIEW_PAGE_SIZE = 6;
   const [promptReviewPage, setPromptReviewPage] = useState(0);
+  const [surfacedPage, setSurfacedPage] = useState(0);
+  const [testingPage, setTestingPage] = useState(0);
+  const [deployedPage, setDeployedPage] = useState(0);
+  const [historyPage, setHistoryPage] = useState(0);
+  const [candidateDialogId, setCandidateDialogId] = useState<string | null>(
+    null,
+  );
   const [developerModeEnabled, setDeveloperModeEnabledState] = useState(
     getDeveloperModeEnabled,
   );
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [selectedPatternCard, setSelectedPatternCard] =
-    useState<EvolutionPatternCard | null>(null);
+  const [lastEvolveScanMessage, setLastEvolveScanMessage] = useState<string | null>(
+    null,
+  );
   const [technicalDialogProposalId, setTechnicalDialogProposalId] = useState<
     string | null
   >(null);
@@ -1435,9 +2191,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     useState<PromptDetailTab>("proposal");
   const [readinessDialog, setReadinessDialog] =
     useState<ReadinessDialogState | null>(null);
-  // Default-closed so novice users see the narrative hero first. The
-  // existing tabs and analytics stay one click away for power users.
-  const [showDetails, setShowDetails] = useState(false);
   const [optimizationOpen, setOptimizationOpen] = useState(false);
 
   useEffect(() => {
@@ -1476,16 +2229,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       ),
     refetchInterval: autoRefresh ? EVOLUTION_DEV_REFRESH_MS : false,
   });
-  const updateEvolutionMutation = useMutation({
-    mutationFn: (payload: JsonRecord) =>
-      api.rawPost("/settings/evolution", payload),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["settings-evolution"] });
-      await queryClient.invalidateQueries({
-        queryKey: ["settings-evolution-dev"],
-      });
-    },
-  });
   const runEvolutionActionMutation = useMutation({
     mutationFn: (payload: JsonRecord) =>
       api.rawPost("/settings/evolution/dev/action", payload),
@@ -1504,7 +2247,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const promptCanary = asRecord(evolution.prompt_canary);
   const specialistCanary = asRecord(evolution.specialist_prompt_canary);
   const promptFragmentCanary = asRecord(evolution.prompt_fragment_canary);
-  const learningQueue = asRecord(evolution.learning_queue);
   const gepaConfig = asRecord(evolution.gepa_config);
   const gepaReadiness = asRecord(evolution.gepa_readiness);
   const gepaBudget = asRecord(gepaReadiness.budget);
@@ -1524,11 +2266,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const gepaFailedItems = recordList(gepaQueue.failed);
   const gepaPendingJobs = gepaPendingItems.length;
   const gepaRunningJobs = gepaRunningItems.length;
-  const gepaDailyBudgetUsd = num(gepaBudget.daily_budget_usd, 2);
-  const gepaRemainingBudgetUsd = num(
-    gepaBudget.remaining_today_usd,
-    gepaDailyBudgetUsd,
-  );
   const gepaBudgetAllowed = toBool(gepaBudget.allowed);
   const latestGepaQueueRecord = [...gepaCompletedItems, ...gepaFailedItems]
     .sort((a, b) =>
@@ -1543,10 +2280,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     latestGepaInner.status,
     str(latestGepaRecord.status, ""),
   ).trim();
-  const latestGepaError =
-    str(latestGepaInner.error, "").trim() ||
-    str(latestGepaInner.stderr_tail, "").trim() ||
-    str(latestGepaRecord.error, "").trim();
   const latestGepaImport = asRecord(
     latestGepaInner.import_result ?? latestGepaRecord.import_result,
   );
@@ -1556,16 +2289,12 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     num(latestGepaImportSummary.specialist_prompt_candidates, 0) +
     num(latestGepaImportSummary.prompt_fragment_candidates, 0);
   const gepaAutoStatus = str(gepaAutoState.last_status, "").trim();
-  const gepaAutoReason = str(gepaAutoState.last_reason, "");
   const gepaEvidenceSamples = num(gepaAutoState.last_evidence_samples, 0);
   const selfEvolveEnabled = toBool(evolution.self_evolve_enabled);
   const gepaOptimizerEnabled =
     gepaConfig.enabled == null ? true : toBool(gepaConfig.enabled);
   const backgroundImprovementPaused =
     !selfEvolveEnabled || !gepaOptimizerEnabled;
-  const backgroundImprovementPauseText = !selfEvolveEnabled
-    ? "Evolve is paused."
-    : "GEPA background optimizer is disabled.";
   const backgroundImprovementNeedsAttention = [
     latestGepaStatus,
     gepaAutoStatus,
@@ -1703,29 +2432,52 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const learningCandidates = pickRecords(evolutionDev, "learning_candidates");
   const learningPatterns = pickRecords(evolutionDev, "learning_patterns");
   const learningItems = pickRecords(evolutionDev, "learning_items");
-  const skillEvolutions: JsonRecord[] = [];
   const experienceGraph = asRecord(evolutionDev.experience_graph);
   const experienceGraphNodes = pickRecords(experienceGraph, "nodes");
   const experienceGraphEdges = pickRecords(experienceGraph, "edges");
-  const recentExperienceRuns = pickRecords(
-    evolutionDev,
-    "recent_experience_runs",
+  const evolveCandidates = useMemo(
+    () => {
+      const candidates = pickRecords(evolutionDev, "usage_candidates");
+      return candidates.length > 0
+        ? candidates
+        : pickRecords(evolutionDev, "usage_opportunities");
+    },
+    [evolutionDev],
   );
-  const reflectedHeuristics = learningItems.filter(
-    (row) => str(row.origin, "").trim().toLowerCase() === "heuristic_reflection",
+  const surfacedCandidates = useMemo(
+    () => filterEvolveCandidatesForTab(evolveCandidates, "review"),
+    [evolveCandidates],
   );
-  const skillReviewItems = skillEvolutions.filter(
-    (row) => str(row.approval_status, "draft") === "draft",
+  const testingCandidates = useMemo(
+    () => filterEvolveCandidatesForTab(evolveCandidates, "testing"),
+    [evolveCandidates],
   );
-  const approvedSkillEvolutions = skillEvolutions.filter(
-    (row) => str(row.approval_status, "").trim().toLowerCase() === "approved",
+  const deployedCandidates = useMemo(
+    () => filterEvolveCandidatesForTab(evolveCandidates, "deployed"),
+    [evolveCandidates],
   );
-  const skillHelpedItems = approvedSkillEvolutions.filter(
-    (row) => str(row.impact_status, "").trim().toLowerCase() === "improved",
+  const historyCandidates = useMemo(
+    () => filterEvolveCandidatesForTab(evolveCandidates, "history"),
+    [evolveCandidates],
   );
-  const skillObservedItems = approvedSkillEvolutions.filter(
-    (row) => str(row.impact_status, "").trim().toLowerCase() !== "improved",
+  const realizedSavings = useMemo(
+    () => aggregateRealizedSavings(evolveCandidates),
+    [evolveCandidates],
   );
+  const realizedSavingsLine = realizedSavingsHeadline(realizedSavings);
+  const stableRecommendation = useMemo(
+    () => stableRecommendationView(evolutionDev.prompt_stable_recommendation),
+    [evolutionDev],
+  );
+  const promptSnapshots = useMemo(
+    () => snapshotHistoryRows(evolutionDev.prompt_snapshot_history),
+    [evolutionDev],
+  );
+  const dialogCandidate = candidateDialogId
+    ? (evolveCandidates.find(
+        (row) => str(row.id, "") === candidateDialogId,
+      ) ?? null)
+    : null;
   const nonSkillLearningCandidates = learningCandidates.filter(
     (row) => str(row.candidate_type, "") !== "skill_patch",
   );
@@ -1761,10 +2513,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   ].sort((a, b) =>
     str(b.timestamp_utc, "").localeCompare(str(a.timestamp_utc, "")),
   );
-  const confirmedLineageRows = lineageRows.filter((row) => toBool(row.promoted));
-  const confirmedRecentChangeCount =
-    confirmedLineageRows.length + skillHelpedItems.length;
-  const routingRollbackAvailable = toBool(evolution.routing_rollback_available);
+  const confirmedRecentChangeCount = lineageRows.filter((row) =>
+    toBool(row.promoted),
+  ).length;
   const promptRollbackAvailable = toBool(evolution.prompt_rollback_available);
   const specialistPromptRollbackAvailable = toBool(
     evolution.specialist_prompt_rollback_available,
@@ -1795,9 +2546,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       canaryState: routingCanaryState,
       primaryMetricLabel: "Task success rate",
       stopAction: { action: "disable_canary" },
-      acceptAction: { action: "promote_candidate" },
-      rollbackAction: { action: "rollback_baseline" },
-      rollbackAvailable: routingRollbackAvailable,
+      rollbackAvailable: false,
     },
     {
       key: "prompt",
@@ -1902,16 +2651,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const activeExperimentItems = tests.filter((item) => item.enabled);
   const stableExperimentItems = tests.filter((item) => !item.enabled);
   const activeTests = activeExperimentItems.length;
-  const maxRollout = tests.reduce(
-    (acc, item) => Math.max(acc, item.rollout),
-    0,
-  );
   const helpedLines = [
-    ...skillHelpedItems.flatMap((row) => {
-      const summary = stringList(asRecord(row.impact_assessment).summary);
-      const prefix = str(row.skill_name, "Skill");
-      return summary.map((line) => `${prefix}: ${line}`);
-    }),
     ...stringList(promptInsights.summary),
     ...stringList(specialistInsights.summary),
     ...stringList(promptFragmentInsights.summary),
@@ -1957,9 +2697,19 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       }))
       .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
     const degreeByNode = new Map<string, number>();
+    const edgeTypesByNode = new Map<string, Set<string>>();
     for (const edge of rawLinks) {
       degreeByNode.set(edge.source, (degreeByNode.get(edge.source) ?? 0) + 1);
       degreeByNode.set(edge.target, (degreeByNode.get(edge.target) ?? 0) + 1);
+      const edgeLabel = humanizeStatusLabel(edge.value || "linked");
+      for (const id of [edge.source, edge.target]) {
+        let types = edgeTypesByNode.get(id);
+        if (!types) {
+          types = new Set<string>();
+          edgeTypesByNode.set(id, types);
+        }
+        types.add(edgeLabel);
+      }
     }
     const visibleNodes = experienceGraphNodes
       .slice()
@@ -1979,19 +2729,43 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     const nodeBaseSize = [10, 8, 9, 9, 7];
     const nodes = visibleNodes.map((node) => {
       const id = str(node.id, "");
+      const kind = str(node.kind, "");
       const category = kindCategory(str(node.kind, ""));
       const degree = degreeByNode.get(id) ?? 0;
+      const status = str(node.status, "").trim();
+      const rawLabel = str(node.label, str(node.id, "Node"));
+      const displayTitle = experienceGraphNodeTitle(node);
+      const connectedBy = Array.from(edgeTypesByNode.get(id) ?? [])
+        .slice(0, 3)
+        .join(", ");
       return {
         id,
-        name: str(node.label, str(node.id, "Node")),
+        name: displayTitle,
         category,
         symbolSize: Math.min(15, nodeBaseSize[category] + Math.min(5, degree)),
-        value: str(node.status, ""),
+        value: status,
+        kind,
+        kindLabel: graphKindLabel(kind),
+        statusLabel: status ? humanizeStatusLabel(status) : "",
+        rawLabel,
+        degree,
+        connectedBy,
+        intentLabel:
+          kind === "experience_run" && rawLabel.trim()
+            ? humanizeStatusLabel(rawLabel)
+            : "",
       };
     });
+    const nodeTitleById = new Map(nodes.map((node) => [node.id, node.name]));
     const links = rawLinks
       .filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target))
-      .slice(0, 120);
+      .slice(0, 120)
+      .map((edge) => ({
+        ...edge,
+        edgeLabel: humanizeStatusLabel(edge.value || "linked"),
+        sourceName: nodeTitleById.get(edge.source) ?? edge.source,
+        targetName: nodeTitleById.get(edge.target) ?? edge.target,
+      }));
     return {
       backgroundColor: "transparent",
       animationDurationUpdate: 260,
@@ -2000,11 +2774,25 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         backgroundColor: "rgba(14, 18, 14, 0.96)",
         borderColor: "rgba(120, 242, 176, 0.24)",
         textStyle: { color: "#fff8ed", fontSize: 12 },
-        formatter: (params: { data?: JsonRecord; value?: unknown }) => {
+        formatter: (params: { data?: JsonRecord; dataType?: string; value?: unknown }) => {
           const data = asRecord(params.data);
-          return [str(data.name, "Node"), str(data.value, "")]
-            .filter(Boolean)
-            .join("<br/>");
+          if (params.dataType === "edge" || str(data.source, "").trim()) {
+            const title = str(data.edgeLabel || data.value, "Linked evidence");
+            const details = graphDetailRows([
+              ["From", data.sourceName],
+              ["To", data.targetName],
+            ]);
+            return `<strong>${escapeTooltipText(title)}</strong>${details ? `<br/>${details}` : ""}`;
+          }
+          const title = str(data.name, "Graph node");
+          const details = graphDetailRows([
+            ["Type", data.kindLabel],
+            ["Status", data.statusLabel],
+            ["Connections", finiteNumber(data.degree)?.toLocaleString()],
+            ["Linked by", data.connectedBy],
+            ["Intent", data.intentLabel],
+          ]);
+          return `<strong>${escapeTooltipText(title)}</strong>${details ? `<br/>${details}` : ""}`;
         },
       },
       legend: [
@@ -2071,10 +2859,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       ],
     };
   }, [experienceGraphEdges, experienceGraphNodes]);
-  const evidenceCards = useMemo(
-    () => buildEvolutionEvidenceCards(recentExperienceRuns),
-    [recentExperienceRuns],
-  );
   const learningPatternById = useMemo(() => {
     const next = new Map<string, JsonRecord>();
     for (const row of learningPatterns) {
@@ -2123,17 +2907,21 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const visibleNonSkillLearningCandidates = showSuperseded
     ? nonSkillLearningCandidates
     : openNonSkillLearningCandidates;
-  const needsApprovalCount =
-    skillReviewItems.length +
+  const candidatesTabCount =
+    surfacedCandidates.length +
     openNonSkillLearningCandidates.length +
-    openPromptCanarySafetyEvents.length +
     promptOptimizationDecisionItems.length;
-  const promotedChangeCount =
-    lineageRows.filter((row) => toBool(row.promoted)).length +
-    skillHelpedItems.length;
+  const testingTabCount =
+    testingCandidates.length +
+    activeExperimentItems.length +
+    openPromptCanarySafetyEvents.length +
+    (stableRecommendation ? 1 : 0);
+  const promotedChangeCount = lineageRows.filter((row) =>
+    toBool(row.promoted),
+  ).length;
+  const deployedTabCount = deployedCandidates.length + promotedChangeCount;
   const experienceGraphReady =
     experienceGraphNodes.length >= 4 && experienceGraphEdges.length > 0;
-  const experienceNodePreview = experienceGraphNodes.slice(0, 5);
   const metricChartLabels = metricChartRows.map((row) => {
     const surface = str(row.surface, "-");
     const version = str(row.version, "").trim();
@@ -2167,6 +2955,37 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       backgroundColor: "rgba(14, 18, 14, 0.96)",
       borderColor: "rgba(120, 242, 176, 0.24)",
       textStyle: { color: "#fff8ed" },
+      formatter: (items: unknown) => {
+        const list = Array.isArray(items) ? items : [items];
+        const first = asRecord(list[0]);
+        const row = metricChartRows[num(first.dataIndex, -1)] ?? {};
+        const surface = str(row.surface, "Surface");
+        const version = str(row.version, "").trim();
+        const samples =
+          finiteNumber(row.samples) ??
+          finiteNumber(row.sample_count) ??
+          finiteNumber(row.total_runs);
+        const title = version ? `${surface} ${version}` : surface;
+        const metricLines = list
+          .map((item) => {
+            const entry = asRecord(item);
+            const label = str(entry.seriesName, "Metric");
+            const value = finiteNumber(entry.value);
+            return `${escapeTooltipText(label)}: ${
+              value == null ? "-" : `${value.toFixed(1)}%`
+            }`;
+          })
+          .join("<br/>");
+        const details = graphDetailRows([
+          [
+            "Recent samples",
+            samples == null ? "" : Math.round(samples).toLocaleString(),
+          ],
+        ]);
+        return `<strong>${escapeTooltipText(title)}</strong>${
+          details ? `<br/>${details}` : ""
+        }${metricLines ? `<br/>${metricLines}` : ""}`;
+      },
     },
     xAxis: {
       type: "category",
@@ -2207,75 +3026,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       },
     ],
   };
-  const lastRoutingOptimization = asRecord(evolutionDev.last_result);
-  const lastRoutingPromoted = toBool(lastRoutingOptimization.promoted);
-  const lastRoutingMode = str(lastRoutingOptimization.promotion_mode, "none");
-  const lastRoutingGate = promotionGateSummary(lastRoutingOptimization);
-  const lastRoutingAccuracyGain = num(
-    lastRoutingOptimization.accuracy_gain,
-    Number.NaN,
-  );
-  const lastRoutingSummary =
-    Object.keys(lastRoutingOptimization).length === 0
-      ? "No guided optimization has run yet."
-      : lastRoutingMode === "canary"
-        ? "A routing improvement is being tested on a small share of traffic."
-        : lastRoutingMode === "baseline"
-          ? "The last routing improvement passed checks and is now stable."
-          : lastRoutingPromoted
-            ? "A routing improvement passed offline checks and is waiting on rollout."
-            : lastRoutingGate
-              ? `Last check made no change: ${lastRoutingGate}.`
-              : "Last check made no change.";
   const statusLoading = evolutionQ.isLoading;
   const detailLoading = evolutionDevQ.isLoading;
-  const guidedOptimizationDisabled =
-    statusLoading ||
-    detailLoading ||
-    updateEvolutionMutation.isPending ||
-    runEvolutionActionMutation.isPending ||
-    !toBool(evolution.self_evolve_enabled);
-  const rollbackAvailableCount = [
-    routingRollbackAvailable,
-    promptRollbackAvailable,
-    specialistPromptRollbackAvailable,
-    promptFragmentRollbackAvailable,
-  ].filter(Boolean).length;
-  const anyRollbackAvailable = rollbackAvailableCount > 0;
-  const reviewItemNoun = needsApprovalCount === 1 ? "suggestion" : "suggestions";
-  const reviewVerb = needsApprovalCount === 1 ? "needs" : "need";
-  const reviewDecisionSubject =
-    needsApprovalCount === 1 ? "this idea" : "these ideas";
-  const primaryStatusTitle = needsApprovalCount > 0
-    ? `${needsApprovalCount} ${reviewItemNoun} ${reviewVerb} your review`
-    : activeTests > 0
-      ? "A limited test is running"
-      : anyRollbackAvailable
-        ? "A stable change is active"
-        : gepaRunningJobs > 0
-          ? "Running background check"
-          : gepaPendingJobs > 0
-            ? "Queued for quiet time"
-            : !gepaReady
-              ? "Waiting for model setup"
-              : latestGepaCandidateCount > 0
-                ? "Checking candidate safety"
-                : "Nothing needs you now";
-  const primaryStatusDetail = needsApprovalCount > 0
-    ? `Nothing has changed yet. Open the review queue to decide whether Evolve should keep going with ${reviewDecisionSubject}.`
-    : activeTests > 0
-      ? "A small live test is active. You can view it, stop it, or make it stable from Live tests."
-      : anyRollbackAvailable
-        ? `${rollbackAvailableCount} stable change${rollbackAvailableCount === 1 ? "" : "s"} can be rolled back from Live tests.`
-        : gepaRunningJobs > 0
-          ? "Evolve is reviewing completed work. If it finds something useful, it will move into safety checks or review."
-          : gepaPendingJobs > 0
-            ? "A background check is waiting until AgentArk is quiet."
-            : !gepaReady
-              ? "Background improvement needs a working primary model before it can run."
-              : latestGepaCandidateCount > 0
-                ? "Candidate improvements were created and are going through safety checks."
-                : "Evolve is watching completed work and will ask before it changes behavior.";
   const reviewLifecycleSteps = [
     "Suggested",
     "Approved",
@@ -2284,43 +3036,40 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     "Stable change",
   ];
 
-  async function updateEvolution(payload: JsonRecord, message: string) {
-    setError(null);
-    setSuccess(null);
-    try {
-      await updateEvolutionMutation.mutateAsync(payload);
-      setSuccess(message);
-    } catch (e) {
-      setError(errMessage(e));
-    }
-  }
-
-  async function runEvolutionAction(
-    payload: JsonRecord,
-    message: string,
-    confirmMessage?: string,
-  ) {
-    if (confirmMessage && !window.confirm(confirmMessage)) return;
-    setError(null);
-    setSuccess(null);
-    try {
-      const result = await runEvolutionActionMutation.mutateAsync(payload);
-      const resultMessage = str(asRecord(result).message, "");
-      setSuccess(`${resultMessage || message}${evolutionTraceIdHint(result)}`);
-    } catch (e) {
-      setError(errMessage(e));
-    }
-  }
-
-  function openReviewQueue() {
-    setTab("review");
-    window.setTimeout(() => {
-      const target = document.getElementById("ark-evolve-review-queue");
-      if (!target) return;
-      target.scrollIntoView({ behavior: "smooth", block: "start" });
-      target.focus({ preventScroll: true });
-    }, 0);
-  }
+  const runActionMutateAsync = runEvolutionActionMutation.mutateAsync;
+  const runEvolutionAction = useCallback(
+    async (payload: JsonRecord, message: string, confirmMessage?: string) => {
+      if (confirmMessage && !window.confirm(confirmMessage)) return;
+      setError(null);
+      setSuccess(null);
+      try {
+        const result = await runActionMutateAsync(payload);
+        const resultMessage = str(asRecord(result).message, "");
+        const finalMessage = `${resultMessage || message}${evolutionTraceIdHint(result)}`;
+        setSuccess(finalMessage);
+        const action = str(payload.action, "");
+        if (action === "scan_evolve_candidates" || action === "mine_opportunities") {
+          setLastEvolveScanMessage(finalMessage);
+        }
+      } catch (e) {
+        setError(errMessage(e));
+      }
+    },
+    [runActionMutateAsync],
+  );
+  const openCandidateDialog = useCallback((id: string) => {
+    if (id) setCandidateDialogId(id);
+  }, []);
+  const closeCandidateDialog = useCallback(() => {
+    setCandidateDialogId(null);
+  }, []);
+  const candidateDialogAction = useCallback(
+    (payload: JsonRecord, message: string, confirmMessage?: string) => {
+      void runEvolutionAction(payload, message, confirmMessage);
+      setCandidateDialogId(null);
+    },
+    [runEvolutionAction],
+  );
 
   const statusError = evolutionQ.error ? errMessage(evolutionQ.error) : "";
   const detailError = evolutionDevQ.error
@@ -2342,13 +3091,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       : hasMeasuredHelp
         ? `${confirmedRecentChangeCount || helpedLines.length} confirmed improvement${(confirmedRecentChangeCount || helpedLines.length) === 1 ? "" : "s"}`
         : "No proven improvement yet";
-  const resultSummaryDetail = detailLoading
-    ? "Evolve is loading the recent evidence behind prompt, routing, specialist, memory, and strategy changes."
-    : detailError
-      ? "The detail endpoint did not return enough data to explain recent Evolve results."
-      : hasMeasuredHelp
-        ? "These are changes with measured evidence from recent runs. Live tests and review items are shown separately before anything risky becomes stable."
-        : "Evolve has not found enough measured evidence to call a recent change useful. This page now shows that plainly instead of stretching empty panels or drawing weak charts.";
   const resultSummaryCards = [
     {
       label: "Confirmed wins",
@@ -2361,21 +3103,24 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     },
     {
       label: "Still measuring",
-      value: String(skillObservedItems.length),
+      value: String(testingCandidates.length),
       helper:
-        skillObservedItems.length > 0
-          ? "Approved changes need more traffic."
-          : "No approved change is waiting.",
-      tone: skillObservedItems.length > 0 ? ("warn" as const) : ("default" as const),
+        testingCandidates.length > 0
+          ? "Approved candidates are under test."
+          : "No approved candidate is waiting.",
+      tone:
+        testingCandidates.length > 0
+          ? ("warn" as const)
+          : ("default" as const),
     },
     {
       label: "Needs review",
-      value: String(needsApprovalCount),
+      value: String(candidatesTabCount),
       helper:
-        needsApprovalCount > 0
-          ? "Suggestions wait for your decision."
+        candidatesTabCount > 0
+          ? "Candidates wait for your decision."
           : "Nothing is waiting on you.",
-      tone: needsApprovalCount > 0 ? ("warn" as const) : ("default" as const),
+      tone: candidatesTabCount > 0 ? ("warn" as const) : ("default" as const),
     },
     {
       label: "Live tests",
@@ -2412,30 +3157,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       }`,
     },
   ];
-  const selectedPatternRuns = selectedPatternCard?.runs ?? [];
-  const selectedPatternRequests = uniqueNonEmptyStrings(
-    selectedPatternRuns
-      .map((run) => str(run.request_text, "").trim())
-      .filter(Boolean),
-  ).slice(0, 6);
-  const selectedPatternPolicies = uniqueNonEmptyStrings(
-    selectedPatternRuns.map((run) => run.policy_version),
-  );
-  const selectedPatternStrategies = uniqueNonEmptyStrings(
-    selectedPatternRuns.map((run) => run.strategy_version),
-  );
-  const selectedPatternPrompts = uniqueNonEmptyStrings(
-    selectedPatternRuns.map((run) => run.prompt_version),
-  );
-  const selectedPatternSpecialistPrompts = uniqueNonEmptyStrings(
-    selectedPatternRuns.map((run) => run.specialist_prompt_version),
-  );
-  const selectedPatternVersionItems = [
-    { label: "Policy", values: selectedPatternPolicies },
-    { label: "Strategy", values: selectedPatternStrategies },
-    { label: "Prompt", values: selectedPatternPrompts },
-    { label: "Specialist prompt", values: selectedPatternSpecialistPrompts },
-  ].filter((item) => item.values.length > 1);
 
   return (
     <WorkspacePageShell className="evolution-page" spacing={1.5}>
@@ -2447,17 +3168,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       {success ? <Alert severity="success">{success}</Alert> : null}
       {activeError ? <Alert severity="error">{activeError}</Alert> : null}
 
-      {/* EvolveHero removed entirely. The filter chip strip below
-          ("Needs review (2)" / "Live tests (1)" / "Stable" / "Overview")
-          carries the same headline number + state with far less screen
-          real estate. The page no longer has a giant counter floating
-          at the top — counts live inline on the action they belong to. */}
-
-      {/* Previous "show details" Collapse + duplicate primaryStatusTitle
-          header was removed. The EvolveHero above already surfaces the
-          headline + action moments; repeating it below was the source
-          of the "2 suggestions need your review" / "2 suggestions are
-          waiting" duplication. Tabs are now always visible. */}
       {!gepaReady && !backgroundImprovementPaused ? (
         <Alert severity="info" sx={{ borderRadius: 1 }}>
           Background improvement starts automatically after Models has a working
@@ -2474,14 +3184,16 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         >
           <Tabs
             value={tab}
-            onChange={(_event, next) => setTab(next as EvolutionPageTab)}
+            onChange={(_event, next) => setTab(next as EvolutionCandidateTab)}
             variant="scrollable"
             allowScrollButtonsMobile
             className="workspace-page-subnav-tabs"
             sx={{ flex: 1 }}
           >
-            <Tab value="review" label={`Needs Review (${needsApprovalCount})`} />
-            <Tab value="helped" label={`Deployed (${promotedChangeCount})`} />
+            <Tab value="review" label={`Candidates (${candidatesTabCount})`} />
+            <Tab value="testing" label={`Testing (${testingTabCount})`} />
+            <Tab value="deployed" label={`Deployed (${deployedTabCount})`} />
+            <Tab value="history" label="History" />
           </Tabs>
         </Stack>
       </Box>
@@ -2506,606 +3218,87 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           </Stack>
         </Box>
       ) : null}
-      {tab === "what" ? (
+      {tab === "deployed" ? (
         <Stack spacing={1.5}>
-          <Box className="list-shell" sx={{ p: 1.6 }}>
-            {detailLoading ? (
-              <Stack
-                direction="row"
-                spacing={1}
-                sx={{
-                  alignItems: "center",
-                }}
-              >
-                <CircularProgress size={16} />
-                <Typography
-                  variant="body2"
-                  sx={{
-                    color: "text.secondary",
-                  }}
-                >
-                  Loading recent changes...
-                </Typography>
-              </Stack>
-            ) : detailError ? (
-              <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                Detailed Evolve history is unavailable: {detailError}
-              </Alert>
-            ) : confirmedRecentChangeCount === 0 ? (
-              <Typography
-                variant="body2"
-                sx={{
-                  color: "text.secondary",
-                }}
-              >
-                No confirmed improvements yet. Evolve will list changes here
-                only after they have proven measurable impact. In the meantime,
-                the Review queue tab shows changes that are waiting on you.
-              </Typography>
-            ) : (
-              <Stack spacing={1}>
-                {skillHelpedItems.length > 0 ? (
-                  <Box
+          {realizedSavingsLine || deployedCandidates.length > 0 ? (
+            <Box
+              className="list-shell"
+              sx={{
+                p: 1.6,
+                borderLeft: "3px solid rgba(120, 242, 176, 0.55)",
+              }}
+            >
+              <Stack spacing={1.1}>
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography
+                    variant="caption"
                     sx={{
-                      pb: 1,
-                      borderBottom: "1px solid var(--ui-rgba-145-170-205-120)",
+                      color: "var(--text-faint)",
+                      display: "block",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.62rem",
+                      textTransform: "uppercase",
+                      letterSpacing: 0.12,
                     }}
                   >
-                    <Typography
-                      variant="caption"
-                      sx={{
-                        color: "text.secondary",
-                        display: "block",
-                        mb: 0.75,
-                      }}
-                    >
-                      Capability improvements
-                    </Typography>
-                    <Stack spacing={0.85}>
-                      {skillHelpedItems.slice(0, 4).map((row, idx) => {
-                        const when = humanTs(
-                          str(row.reviewed_at || row.updated_at, "-"),
-                        );
-                        return (
-                          <Alert
-                            key={`skill-evolution-what-${str(row.id, String(idx))}`}
-                            severity={skillEvolutionAlertSeverity(
-                              str(
-                                row.impact_status,
-                                str(row.approval_status, "draft"),
-                              ),
-                            )}
-                            sx={{ borderRadius: 1 }}
-                          >
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              useFlexGap
-                              sx={{
-                                alignItems: "center",
-                                flexWrap: "wrap",
-                                mb: 0.35,
-                              }}
-                            >
-                              <Typography
-                                variant="body2"
-                                sx={{ color: "#e8f4ff", fontWeight: 600 }}
-                              >
-                                {canonicalSkillIdentifier(
-                                  str(row.skill_name, "Skill"),
-                                )}
-                              </Typography>
-                              <Chip
-                                size="small"
-                                label={skillEvolutionActionLabel(
-                                  str(row.action, ""),
-                                )}
-                              />
-                              <Chip
-                                size="small"
-                                color={skillEvolutionChipColor(
-                                  str(
-                                    row.impact_status,
-                                    str(row.approval_status, "draft"),
-                                  ),
-                                )}
-                                label={
-                                  str(
-                                    row.impact_status,
-                                    str(row.approval_status, "draft"),
-                                  ) || "draft"
-                                }
-                              />
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                {when.label}
-                              </Typography>
-                            </Stack>
-                            <Typography variant="body2">
-                              {str(
-                                row.diff_summary,
-                                str(row.summary, "Reviewable capability change"),
-                              )}
-                            </Typography>
-                          </Alert>
-                        );
-                      })}
-                    </Stack>
-                  </Box>
-                ) : null}
-                {confirmedLineageRows.slice(0, 8).map((row, idx) => {
-                  const surfaceSummary = stringList(row.optimized_surfaces)
-                    .concat(stringList(row.optimized_roles))
-                    .join(", ");
-                  const notesSummary = stringList(row.notes).join(" | ");
-                  const focusSummary = pickRecords(row, "focus_cases")
-                    .slice(0, 2)
-                    .map(buildEvolutionFocusCaseLabel)
-                    .join(" | ");
-                  const fallbackSummary = str(
-                    row.candidate_source,
-                    "No summary recorded",
-                  );
-                  const summary =
-                    surfaceSummary ||
-                    notesSummary ||
-                    focusSummary ||
-                    fallbackSummary;
-                  return (
-                    <Box
-                      key={`evolution-lineage-${str(row.entry_id, String(idx))}`}
-                      sx={{
-                        pb: 1,
-                        borderBottom: "1px solid var(--ui-rgba-145-170-205-120)",
-                      }}
-                    >
-                      <Stack
-                        direction="row"
-                        spacing={1}
-                        useFlexGap
-                        sx={{
-                          alignItems: "center",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <Chip size="small" label={str(row.surface, "Change")} />
-                        <Typography
-                          variant="body2"
-                          title={humanTs(str(row.timestamp_utc, "-")).tip}
-                        >
-                          {humanTs(str(row.timestamp_utc, "-")).label}
-                        </Typography>
-                        <Typography
-                          variant="body2"
-                          sx={{
-                            color: "text.secondary",
-                          }}
-                        >
-                          {toBool(row.promoted) ? "Promoted" : "Tested"}
-                        </Typography>
-                        <Typography
-                          variant="body2"
-                          sx={{
-                            color: "text.secondary",
-                          }}
-                        >
-                          {evolutionGainLabel(row.gain)}
-                        </Typography>
-                      </Stack>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                          display: "block",
-                          mt: 0.35,
-                        }}
-                      >
-                        {summary}
-                      </Typography>
-                    </Box>
-                  );
-                })}
-              </Stack>
-            )}
-          </Box>
-
-          {developerModeEnabled && evidenceCards.length > 0 ? (
-            <Box className="list-shell" sx={{ p: 1.6 }}>
-              <Typography variant="h6" sx={{ fontWeight: 700, mb: 0.5 }}>
-                Recent patterns
-              </Typography>
-              <Typography
-                variant="body2"
-                sx={{
-                  color: "text.secondary",
-                  mb: 1,
-                }}
-              >
-                Select a row to inspect the grouped runs, observed tools, and
-                why Evolve is still only watching the pattern.
-              </Typography>
-              {detailLoading ? (
-                <Stack
-                  direction="row"
-                  spacing={1}
-                  sx={{ alignItems: "center" }}
-                >
-                  <CircularProgress size={16} />
-                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                    Loading...
-                  </Typography>
-                </Stack>
-              ) : detailError ? (
-                <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                  {detailError}
-                </Alert>
-              ) : (
-                (() => {
-                  const patternPageSize = 10;
-                  const patternPages = Math.max(
-                    1,
-                    Math.ceil(evidenceCards.length / patternPageSize),
-                  );
-                  const patternSlice = evidenceCards.slice(0, patternPageSize);
-                  return (
-                    <>
-                      <TableContainer
-                        className="table-shell"
-                        sx={{ width: "100%", overflowX: "auto" }}
-                      >
-                        <Table size="small">
-                          <TableHead>
-                            <TableRow>
-                              <TableCell width="25%">Pattern</TableCell>
-                              <TableCell width="10%">Status</TableCell>
-                              <TableCell width="40%">Detail</TableCell>
-                              <TableCell width="25%">Why it matters</TableCell>
-                            </TableRow>
-                          </TableHead>
-                          <TableBody>
-                            {patternSlice.map((card) => (
-                              <TableRow
-                                key={card.key}
-                                hover
-                                role="button"
-                                tabIndex={0}
-                                sx={{ cursor: "pointer" }}
-                                onClick={() => setSelectedPatternCard(card)}
-                                onKeyDown={(event) => {
-                                  if (
-                                    event.key === "Enter" ||
-                                    event.key === " "
-                                  ) {
-                                    event.preventDefault();
-                                    setSelectedPatternCard(card);
-                                  }
-                                }}
-                              >
-                                <TableCell>
-                                  <Typography
-                                    variant="body2"
-                                    sx={{ fontWeight: 600 }}
-                                    noWrap
-                                    title={card.title}
-                                  >
-                                    {card.title}
-                                  </Typography>
-                                </TableCell>
-                                <TableCell>
-                                  <Chip
-                                    size="small"
-                                    color={learningEvidenceStatusColor(
-                                      card.status,
-                                    )}
-                                    label={humanizeStatusLabel(card.status)}
-                                  />
-                                </TableCell>
-                                <TableCell>
-                                  <Typography
-                                    variant="caption"
-                                    color="text.secondary"
-                                    sx={{
-                                      display: "-webkit-box",
-                                      WebkitLineClamp: 2,
-                                      WebkitBoxOrient: "vertical",
-                                      overflow: "hidden",
-                                    }}
-                                  >
-                                    {card.detail}
-                                  </Typography>
-                                </TableCell>
-                                <TableCell>
-                                  <Typography
-                                    variant="caption"
-                                    color="text.secondary"
-                                    noWrap
-                                    title={card.rationale || ""}
-                                  >
-                                    {card.rationale || "-"}
-                                  </Typography>
-                                </TableCell>
-                              </TableRow>
-                            ))}
-                          </TableBody>
-                        </Table>
-                      </TableContainer>
-                      {patternPages > 1 ? (
-                        <Typography
-                          variant="caption"
-                          color="text.secondary"
-                          sx={{ pt: 0.5 }}
-                        >
-                          Showing {patternSlice.length} of{" "}
-                          {evidenceCards.length} patterns
-                        </Typography>
-                      ) : null}
-                    </>
-                  );
-                })()
-              )}
-            </Box>
-          ) : null}
-        </Stack>
-      ) : null}
-      <Dialog
-        open={selectedPatternCard != null}
-        onClose={() => setSelectedPatternCard(null)}
-        maxWidth="lg"
-        fullWidth
-        slotProps={{ paper: { sx: { borderRadius: "8px", border: "1px solid var(--surface-border)", background: "var(--surface-bg-elevated)", boxShadow: "0 28px 96px var(--ui-rgba-0-0-0-500)" } } }}
-      >
-        <DialogTitle sx={{ pb: 0.5, display: "flex", alignItems: "center", gap: 1.5, borderBottom: "1px solid", borderColor: "divider" }}>
-          <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>Observed pattern</Typography>
-          {selectedPatternCard ? <Chip size="small" color={learningEvidenceStatusColor(selectedPatternCard.status)} label={humanizeStatusLabel(selectedPatternCard.status)} /> : null}
-        </DialogTitle>
-        <DialogContent>
-          {selectedPatternCard ? (
-            <Stack spacing={1.25}>
-              <Stack
-                direction={{ xs: "column", md: "row" }}
-                spacing={1}
-                sx={{
-                  justifyContent: "space-between",
-                  alignItems: { xs: "flex-start", md: "center" },
-                }}
-              >
-                <Box sx={{ minWidth: 0 }}>
-                  <Typography variant="h6" sx={{ fontWeight: 700 }}>
-                    {selectedPatternCard.title}
+                    Measured savings since deploy
                   </Typography>
                   <Typography
-                    variant="body2"
-                    sx={{ color: "text.secondary", mt: 0.35 }}
+                    variant="subtitle1"
+                    sx={{
+                      color: "#e8f4ff",
+                      fontWeight: 650,
+                      lineHeight: 1.35,
+                      mt: 0.35,
+                    }}
                   >
-                    {evolutionPatternStatusExplanation(selectedPatternCard)}
+                    {realizedSavingsLine ??
+                      "ArkEvolve deployed these changes; per-turn savings appear once the judge has measured both arms."}
                   </Typography>
                 </Box>
-                <Stack
-                  direction="row"
-                  spacing={0.75}
-                  useFlexGap
-                  sx={{ flexWrap: "wrap" }}
-                >
-                  <Chip
-                    size="small"
-                    color={learningEvidenceStatusColor(
-                      selectedPatternCard.status,
-                    )}
-                    label={selectedPatternCard.status}
-                  />
-                  {selectedPatternCard.chips.map((chip) => (
-                    <Chip
-                      key={`${selectedPatternCard.key}-${chip}`}
-                      size="small"
-                      variant="outlined"
-                      label={chip}
-                    />
-                  ))}
-                </Stack>
-              </Stack>
-
-              <Grid2 container spacing={1.25}>
-                <Grid2 size={{ xs: 12, md: 6 }}>
-                  <Box className="metadata-box">
-                    <Stack spacing={0.55}>
-                      <Typography variant="subtitle2">What happened</Typography>
-                      <Typography
-                        variant="body2"
-                        sx={{ whiteSpace: "pre-wrap" }}
-                      >
-                        {selectedPatternCard.detail}
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{ color: "text.secondary", whiteSpace: "pre-wrap" }}
-                      >
-                        {selectedPatternCard.rationale ||
-                          "AgentArk is still comparing repeated runs before changing future behavior."}
-                      </Typography>
-                    </Stack>
-                  </Box>
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 6 }}>
-                  <Box className="metadata-box">
-                    <Stack spacing={0.55}>
-                      <Typography variant="subtitle2">
-                        Why this is being tracked
-                      </Typography>
-                      {selectedPatternCard.latestSeen ? (
-                        <Typography variant="body2">
-                          <strong>Latest seen:</strong>{" "}
-                          {selectedPatternCard.latestSeen}
-                        </Typography>
-                      ) : null}
-                      {selectedPatternCard.toolSummary ? (
-                        <Typography
-                          variant="body2"
-                          sx={{ whiteSpace: "pre-wrap" }}
-                        >
-                          <strong>Tools used:</strong>{" "}
-                          {selectedPatternCard.toolSummary}
-                        </Typography>
-                      ) : null}
-                      {selectedPatternCard.evidence ? (
-                        selectedPatternCard.evidence
-                          .split(" | ")
-                          .map((line, idx) => (
-                            <Typography
-                              key={`${selectedPatternCard.key}-evidence-${idx}`}
-                              variant="caption"
-                              sx={{ color: "text.secondary", display: "block" }}
-                            >
-                              {line}
-                            </Typography>
-                          ))
-                      ) : (
-                        <Typography
-                          variant="caption"
-                          sx={{ color: "text.secondary" }}
-                        >
-                          No extra notes recorded yet.
-                        </Typography>
-                      )}
-                    </Stack>
-                  </Box>
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 6 }}>
-                  <Box className="metadata-box">
-                    <Stack spacing={0.55}>
-                      <Typography variant="subtitle2">
-                        Example user messages
-                      </Typography>
-                      {selectedPatternRequests.length > 0 ? (
-                        selectedPatternRequests.map((requestText, idx) => (
-                          <Typography
-                            key={`${selectedPatternCard.key}-request-${idx}`}
-                            variant="body2"
-                            sx={{ whiteSpace: "pre-wrap" }}
-                          >
-                            {requestText}
-                          </Typography>
-                        ))
-                      ) : (
-                        <Typography
-                          variant="caption"
-                          sx={{ color: "text.secondary" }}
-                        >
-                          No user message was stored for these runs.
-                        </Typography>
-                      )}
-                    </Stack>
-                  </Box>
-                </Grid2>
-                {selectedPatternVersionItems.length > 0 ? (
-                  <Grid2 size={{ xs: 12, md: 6 }}>
-                    <Box className="metadata-box">
-                      <Stack spacing={0.55}>
-                        <Typography variant="subtitle2">
-                          Internal changes across these runs
-                        </Typography>
-                        <Typography
-                          variant="caption"
-                          sx={{ color: "text.secondary" }}
-                        >
-                          Shown only when the underlying setup changed between
-                          related runs.
-                        </Typography>
-                        {selectedPatternVersionItems.map((item) => (
-                          <Typography
-                            key={`${selectedPatternCard.key}-${item.label}`}
-                            variant="body2"
-                            sx={{ whiteSpace: "pre-wrap" }}
-                          >
-                            <strong>{item.label}:</strong>{" "}
-                            {item.values.join(", ")}
-                          </Typography>
+                {realizedSavingsLine ? (
+                  <Typography
+                    variant="caption"
+                    sx={{ color: "var(--text-secondary)" }}
+                  >
+                    Summed per-turn deltas across {realizedSavings.measuredCount}{" "}
+                    measured deployment
+                    {realizedSavings.measuredCount === 1 ? "" : "s"}; only
+                    dimensions with baseline and candidate evidence count.
+                  </Typography>
+                ) : null}
+                {(() => {
+                  const slice = pageSlice(
+                    deployedCandidates,
+                    deployedPage,
+                    PROMPT_REVIEW_PAGE_SIZE,
+                  );
+                  return (
+                    <>
+                      <Stack spacing={1}>
+                        {slice.items.map((row) => (
+                          <EvolveCandidateRow
+                            key={`deployed-opp-${str(row.id, "")}`}
+                            row={row}
+                            onOpen={openCandidateDialog}
+                          />
                         ))}
                       </Stack>
-                    </Box>
-                  </Grid2>
-                ) : null}
-              </Grid2>
-
-              <Box className="list-shell" sx={{ p: 1.25 }}>
-                <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  Observed runs
-                </Typography>
-                <TableContainer className="table-shell">
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell width="18%">When</TableCell>
-                        <TableCell width="14%">Result</TableCell>
-                        <TableCell width="20%">Tools used</TableCell>
-                        <TableCell width="48%">What happened</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {selectedPatternRuns.map((run, idx) => {
-                        const runState = titleCaseLabel(
-                          normalizeLearningEvidenceState(run) || "observed",
-                        );
-                        const toolSummary = summarizeLearningEvidenceTools(
-                          stringList(run.tool_names),
-                        );
-                        const summary = summarizeEvolutionPatternRun(run);
-                        return (
-                          <TableRow
-                            key={`${selectedPatternCard.key}-run-${str(run.id, String(idx))}`}
-                          >
-                            <TableCell>
-                              <Typography
-                                variant="body2"
-                                title={humanTs(str(run.created_at, "-")).tip}
-                              >
-                                {humanTs(str(run.created_at, "-")).label}
-                              </Typography>
-                            </TableCell>
-                            <TableCell>
-                              <Chip
-                                size="small"
-                                color={learningEvidenceStatusColor(runState)}
-                                label={runState}
-                              />
-                            </TableCell>
-                            <TableCell>
-                              <Typography
-                                variant="body2"
-                                noWrap
-                                title={toolSummary || "-"}
-                              >
-                                {toolSummary || "-"}
-                              </Typography>
-                            </TableCell>
-                            <TableCell>
-                              <Typography
-                                variant="body2"
-                                sx={{
-                                  whiteSpace: "pre-wrap",
-                                  wordBreak: "break-word",
-                                }}
-                              >
-                                {summary}
-                              </Typography>
-                            </TableCell>
-                          </TableRow>
-                        );
-                      })}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-              </Box>
-            </Stack>
+                      <ListPager
+                        page={slice.page}
+                        pageCount={slice.pageCount}
+                        rangeStart={slice.rangeStart}
+                        rangeEnd={slice.rangeEnd}
+                        total={slice.total}
+                        noun="deployed candidates"
+                        onPage={setDeployedPage}
+                      />
+                    </>
+                  );
+                })()}
+              </Stack>
+            </Box>
           ) : null}
-        </DialogContent>
-        <DialogActions sx={{ borderTop: "1px solid", borderColor: "divider", px: 2.5, py: 1.5 }}>
-          <Button variant="outlined" color="secondary" onClick={() => setSelectedPatternCard(null)}>Close</Button>
-        </DialogActions>
-      </Dialog>
-      {tab === "helped" ? (
-        <Stack spacing={1.5}>
           <Box className="list-shell" sx={{ p: 1.6 }}>
             <Stack spacing={1.2}>
               <Stack
@@ -3121,11 +3314,10 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     variant="h6"
                     sx={{ color: "#e8f4ff", fontWeight: 750 }}
                   >
-                    Results in plain English
+                    Result ledger
                   </Typography>
                   <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                    What Evolve can prove, what it is still measuring, and
-                    whether anything needs your decision.
+                    Confirmed wins, active measurements, and decisions waiting for review.
                   </Typography>
                 </Box>
                 <Chip
@@ -3174,7 +3366,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               banner saying "no impact yet" + three 0.0-pt metric cards
               was the loudest version of "nothing to show" possible.
               Render nothing instead. */}
-          {!detailLoading && !detailError && skillHelpedItems.length === 0 && helpedLines.length === 0 ? null : (
+          {!detailLoading && !detailError && helpedLines.length === 0 ? null : (
           <Grid2 size={{ xs: 12, lg: 7 }}>
             <Box className="list-shell" sx={{ p: 1.6 }}>
               <Typography
@@ -3217,120 +3409,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 </Alert>
               ) : (
                 <Stack spacing={1}>
-                  {skillHelpedItems.map((row, idx) => {
-                    const assessment = asRecord(row.impact_assessment);
-                    const metricRows = skillEvolutionMetricRows(row);
-                    return (
-                      <Box
-                        key={`skill-helped-${str(row.id, String(idx))}`}
-                        sx={{
-                          pb: 1,
-                          borderBottom: "1px solid var(--ui-rgba-145-170-205-120)",
-                        }}
-                      >
-                        <Stack
-                          direction="row"
-                          spacing={1}
-                          useFlexGap
-                          sx={{ alignItems: "center", flexWrap: "wrap" }}
-                        >
-                          <Typography
-                            variant="body2"
-                            sx={{ color: "#e8f4ff", fontWeight: 600 }}
-                          >
-                            {str(row.skill_name, "Skill")}
-                          </Typography>
-                          <Chip
-                            size="small"
-                            label={skillEvolutionActionLabel(
-                              str(row.action, ""),
-                            )}
-                          />
-                          <Chip
-                            size="small"
-                            color={skillEvolutionChipColor(
-                              str(row.impact_status, "improved"),
-                            )}
-                            label={humanizeStatusLabel(str(row.impact_status, "improved"))}
-                          />
-                        </Stack>
-                        <Typography
-                          variant="body2"
-                          sx={{ color: "text.secondary", mt: 0.45 }}
-                        >
-                          {str(
-                            row.diff_summary,
-                            str(row.summary, "Measured improvement recorded."),
-                          )}
-                        </Typography>
-                        {stringList(assessment.summary).map(
-                          (line, summaryIdx) => (
-                            <Typography
-                              key={`skill-helped-summary-${idx}-${summaryIdx}`}
-                              variant="caption"
-                              sx={{
-                                color: "text.secondary",
-                                display: "block",
-                                mt: 0.35,
-                              }}
-                            >
-                              {line}
-                            </Typography>
-                          ),
-                        )}
-                        <Box
-                          sx={{
-                            mt: 1,
-                            display: "grid",
-                            gridTemplateColumns: {
-                              xs: "1fr",
-                              sm: "repeat(3, minmax(0,1fr))",
-                            },
-                            gap: 1,
-                          }}
-                        >
-                          {metricRows.map((metric) => (
-                            <Box
-                              key={`${str(row.id, "skill")}-${metric.label}`}
-                              sx={{
-                                p: 0.9,
-                                border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                borderRadius: 1,
-                              }}
-                            >
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                  display: "block",
-                                }}
-                              >
-                                {metric.label}
-                              </Typography>
-                              <Typography variant="body2">
-                                {metric.before}
-                                {" -> "}
-                                {metric.after}
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color:
-                                    metric.positive == null
-                                      ? "text.secondary"
-                                      : metric.positive
-                                        ? "#14f195"
-                                        : "#fb7185",
-                                }}
-                              >
-                                {metric.delta}
-                              </Typography>
-                            </Box>
-                          ))}
-                        </Box>
-                      </Box>
-                    );
-                  })}
                   {helpedLines.slice(0, 8).map((line, idx) => (
                     <Alert
                       key={`evolution-helped-${idx}`}
@@ -3368,17 +3446,12 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           )}
           <Grid2 size={{ xs: 12, lg: 5 }}>
             <Stack spacing={1.5}>
-              {/* "Still observing" section is hidden entirely when no
-                  approved change is waiting on more evidence — the
-                  long info banner saying "No approved changes are
-                  waiting" was an empty state pretending to be content. */}
-              {!detailLoading && !detailError && skillObservedItems.length === 0 ? null : (
               <Box className="list-shell" sx={{ p: 1.6 }}>
                 <Typography
                   variant="h6"
                   sx={{ color: "#e8f4ff", fontWeight: 700 }}
                 >
-                  Still observing
+                  Learning graph
                 </Typography>
                 <Typography
                   variant="body2"
@@ -3387,117 +3460,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     mb: 1,
                   }}
                 >
-                  Approved changes that have traffic, but have not cleared
-                  the improvement threshold yet.
-                </Typography>
-                {detailLoading ? (
-                  <Stack
-                    direction="row"
-                    spacing={1}
-                    sx={{ alignItems: "center" }}
-                  >
-                    <CircularProgress size={16} />
-                    <Typography
-                      variant="body2"
-                      sx={{ color: "text.secondary" }}
-                    >
-                      Loading observed skill metrics...
-                    </Typography>
-                  </Stack>
-                ) : detailError ? (
-                  <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                    Observed skill metrics are unavailable: {detailError}
-                  </Alert>
-                ) : (
-                  <Stack spacing={1}>
-                    {skillObservedItems.slice(0, 6).map((row, idx) => {
-                      const metricRows = skillEvolutionMetricRows(row);
-                      return (
-                        <Box
-                          key={`skill-observed-${str(row.id, String(idx))}`}
-                          sx={{
-                            pb: 1,
-                            borderBottom: "1px solid var(--ui-rgba-145-170-205-120)",
-                          }}
-                        >
-                          <Stack
-                            direction="row"
-                            spacing={0.75}
-                            useFlexGap
-                            sx={{
-                              alignItems: "center",
-                              flexWrap: "wrap",
-                              mb: 0.35,
-                            }}
-                          >
-                            <Typography
-                              variant="body2"
-                              sx={{ color: "#e8f4ff", fontWeight: 600 }}
-                            >
-                              {canonicalSkillIdentifier(
-                                str(row.skill_name, "Skill"),
-                              )}
-                            </Typography>
-                            <Chip
-                              size="small"
-                              label={skillEvolutionActionLabel(
-                                str(row.action, ""),
-                              )}
-                            />
-                            <Chip
-                              size="small"
-                              color={skillEvolutionChipColor(
-                                str(row.impact_status, "pending"),
-                              )}
-                              label={humanizeStatusLabel(str(row.impact_status, "pending"))}
-                            />
-                          </Stack>
-                          <Typography
-                            variant="caption"
-                            sx={{
-                              color: "text.secondary",
-                              display: "block",
-                              mb: 0.55,
-                            }}
-                          >
-                            {str(
-                              row.diff_summary,
-                              str(row.summary, "Observed after approval."),
-                            )}
-                          </Typography>
-                          {metricRows.map((metric) => (
-                            <Typography
-                              key={`${str(row.id, "skill-observed")}-${metric.label}`}
-                              variant="caption"
-                              sx={{ color: "text.secondary", display: "block" }}
-                            >
-                              {metric.label}: {metric.before}
-                              {" -> "}
-                              {metric.after} ({metric.delta})
-                            </Typography>
-                          ))}
-                        </Box>
-                      );
-                    })}
-                  </Stack>
-                )}
-              </Box>
-              )}
-              <Box className="list-shell" sx={{ p: 1.6 }}>
-                <Typography
-                  variant="h6"
-                  sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                >
-                  Experience graph
-                </Typography>
-                <Typography
-                  variant="body2"
-                  sx={{
-                    color: "text.secondary",
-                    mb: 1,
-                  }}
-                >
-                  Saved runs, learned items, reusable patterns, and review candidates.
+                  How recent runs connect to learned items, reusable patterns, and review candidates.
                 </Typography>
                 {detailLoading ? (
                   <Stack
@@ -3514,11 +3477,11 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   </Stack>
                 ) : detailError ? (
                   <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                    Experience graph is unavailable: {detailError}
+                    Learning graph is unavailable: {detailError}
                   </Alert>
                 ) : experienceGraphNodes.length === 0 ? (
                   <Alert severity="info" sx={{ borderRadius: 1 }}>
-                    No saved experience graph nodes yet.
+                    No learning graph nodes yet.
                   </Alert>
                 ) : !experienceGraphReady ? (
                   <Stack spacing={1}>
@@ -3583,7 +3546,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                       variant="h6"
                       sx={{ color: "#e8f4ff", fontWeight: 700 }}
                     >
-                      Optimization graph
+                      Version outcomes
                     </Typography>
                     <Typography
                       variant="body2"
@@ -3591,7 +3554,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                         color: "text.secondary",
                       }}
                     >
-                      Success and error rates for the versions with recent traffic.
+                      Success, error, and sample count by surface/version.
                     </Typography>
                   </Box>
                   <Button
@@ -3691,42 +3654,185 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           </Grid2>
         </Stack>
       ) : null}
-      {tab === "tests" ? (
+      {tab === "testing" ? (
         <Stack spacing={1.5}>
-          {activeExperimentItems.length === 0 ? (
-            <Box className="list-shell" sx={{ p: 1.75 }}>
-              <Stack spacing={1.2}>
-                <Stack
-                  direction={{ xs: "column", sm: "row" }}
-                  spacing={1}
-                  sx={{
-                    justifyContent: "space-between",
-                    alignItems: { xs: "flex-start", sm: "center" },
-                  }}
+          {stableRecommendation ? (
+            <Box
+              className="list-shell"
+              sx={{
+                p: 1.6,
+                borderLeft: "3px solid #14f195",
+              }}
+            >
+              <Stack
+                direction={{ xs: "column", md: "row" }}
+                spacing={1.5}
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", md: "center" },
+                }}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: "#78f2b0",
+                      display: "block",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.62rem",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: 0.12,
+                    }}
+                  >
+                    Stable promotion recommended
+                  </Typography>
+                  <Typography
+                    variant="subtitle1"
+                    sx={{ color: "#e8f4ff", fontWeight: 650, mt: 0.35 }}
+                  >
+                    ArkEvolve recommends promoting this canary — it beat the
+                    baseline on real usage.
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      color: "var(--text-secondary)",
+                      display: "block",
+                      mt: 0.45,
+                    }}
+                  >
+                    {[
+                      stableRecommendation.successGain != null
+                        ? `${formatSignedPoints(stableRecommendation.successGain)} success`
+                        : "",
+                      stableRecommendation.wins != null &&
+                      stableRecommendation.losses != null
+                        ? `${stableRecommendation.wins} wins / ${stableRecommendation.losses} losses`
+                        : "",
+                      stableRecommendation.pValue != null
+                        ? `p=${stableRecommendation.pValue.toFixed(3)}`
+                        : "",
+                      stableRecommendation.baselineSamples != null &&
+                      stableRecommendation.candidateSamples != null
+                        ? `${Math.round(stableRecommendation.baselineSamples).toLocaleString()} vs ${Math.round(stableRecommendation.candidateSamples).toLocaleString()} runs`
+                        : "",
+                      stableRecommendation.recommendedAt
+                        ? `judged ${formatTimestampForHumans(stableRecommendation.recommendedAt).label}`
+                        : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </Typography>
+                </Box>
+                <Button
+                  variant="contained"
+                  sx={{ flexShrink: 0 }}
+                  disabled={runEvolutionActionMutation.isPending}
+                  onClick={() =>
+                    void runEvolutionAction(
+                      {
+                        action: "promote_prompt_canary_candidate",
+                        candidate_id: "prompt",
+                      },
+                      "Canary promoted to stable. Rollback stays available from History.",
+                      "Promote this prompt canary to stable for all traffic?",
+                    )
+                  }
                 >
-                  <Box>
-                    <Typography
-                      variant="h6"
-                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                    >
-                      No active experiments
-                    </Typography>
-                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                      Evolve is using the current stable behavior across reply
-                      routing, main replies, adaptive prompt guidance, request
-                      understanding, and specialist helpers.
-                    </Typography>
-                  </Box>
-                  <Chip size="small" label="Stable" />
-                </Stack>
-                <Alert severity="info" sx={{ borderRadius: 1 }}>
-                  When Evolve starts testing a new improvement, this page will
-                  explain what is changing, why it could help, how much traffic
-                  is included, and what decision is still pending.
-                </Alert>
+                  Promote to stable
+                </Button>
               </Stack>
             </Box>
-          ) : (
+          ) : null}
+          {testingCandidates.length > 0 ? (
+            <Box className="list-shell" sx={{ p: 1.6 }}>
+              <Typography
+                variant="subtitle1"
+                sx={{
+                  color: "var(--text-primary)",
+                  fontWeight: 600,
+                  fontSize: "0.95rem",
+                  lineHeight: 1.3,
+                }}
+              >
+                Candidates under test
+              </Typography>
+              <Typography
+                variant="body2"
+                sx={{
+                  color: "var(--text-secondary)",
+                  fontSize: "0.78rem",
+                  lineHeight: 1.4,
+                  mt: 0.25,
+                  mb: 1.25,
+                }}
+              >
+                Approved candidates ArkEvolve is optimizing and measuring
+                against the baseline on real usage.
+              </Typography>
+              {(() => {
+                const slice = pageSlice(
+                  testingCandidates,
+                  testingPage,
+                  PROMPT_REVIEW_PAGE_SIZE,
+                );
+                return (
+                  <>
+                    <Stack spacing={1}>
+                      {slice.items.map((row) => (
+                        <EvolveCandidateRow
+                          key={`testing-opp-${str(row.id, "")}`}
+                          row={row}
+                          onOpen={openCandidateDialog}
+                        />
+                      ))}
+                    </Stack>
+                    <ListPager
+                      page={slice.page}
+                      pageCount={slice.pageCount}
+                      rangeStart={slice.rangeStart}
+                      rangeEnd={slice.rangeEnd}
+                      total={slice.total}
+                      noun="candidates"
+                      onPage={setTestingPage}
+                    />
+                  </>
+                );
+              })()}
+            </Box>
+          ) : null}
+          {activeExperimentItems.length === 0 &&
+          testingCandidates.length === 0 &&
+          !stableRecommendation &&
+          visiblePromptCanarySafetyEvents.length === 0 ? (
+            <Box className="list-shell" sx={{ p: 1.75 }}>
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                spacing={1}
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", sm: "center" },
+                }}
+              >
+                <Box>
+                  <Typography
+                    variant="h6"
+                    sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                  >
+                    Nothing is being tested right now
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    ArkEvolve is serving the current stable behavior on every
+                    surface. Approved candidates and live canaries appear
+                    here while they are measured.
+                  </Typography>
+                </Box>
+                <Chip size="small" label="Stable" />
+              </Stack>
+            </Box>
+          ) : null}
+          {activeExperimentItems.length === 0 ? null : (
             <Grid2 container spacing={1.5}>
               {activeExperimentItems.map((item) => {
                 const reasonLabels = replayGateReasonLabels(item);
@@ -3970,6 +4076,239 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               })}
             </Grid2>
           )}
+          {visiblePromptCanarySafetyEvents.length > 0 ? (
+            <Box className="list-shell" sx={{ p: 1.6 }}>
+              <Typography
+                variant="subtitle2"
+                sx={{ color: "#e8f4ff", mb: 0.25 }}
+              >
+                Safety events
+              </Typography>
+              <Typography
+                variant="body2"
+                sx={{
+                  color: "var(--text-secondary)",
+                  fontSize: "0.78rem",
+                  mb: 1,
+                }}
+              >
+                Canary regressions ArkEvolve flagged or auto-reverted on
+                this surface, including ones waiting on a decision.
+              </Typography>
+              <Stack spacing={1}>
+                {visiblePromptCanarySafetyEvents.slice(0, 8).map((row, idx) => {
+                  const eventId = str(row.id, "");
+                  const status = str(row.status, "review_recommended");
+                  const reviewStatus = str(
+                    row.review_status,
+                    status || "open",
+                  );
+                  const reviewedAt = str(row.reviewed_at, "");
+                  const createdAt = str(row.created_at, "");
+                  const baselineVersion = str(row.baseline_version, "");
+                  const candidateVersion = str(row.candidate_version, "");
+                  const baselineSamples = num(row.baseline_samples, 0);
+                  const candidateSamples = num(row.candidate_samples, 0);
+                  const baselineSuccessRate =
+                    num(row.baseline_success_rate, 0) * 100;
+                  const candidateSuccessRate =
+                    num(row.candidate_success_rate, 0) * 100;
+                  const successDelta = num(row.success_delta, 0) * 100;
+                  const reviewEvidence = promptCanaryReviewEvidence(row);
+                  const canReview =
+                    status === "review_recommended" &&
+                    reviewStatus === "open" &&
+                    !!eventId;
+                  return (
+                    <Box
+                      key={`prompt-canary-safety-${eventId || idx}`}
+                      sx={{
+                        p: 1.25,
+                        border: "1px solid var(--ui-rgba-145-170-205-120)",
+                        borderRadius: 1,
+                      }}
+                    >
+                      <Stack
+                        direction={{ xs: "column", md: "row" }}
+                        spacing={1}
+                        sx={{
+                          justifyContent: "space-between",
+                          alignItems: { xs: "flex-start", md: "center" },
+                        }}
+                      >
+                        <Box sx={{ minWidth: 0 }}>
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            useFlexGap
+                            sx={{
+                              alignItems: "center",
+                              flexWrap: "wrap",
+                              mb: 0.45,
+                            }}
+                          >
+                            <Typography
+                              variant="subtitle1"
+                              sx={{ color: "#e8f4ff", fontWeight: 600 }}
+                            >
+                              {str(row.title, "Experiment needs attention")}
+                            </Typography>
+                            <Chip
+                              size="small"
+                              color={promptCanarySafetyStatusColor(
+                                reviewStatus,
+                              )}
+                              label={
+                                reviewStatus === "open"
+                                  ? "Needs decision"
+                                  : humanizeStatusLabel(reviewStatus)
+                              }
+                            />
+                          </Stack>
+                          <Typography variant="body1">
+                            {str(
+                              row.summary,
+                              "Recent traffic suggests this experiment needs a human decision.",
+                            )}
+                          </Typography>
+                          <Typography
+                            variant="body2"
+                            sx={{
+                              color: "text.secondary",
+                              display: "block",
+                              mt: 0.75,
+                            }}
+                          >
+                            {promptCanaryActionSummary(row)}
+                          </Typography>
+                          {reviewedAt ? (
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                color: "text.secondary",
+                                display: "block",
+                                mt: 0.45,
+                              }}
+                            >
+                              Reviewed {formatTimestampForHumans(reviewedAt).label}
+                            </Typography>
+                          ) : createdAt ? (
+                            <Typography
+                              variant="body2"
+                              sx={{
+                                color: "text.secondary",
+                                display: "block",
+                                mt: 0.45,
+                              }}
+                            >
+                              Recorded {formatTimestampForHumans(createdAt).label}
+                            </Typography>
+                          ) : null}
+                        </Box>
+                        {canReview ? (
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            sx={{ flexShrink: 0 }}
+                          >
+                            <Button
+                              size="small"
+                              variant="contained"
+                              disabled={runEvolutionActionMutation.isPending}
+                              onClick={() =>
+                                void runEvolutionAction(
+                                  {
+                                    action: "disable_prompt_canary_candidate",
+                                    candidate_id: eventId,
+                                  },
+                                  "Experiment stopped.",
+                                  "Stop this experiment now?",
+                                )
+                              }
+                            >
+                              Stop test
+                            </Button>
+                            <Button
+                              size="small"
+                              color="inherit"
+                              disabled={runEvolutionActionMutation.isPending}
+                              onClick={() =>
+                                void runEvolutionAction(
+                                  {
+                                    action: "keep_prompt_canary_candidate",
+                                    candidate_id: eventId,
+                                  },
+                                  "Recorded decision to keep the experiment active.",
+                                )
+                              }
+                            >
+                              Keep testing
+                            </Button>
+                          </Stack>
+                        ) : null}
+                      </Stack>
+                      <Box
+                        sx={{
+                          display: "flex",
+                          justifyContent: "flex-end",
+                          mt: 1,
+                        }}
+                      >
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() =>
+                            setTechnicalDialogProposalId(`canary:${eventId}`)
+                          }
+                        >
+                          See technical details
+                        </Button>
+                      </Box>
+                      <Dialog
+                        open={
+                          technicalDialogProposalId === `canary:${eventId}`
+                        }
+                        onClose={() => setTechnicalDialogProposalId(null)}
+                        maxWidth="md"
+                        fullWidth
+                      >
+                        <DialogTitle>Technical details</DialogTitle>
+                        <DialogContent>
+                          <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
+                          <Stack spacing={0.75} sx={{ mt: 2 }}>
+                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                              Stable version: {baselineVersion || "-"}
+                            </Typography>
+                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                              Experiment version: {candidateVersion || "-"}
+                            </Typography>
+                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                              Stable behavior: {baselineSuccessRate.toFixed(1)}% over {baselineSamples.toLocaleString()} runs
+                            </Typography>
+                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                              Experiment: {candidateSuccessRate.toFixed(1)}% over {candidateSamples.toLocaleString()} runs
+                            </Typography>
+                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                              Success delta: {successDelta.toFixed(1)} pts
+                            </Typography>
+                          </Stack>
+                        </DialogContent>
+                        <DialogActions>
+                          <Button
+                            onClick={() =>
+                              setTechnicalDialogProposalId(null)
+                            }
+                          >
+                            Close
+                          </Button>
+                        </DialogActions>
+                      </Dialog>
+                    </Box>
+                  );
+                })}
+              </Stack>
+            </Box>
+          ) : null}
           {developerModeEnabled && stableExperimentItems.length > 0 ? (
             <Accordion disableGutters className="chat-workspace-section">
               <AccordionSummary expandIcon={<ExpandMoreIcon />}>
@@ -4063,7 +4402,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     lineHeight: 1.3,
                   }}
                 >
-                  Review queue
+                  Candidates
                 </Typography>
                 <Typography
                   variant="body2"
@@ -4074,35 +4413,63 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     mt: 0.25,
                   }}
                 >
-                  Improvements Evolve drafted from recent runs. Each one
-                  waits on your decision before AgentArk behavior changes.
-                  Ranked by estimated savings and recent slow, costly,
-                  corrected, or failed samples.
+                  ArkEvolve scans this install's real usage into typed evolve
+                  candidates. Nothing changes until you approve an item.
                 </Typography>
               </Box>
-              <FormControlLabel
-                control={
-                  <Switch
-                    size="small"
-                    checked={showSuperseded}
-                    onChange={(event) => setShowSuperseded(event.target.checked)}
-                  />
-                }
-                label="Show past decisions"
-                sx={{
-                  m: 0,
-                  flex: "0 0 auto",
-                  alignSelf: "center",
-                  "& .MuiTypography-root": {
-                    fontFamily: "var(--font-mono)",
-                    fontSize: "0.7rem",
-                    textTransform: "uppercase",
-                    color: "var(--text-secondary)",
-                    letterSpacing: 0.04,
-                  },
-                }}
-              />
+              <Stack
+                direction="row"
+                spacing={1}
+                sx={{ flex: "0 0 auto", alignItems: "center" }}
+              >
+                <FormControlLabel
+                  control={
+                    <Switch
+                      size="small"
+                      checked={showSuperseded}
+                      onChange={(event) => setShowSuperseded(event.target.checked)}
+                    />
+                  }
+                  label="Show past decisions"
+                  sx={{
+                    m: 0,
+                    "& .MuiTypography-root": {
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.7rem",
+                      textTransform: "uppercase",
+                      color: "var(--text-secondary)",
+                      letterSpacing: 0.04,
+                    },
+                  }}
+                />
+                <Chip
+                  size="small"
+                  color={backgroundImprovementColor}
+                  label={backgroundImprovementLabel}
+                  title="Background improvement status"
+                />
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="inherit"
+                  sx={{ whiteSpace: "nowrap" }}
+                  disabled={runEvolutionActionMutation.isPending}
+                  onClick={() =>
+                    void runEvolutionAction(
+                      { action: "scan_evolve_candidates" },
+                      "ArkEvolve scan finished.",
+                    )
+                  }
+                >
+                  Run ArkEvolve scan
+                </Button>
+              </Stack>
             </Stack>
+            {lastEvolveScanMessage ? (
+              <Alert severity="info" sx={{ borderRadius: 1, mb: 1.25 }}>
+                {lastEvolveScanMessage}
+              </Alert>
+            ) : null}
             {arkdistillContextSamples != null && arkdistillContextSamples > 0 ? (
               <Box
                 sx={{
@@ -4181,9 +4548,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               <Alert severity="warning" sx={{ borderRadius: 1 }}>
                 Approval details are unavailable: {detailError}
               </Alert>
-            ) : skillReviewItems.length === 0 &&
+            ) : surfacedCandidates.length === 0 &&
               visibleNonSkillLearningCandidates.length === 0 &&
-              visiblePromptCanarySafetyEvents.length === 0 &&
               visiblePromptOptimizationOpportunities.length === 0 ? (
               <Typography
                 variant="body2"
@@ -4191,234 +4557,70 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   color: "text.secondary",
                 }}
               >
-                Nothing is waiting on you right now. Approved suggestions still
-                in background testing are not deployed, so there is nothing to
-                roll back.
+                ArkEvolve scans real usage during quiet time. Nothing needs
+                review yet.
               </Typography>
             ) : (
               <Stack spacing={1.5}>
-                {visiblePromptCanarySafetyEvents.length > 0 ? (
+                {surfacedCandidates.length > 0 ? (
                   <Box>
                     <Typography
                       variant="subtitle2"
-                      sx={{ color: "#e8f4ff", mb: 1 }}
+                      sx={{ color: "#e8f4ff", mb: 0.25 }}
                     >
-                      Experiment decisions
+                      From your usage
                     </Typography>
-                    <Stack spacing={1}>
-                      {visiblePromptCanarySafetyEvents.slice(0, 8).map((row, idx) => {
-                        const eventId = str(row.id, "");
-                        const status = str(row.status, "review_recommended");
-                        const reviewStatus = str(
-                          row.review_status,
-                          status || "open",
-                        );
-                        const reviewedAt = str(row.reviewed_at, "");
-                        const createdAt = str(row.created_at, "");
-                        const baselineVersion = str(row.baseline_version, "");
-                        const candidateVersion = str(row.candidate_version, "");
-                        const baselineSamples = num(row.baseline_samples, 0);
-                        const candidateSamples = num(row.candidate_samples, 0);
-                        const baselineSuccessRate =
-                          num(row.baseline_success_rate, 0) * 100;
-                        const candidateSuccessRate =
-                          num(row.candidate_success_rate, 0) * 100;
-                        const successDelta = num(row.success_delta, 0) * 100;
-                        const reviewEvidence = promptCanaryReviewEvidence(row);
-                        const canReview =
-                          status === "review_recommended" &&
-                          reviewStatus === "open" &&
-                          !!eventId;
-                        return (
-                          <Box
-                            key={`prompt-canary-safety-${eventId || idx}`}
-                            sx={{
-                              p: 1.25,
-                              border: "1px solid var(--ui-rgba-145-170-205-120)",
-                              borderRadius: 1,
-                            }}
-                          >
-                            <Stack
-                              direction={{ xs: "column", md: "row" }}
-                              spacing={1}
-                              sx={{
-                                justifyContent: "space-between",
-                                alignItems: { xs: "flex-start", md: "center" },
-                              }}
-                            >
-                              <Box sx={{ minWidth: 0 }}>
-                                <Stack
-                                  direction="row"
-                                  spacing={0.75}
-                                  useFlexGap
-                                  sx={{
-                                    alignItems: "center",
-                                    flexWrap: "wrap",
-                                    mb: 0.45,
-                                  }}
-                                >
-                                  <Typography
-                                    variant="subtitle1"
-                                    sx={{ color: "#e8f4ff", fontWeight: 600 }}
-                                  >
-                                    {str(row.title, "Experiment needs attention")}
-                                  </Typography>
-                                  <Chip
-                                    size="small"
-                                    color={promptCanarySafetyStatusColor(
-                                      reviewStatus,
-                                    )}
-                                    label={
-                                      reviewStatus === "open"
-                                        ? "Needs decision"
-                                        : humanizeStatusLabel(reviewStatus)
-                                    }
-                                  />
-                                </Stack>
-                                <Typography variant="body1">
-                                  {str(
-                                    row.summary,
-                                    "Recent traffic suggests this experiment needs a human decision.",
-                                  )}
-                                </Typography>
-                                <Typography
-                                  variant="body2"
-                                  sx={{
-                                    color: "text.secondary",
-                                    display: "block",
-                                    mt: 0.75,
-                                  }}
-                                >
-                                  {promptCanaryActionSummary(row)}
-                                </Typography>
-                                {reviewedAt ? (
-                                  <Typography
-                                    variant="body2"
-                                    sx={{
-                                      color: "text.secondary",
-                                      display: "block",
-                                      mt: 0.45,
-                                    }}
-                                  >
-                                    Reviewed {formatTimestampForHumans(reviewedAt).label}
-                                  </Typography>
-                                ) : createdAt ? (
-                                  <Typography
-                                    variant="body2"
-                                    sx={{
-                                      color: "text.secondary",
-                                      display: "block",
-                                      mt: 0.45,
-                                    }}
-                                  >
-                                    Recorded {formatTimestampForHumans(createdAt).label}
-                                  </Typography>
-                                ) : null}
-                              </Box>
-                              {canReview ? (
-                                <Stack
-                                  direction="row"
-                                  spacing={0.75}
-                                  sx={{ flexShrink: 0 }}
-                                >
-                                  <Button
-                                    size="small"
-                                    variant="contained"
-                                    disabled={runEvolutionActionMutation.isPending}
-                                    onClick={() =>
-                                      void runEvolutionAction(
-                                        {
-                                          action: "disable_prompt_canary_candidate",
-                                          candidate_id: eventId,
-                                        },
-                                        "Experiment stopped.",
-                                        "Stop this experiment now?",
-                                      )
-                                    }
-                                  >
-                                    Stop test
-                                  </Button>
-                                  <Button
-                                    size="small"
-                                    color="inherit"
-                                    disabled={runEvolutionActionMutation.isPending}
-                                    onClick={() =>
-                                      void runEvolutionAction(
-                                        {
-                                          action: "keep_prompt_canary_candidate",
-                                          candidate_id: eventId,
-                                        },
-                                        "Recorded decision to keep the experiment active.",
-                                      )
-                                    }
-                                  >
-                                    Keep testing
-                                  </Button>
-                                </Stack>
-                              ) : null}
-                            </Stack>
-                            <Box
-                              sx={{
-                                display: "flex",
-                                justifyContent: "flex-end",
-                                mt: 1,
-                              }}
-                            >
-                              <Button
-                                size="small"
-                                variant="text"
-                                onClick={() =>
-                                  setTechnicalDialogProposalId(`canary:${eventId}`)
-                                }
-                              >
-                                See technical details
-                              </Button>
-                            </Box>
-                            <Dialog
-                              open={
-                                technicalDialogProposalId === `canary:${eventId}`
-                              }
-                              onClose={() => setTechnicalDialogProposalId(null)}
-                              maxWidth="md"
-                              fullWidth
-                            >
-                              <DialogTitle>Technical details</DialogTitle>
-                              <DialogContent>
-                                <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
-                                <Stack spacing={0.75} sx={{ mt: 2 }}>
-                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    Stable version: {baselineVersion || "-"}
-                                  </Typography>
-                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    Experiment version: {candidateVersion || "-"}
-                                  </Typography>
-                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    Stable behavior: {baselineSuccessRate.toFixed(1)}% over {baselineSamples.toLocaleString()} runs
-                                  </Typography>
-                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    Experiment: {candidateSuccessRate.toFixed(1)}% over {candidateSamples.toLocaleString()} runs
-                                  </Typography>
-                                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                    Success delta: {successDelta.toFixed(1)} pts
-                                  </Typography>
-                                </Stack>
-                              </DialogContent>
-                              <DialogActions>
-                                <Button
-                                  onClick={() =>
-                                    setTechnicalDialogProposalId(null)
-                                  }
-                                >
-                                  Close
-                                </Button>
-                              </DialogActions>
-                            </Dialog>
-                          </Box>
-                        );
-                      })}
-                    </Stack>
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "var(--text-secondary)",
+                        display: "block",
+                        mb: 1,
+                      }}
+                    >
+                      Typed evolve candidates from real activity, including
+                      token savings, contract repair, routing, and learned
+                      behavior. Open a row for evidence and actions.
+                    </Typography>
+                    {(() => {
+                      const slice = pageSlice(
+                        surfacedCandidates,
+                        surfacedPage,
+                        PROMPT_REVIEW_PAGE_SIZE,
+                      );
+                      return (
+                        <>
+                          <Stack spacing={1}>
+                            {slice.items.map((row) => (
+                              <EvolveCandidateRow
+                                key={`surfaced-opp-${str(row.id, "")}`}
+                                row={row}
+                                onOpen={openCandidateDialog}
+                              />
+                            ))}
+                          </Stack>
+                          <ListPager
+                            page={slice.page}
+                            pageCount={slice.pageCount}
+                            rangeStart={slice.rangeStart}
+                            rangeEnd={slice.rangeEnd}
+                            total={slice.total}
+                            noun="candidates"
+                            onPage={setSurfacedPage}
+                          />
+                        </>
+                      );
+                    })()}
                   </Box>
-                ) : null}
+                ) : (
+                  <Typography
+                    variant="caption"
+                    sx={{ color: "var(--text-secondary)" }}
+                  >
+                    ArkEvolve scans real usage during quiet time. Nothing needs
+                    review yet.
+                  </Typography>
+                )}
                 {visiblePromptOptimizationOpportunities.length > 0
                   ? (() => {
                       const pageCount = Math.max(
@@ -4431,9 +4633,23 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                       const page = Math.min(promptReviewPage, pageCount - 1);
                       return (
                   <Box>
-                    {/* Removed "Suggestions before behavior changes" header.
-                        The chip strip already says "Needs review (N)" — a
-                        section sub-header below it was redundant. */}
+                    <Typography
+                      variant="subtitle2"
+                      sx={{ color: "#e8f4ff", mb: 0.25 }}
+                    >
+                      Prompt section proposals
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        color: "var(--text-secondary)",
+                        display: "block",
+                        mb: 1,
+                      }}
+                    >
+                      Ranked by estimated savings and recent slow, costly,
+                      corrected, or failed samples.
+                    </Typography>
                     <Stack spacing={1}>
                       {visiblePromptOptimizationOpportunities
                         .slice(
@@ -5460,577 +5676,22 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                         );
                       })}
                     </Stack>
-                    {pageCount > 1 ? (
-                      <Box
-                        sx={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          gap: 2,
-                          mt: 1.5,
-                          pt: 1,
-                          borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
-                        }}
-                      >
-                        <Typography
-                          sx={{
-                            fontFamily: "var(--font-mono)",
-                            fontSize: "0.66rem",
-                            color: "var(--text-faint)",
-                            letterSpacing: 0.04,
-                          }}
-                        >
-                          {`Showing ${page * PROMPT_REVIEW_PAGE_SIZE + 1}–${Math.min(
-                            (page + 1) * PROMPT_REVIEW_PAGE_SIZE,
-                            visiblePromptOptimizationOpportunities.length,
-                          )} of ${visiblePromptOptimizationOpportunities.length} proposals`}
-                        </Typography>
-                        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                          <Button
-                            size="small"
-                            variant="text"
-                            disabled={page <= 0}
-                            onClick={() =>
-                              setPromptReviewPage((p) => Math.max(0, p - 1))
-                            }
-                            sx={{
-                              minWidth: 28,
-                              height: 28,
-                              px: 0.75,
-                              borderRadius: "7px",
-                              fontFamily: "var(--font-mono)",
-                              fontSize: "0.95rem",
-                              color: "var(--text-faint)",
-                              border: "1px solid transparent",
-                              "&:hover": {
-                                borderColor: "var(--ui-rgba-145-170-205-120)",
-                                color: "#78f2b0",
-                              },
-                              "&.Mui-disabled": { opacity: 0.35 },
-                            }}
-                            aria-label="Previous page"
-                          >
-                            ‹
-                          </Button>
-                          {Array.from({ length: pageCount }).map((_unused, i) => (
-                            <Button
-                              key={`prompt-review-page-${i}`}
-                              size="small"
-                              variant="text"
-                              onClick={() => setPromptReviewPage(i)}
-                              sx={{
-                                minWidth: 30,
-                                height: 28,
-                                px: 0.75,
-                                borderRadius: "7px",
-                                fontFamily: "var(--font-mono)",
-                                fontSize: "0.72rem",
-                                color: i === page ? "#78f2b0" : "var(--text-secondary)",
-                                border:
-                                  i === page
-                                    ? "1px solid rgba(120, 242, 176, 0.4)"
-                                    : "1px solid transparent",
-                                background:
-                                  i === page ? "rgba(120, 242, 176, 0.08)" : "transparent",
-                                "&:hover": {
-                                  borderColor:
-                                    i === page
-                                      ? "rgba(120, 242, 176, 0.4)"
-                                      : "var(--ui-rgba-145-170-205-120)",
-                                  color: i === page ? "#78f2b0" : "var(--text-primary)",
-                                },
-                              }}
-                            >
-                              {i + 1}
-                            </Button>
-                          ))}
-                          <Button
-                            size="small"
-                            variant="text"
-                            disabled={page >= pageCount - 1}
-                            onClick={() =>
-                              setPromptReviewPage((p) =>
-                                Math.min(pageCount - 1, p + 1),
-                              )
-                            }
-                            sx={{
-                              minWidth: 28,
-                              height: 28,
-                              px: 0.75,
-                              borderRadius: "7px",
-                              fontFamily: "var(--font-mono)",
-                              fontSize: "0.95rem",
-                              color: "var(--text-faint)",
-                              border: "1px solid transparent",
-                              "&:hover": {
-                                borderColor: "var(--ui-rgba-145-170-205-120)",
-                                color: "#78f2b0",
-                              },
-                              "&.Mui-disabled": { opacity: 0.35 },
-                            }}
-                            aria-label="Next page"
-                          >
-                            ›
-                          </Button>
-                        </Box>
-                      </Box>
-                    ) : null}
+                    <ListPager
+                      page={page}
+                      pageCount={pageCount}
+                      rangeStart={page * PROMPT_REVIEW_PAGE_SIZE + 1}
+                      rangeEnd={Math.min(
+                        (page + 1) * PROMPT_REVIEW_PAGE_SIZE,
+                        visiblePromptOptimizationOpportunities.length,
+                      )}
+                      total={visiblePromptOptimizationOpportunities.length}
+                      noun="proposals"
+                      onPage={setPromptReviewPage}
+                    />
                   </Box>
                       );
                     })()
                   : null}
-                {skillReviewItems.length > 0 ? (
-                  <Box>
-                    <Typography
-                      variant="subtitle2"
-                      sx={{ color: "#e8f4ff", mb: 1 }}
-                    >
-                      Skill changes
-                    </Typography>
-                    <Stack spacing={1}>
-                      {skillReviewItems.map((row, idx) => {
-                        const candidateId = str(row.id, "");
-                        const status = str(row.approval_status, "draft");
-                        const evidence = asRecord(row.evidence);
-                        const diffPreview = asRecord(row.diff_preview);
-                        const added = stringList(diffPreview.added);
-                        const removed = stringList(diffPreview.removed);
-                        const headings = stringList(diffPreview.headings);
-                        const baseline = asRecord(row.impact_baseline);
-                        const failureReasons = stringList(
-                          evidence.recent_failure_reasons,
-                        );
-                        const selectedExamples = stringList(
-                          evidence.selected_failure_examples,
-                        );
-                        const reviewEvidence = skillReviewEvidence(row);
-                        const replayGate = asRecord(row.replay_gate);
-                        const replayGateStatus = str(replayGate.status, "");
-                        const replayGateReason = str(replayGate.reason, "");
-                        const replayGateAllows = toBool(replayGate.allow_approval);
-                        const readiness = readinessRecord(row.readiness);
-                        const readinessAllowsReview = readiness
-                          ? toBool(readiness.allows_review)
-                          : true;
-                        const canReview =
-                          !!candidateId &&
-                          status !== "approved" &&
-                          status !== "rejected";
-                        const canApprove =
-                          canReview && replayGateAllows && readinessAllowsReview;
-                        const readinessBlocker = stringList(
-                          readiness?.blockers,
-                        )[0];
-                        return (
-                          <Box
-                            key={`skill-review-${candidateId || idx}`}
-                            sx={{
-                              p: 1.25,
-                              border: "1px solid var(--ui-rgba-145-170-205-120)",
-                              borderRadius: 1,
-                            }}
-                          >
-                            <Stack
-                              direction={{ xs: "column", md: "row" }}
-                              spacing={1}
-                              sx={{
-                                justifyContent: "space-between",
-                                alignItems: { xs: "flex-start", md: "center" },
-                              }}
-                            >
-                              <Box sx={{ minWidth: 0 }}>
-                                <Stack
-                                  direction="row"
-                                  spacing={0.75}
-                                  useFlexGap
-                                  sx={{
-                                    alignItems: "center",
-                                    flexWrap: "wrap",
-                                    mb: 0.45,
-                                  }}
-                                >
-                                  <Typography
-                                    variant="subtitle1"
-                                    sx={{ color: "#e8f4ff", fontWeight: 600 }}
-                                  >
-                                    {canonicalSkillIdentifier(
-                                      str(
-                                        row.skill_name,
-                                        str(row.title, "Skill candidate"),
-                                      ),
-                                    )}
-                                  </Typography>
-                                  <Chip
-                                    size="small"
-                                    label={skillEvolutionActionLabel(
-                                      str(row.action, ""),
-                                    )}
-                                  />
-                                  <Chip
-                                    size="small"
-                                    color={skillEvolutionChipColor(status)}
-                                    label={
-                                      status === "draft"
-                                        ? "Needs decision"
-                                        : humanizeStatusLabel(status)
-                                    }
-                                  />
-                                  <Chip
-                                    size="small"
-                                    variant="outlined"
-                                    label={`${ratioPercent(row.confidence).toFixed(0)}% confidence`}
-                                  />
-                                  {replayGateStatus ? (
-                                    <Chip
-                                      size="small"
-                                      color={
-                                        replayGateStatus === "passed"
-                                          ? "success"
-                                          : replayGateStatus === "needs_more_data"
-                                            ? "warning"
-                                            : "error"
-                                      }
-                                      label={`Replay: ${humanizeStatusLabel(replayGateStatus)}`}
-                                    />
-                                  ) : null}
-                                  {readiness ? (
-                                    <Chip
-                                      size="small"
-                                      clickable
-                                      color={readinessChipColor(
-                                        str(readiness.stage, ""),
-                                      )}
-                                      label={readinessShortLabel(readiness)}
-                                      onClick={() =>
-                                        setReadinessDialog({
-                                          title: str(
-                                            row.title,
-                                            "Skill change readiness",
-                                          ),
-                                          readiness,
-                                        })
-                                      }
-                                    />
-                                  ) : null}
-                                </Stack>
-                                <Typography variant="body1">
-                                  {str(
-                                    row.diff_summary,
-                                    str(row.summary, "Reviewable capability change"),
-                                  )}
-                                </Typography>
-                                <Typography
-                                  variant="body2"
-                                  sx={{ color: "text.secondary", display: "block", mt: 0.75 }}
-                                >
-                                  Based on {num(baseline.matched_runs, 0)} matched runs with{" "}
-                                  {percentageLabel(baseline.success_rate, 1) || "-"} success and{" "}
-                                  {percentageLabel(baseline.failure_rate, 1) || "-"} failure.
-                                </Typography>
-                                {replayGateReason ? (
-                                  <Typography
-                                    variant="body2"
-                                    sx={{ color: "text.secondary", display: "block", mt: 0.45 }}
-                                  >
-                                    Replay gate: {replayGateReason}
-                                  </Typography>
-                                ) : null}
-                                {readinessSummary(readiness) ? (
-                                  <Typography
-                                    variant="body2"
-                                    sx={{ color: "text.secondary", display: "block", mt: 0.45 }}
-                                  >
-                                    Readiness: {readinessSummary(readiness)}
-                                  </Typography>
-                                ) : null}
-                                {!canApprove && readinessBlocker ? (
-                                  <Typography
-                                    variant="body2"
-                                    sx={{ color: "warning.main", display: "block", mt: 0.45 }}
-                                  >
-                                    Waiting: {readinessBlocker}
-                                  </Typography>
-                                ) : null}
-                              </Box>
-                              <Stack
-                                direction="row"
-                                spacing={0.75}
-                                sx={{ flexShrink: 0 }}
-                              >
-                                <Button
-                                  size="small"
-                                  variant="contained"
-                                  disabled={
-                                    runEvolutionActionMutation.isPending || !canApprove
-                                  }
-                                  onClick={() =>
-                                    void runEvolutionAction(
-                                      {
-                                        action: "approve_learning_candidate",
-                                        candidate_id: candidateId,
-                                      },
-                                      "Skill change approved.",
-                                    )
-                                  }
-                                >
-                                  Approve
-                                </Button>
-                                <Button
-                                  size="small"
-                                  color="inherit"
-                                  disabled={
-                                    runEvolutionActionMutation.isPending || !canReview
-                                  }
-                                  onClick={() =>
-                                    void runEvolutionAction(
-                                      {
-                                        action: "reject_learning_candidate",
-                                        candidate_id: candidateId,
-                                      },
-                                      "Skill change rejected.",
-                                    )
-                                  }
-                                >
-                                  Reject
-                                </Button>
-                              </Stack>
-                            </Stack>
-                            <Box
-                              sx={{
-                                display: "flex",
-                                justifyContent: "flex-end",
-                                mt: 1,
-                              }}
-                            >
-                              <Button
-                                size="small"
-                                variant="text"
-                                onClick={() =>
-                                  setTechnicalDialogProposalId(
-                                    `skill:${candidateId}`,
-                                  )
-                                }
-                              >
-                                See technical details
-                              </Button>
-                            </Box>
-                            <Dialog
-                              open={
-                                technicalDialogProposalId ===
-                                `skill:${candidateId}`
-                              }
-                              onClose={() => setTechnicalDialogProposalId(null)}
-                              maxWidth="md"
-                              fullWidth
-                            >
-                              <DialogTitle>Technical details</DialogTitle>
-                              <DialogContent>
-                                <EvolutionReviewEvidenceStrip evidence={reviewEvidence} />
-                                <Box
-                                  sx={{
-                                    display: "grid",
-                                    gridTemplateColumns: {
-                                      xs: "1fr",
-                                      md: "repeat(4, minmax(0,1fr))",
-                                    },
-                                    gap: 1,
-                                    mt: 2,
-                                  }}
-                                >
-                                  <Box>
-                                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                      Matched runs
-                                    </Typography>
-                                    <Typography variant="body1">
-                                      {num(baseline.matched_runs, 0)}
-                                    </Typography>
-                                  </Box>
-                                  <Box>
-                                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                      Success
-                                    </Typography>
-                                    <Typography variant="body1">
-                                      {percentageLabel(baseline.success_rate, 1) || "-"}
-                                    </Typography>
-                                  </Box>
-                                  <Box>
-                                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                      Failure
-                                    </Typography>
-                                    <Typography variant="body1">
-                                      {percentageLabel(baseline.failure_rate, 1) || "-"}
-                                    </Typography>
-                                  </Box>
-                                  <Box>
-                                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                                      Tool errors
-                                    </Typography>
-                                    <Typography variant="body1">
-                                      {percentageLabel(baseline.tool_error_rate, 1) || "-"}
-                                    </Typography>
-                                  </Box>
-                                </Box>
-                                {headings.length > 0 ? (
-                                  <Stack
-                                    direction="row"
-                                    spacing={0.75}
-                                    useFlexGap
-                                    sx={{ flexWrap: "wrap", mt: 1.5 }}
-                                  >
-                                    {headings.map((heading) => (
-                                      <Chip
-                                        key={`${candidateId}-${heading}`}
-                                        size="small"
-                                        variant="outlined"
-                                        label={heading}
-                                      />
-                                    ))}
-                                  </Stack>
-                                ) : null}
-                                <Box
-                                  sx={{
-                                    mt: 1.5,
-                                    display: "grid",
-                                    gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
-                                    gap: 1.5,
-                                  }}
-                                >
-                                  <Box>
-                                    <Typography
-                                      variant="body2"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                        mb: 0.5,
-                                        fontWeight: 600,
-                                      }}
-                                    >
-                                      Added / changed
-                                    </Typography>
-                                    {added.length === 0 ? (
-                                      <Typography
-                                        variant="body2"
-                                        sx={{ color: "text.secondary" }}
-                                      >
-                                        No added lines recorded.
-                                      </Typography>
-                                    ) : (
-                                      <Stack spacing={0.5}>
-                                        {added.slice(0, 5).map((line, lineIdx) => (
-                                          <Typography
-                                            key={`${candidateId}-added-${lineIdx}`}
-                                            variant="body2"
-                                            sx={{
-                                              color: "#fff8ed",
-                                              display: "block",
-                                            }}
-                                          >
-                                            + {line}
-                                          </Typography>
-                                        ))}
-                                      </Stack>
-                                    )}
-                                  </Box>
-                                  <Box>
-                                    <Typography
-                                      variant="body2"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                        mb: 0.5,
-                                        fontWeight: 600,
-                                      }}
-                                    >
-                                      Removed / replaced
-                                    </Typography>
-                                    {removed.length === 0 ? (
-                                      <Typography
-                                        variant="body2"
-                                        sx={{ color: "text.secondary" }}
-                                      >
-                                        No removed lines recorded.
-                                      </Typography>
-                                    ) : (
-                                      <Stack spacing={0.5}>
-                                        {removed.slice(0, 5).map((line, lineIdx) => (
-                                          <Typography
-                                            key={`${candidateId}-removed-${lineIdx}`}
-                                            variant="body2"
-                                            sx={{
-                                              color: "#fdb4c0",
-                                              display: "block",
-                                            }}
-                                          >
-                                            - {line}
-                                          </Typography>
-                                        ))}
-                                      </Stack>
-                                    )}
-                                  </Box>
-                                </Box>
-                                {failureReasons.length > 0 ||
-                                selectedExamples.length > 0 ? (
-                                  <Box sx={{ mt: 1.5 }}>
-                                    <Typography
-                                      variant="body2"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                        mb: 0.5,
-                                        fontWeight: 600,
-                                      }}
-                                    >
-                                      Evidence
-                                    </Typography>
-                                    <Stack spacing={0.5}>
-                                      {failureReasons
-                                        .slice(0, 3)
-                                        .map((line, lineIdx) => (
-                                          <Typography
-                                            key={`${candidateId}-failure-${lineIdx}`}
-                                            variant="body2"
-                                            sx={{
-                                              color: "text.secondary",
-                                              display: "block",
-                                            }}
-                                          >
-                                            Failure: {line}
-                                          </Typography>
-                                        ))}
-                                      {selectedExamples
-                                        .slice(0, 2)
-                                        .map((line, lineIdx) => (
-                                          <Typography
-                                            key={`${candidateId}-selected-${lineIdx}`}
-                                            variant="body2"
-                                            sx={{
-                                              color: "text.secondary",
-                                              display: "block",
-                                            }}
-                                          >
-                                            Mismatch: {line}
-                                          </Typography>
-                                        ))}
-                                    </Stack>
-                                  </Box>
-                                ) : null}
-                              </DialogContent>
-                              <DialogActions>
-                                <Button
-                                  onClick={() =>
-                                    setTechnicalDialogProposalId(null)
-                                  }
-                                >
-                                  Close
-                                </Button>
-                              </DialogActions>
-                            </Dialog>
-                          </Box>
-                        );
-                      })}
-                    </Stack>
-                  </Box>
-                ) : null}
                 {visibleNonSkillLearningCandidates.length > 0 ? (
                   <Box>
                     <Typography
@@ -6303,6 +5964,268 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           </Box>
         </Stack>
       ) : null}
+      {tab === "history" ? (
+        <Stack spacing={1.5}>
+          <Box className="list-shell" sx={{ p: 1.6 }}>
+            <Typography
+              variant="subtitle1"
+              sx={{
+                color: "var(--text-primary)",
+                fontWeight: 600,
+                fontSize: "0.95rem",
+                lineHeight: 1.3,
+              }}
+            >
+              Past candidates
+            </Typography>
+            <Typography
+              variant="body2"
+              sx={{
+                color: "var(--text-secondary)",
+                fontSize: "0.78rem",
+                lineHeight: 1.4,
+                mt: 0.25,
+                mb: 1.25,
+              }}
+            >
+              Dismissed and auto-reverted candidates. ArkEvolve keeps their
+              evidence and only revisits a segment if it changes materially.
+            </Typography>
+            {historyCandidates.length === 0 ? (
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                No dismissed or reverted candidates yet.
+              </Typography>
+            ) : (
+              (() => {
+                const slice = pageSlice(
+                  historyCandidates,
+                  historyPage,
+                  PROMPT_REVIEW_PAGE_SIZE,
+                );
+                return (
+                  <>
+                    <Stack spacing={1}>
+                      {slice.items.map((row) => (
+                        <EvolveCandidateRow
+                          key={`history-opp-${str(row.id, "")}`}
+                          row={row}
+                          onOpen={openCandidateDialog}
+                        />
+                      ))}
+                    </Stack>
+                    <ListPager
+                      page={slice.page}
+                      pageCount={slice.pageCount}
+                      rangeStart={slice.rangeStart}
+                      rangeEnd={slice.rangeEnd}
+                      total={slice.total}
+                      noun="candidates"
+                      onPage={setHistoryPage}
+                    />
+                  </>
+                );
+              })()
+            )}
+          </Box>
+          <Box className="list-shell" sx={{ p: 1.6 }}>
+            <Typography
+              variant="subtitle1"
+              sx={{
+                color: "var(--text-primary)",
+                fontWeight: 600,
+                fontSize: "0.95rem",
+                lineHeight: 1.3,
+              }}
+            >
+              Safety event log
+            </Typography>
+            <Typography
+              variant="body2"
+              sx={{
+                color: "var(--text-secondary)",
+                fontSize: "0.78rem",
+                lineHeight: 1.4,
+                mt: 0.25,
+                mb: 1.25,
+              }}
+            >
+              Every canary regression ArkEvolve recorded, including
+              auto-reverts. Actionable events also appear under Testing.
+            </Typography>
+            {promptCanarySafetyEvents.length === 0 ? (
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                No safety events recorded.
+              </Typography>
+            ) : (
+              <Stack spacing={0.75}>
+                {promptCanarySafetyEvents.slice(0, 12).map((row, idx) => {
+                  const eventStatus = str(
+                    row.review_status,
+                    str(row.status, "open"),
+                  );
+                  const createdAt = str(row.created_at, "");
+                  return (
+                    <Box
+                      key={`safety-log-${str(row.id, String(idx))}`}
+                      sx={{
+                        p: 1.1,
+                        border: "1px solid var(--ui-rgba-145-170-205-120)",
+                        borderRadius: 1,
+                      }}
+                    >
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{ alignItems: "center", flexWrap: "wrap" }}
+                      >
+                        <Typography
+                          variant="body2"
+                          sx={{ color: "#e8f4ff", fontWeight: 600 }}
+                        >
+                          {str(row.title, "Canary safety event")}
+                        </Typography>
+                        <Chip
+                          size="small"
+                          color={promptCanarySafetyStatusColor(eventStatus)}
+                          label={humanizeStatusLabel(
+                            str(row.status, eventStatus),
+                          )}
+                        />
+                        {createdAt ? (
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "var(--text-faint)" }}
+                          >
+                            {formatTimestampForHumans(createdAt).label}
+                          </Typography>
+                        ) : null}
+                      </Stack>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: "text.secondary",
+                          display: "block",
+                          mt: 0.35,
+                        }}
+                      >
+                        {str(row.summary, "")}
+                      </Typography>
+                    </Box>
+                  );
+                })}
+              </Stack>
+            )}
+          </Box>
+          <Box className="list-shell" sx={{ p: 1.6 }}>
+            <Typography
+              variant="subtitle1"
+              sx={{
+                color: "var(--text-primary)",
+                fontWeight: 600,
+                fontSize: "0.95rem",
+                lineHeight: 1.3,
+              }}
+            >
+              Prompt snapshots
+            </Typography>
+            <Typography
+              variant="body2"
+              sx={{
+                color: "var(--text-secondary)",
+                fontSize: "0.78rem",
+                lineHeight: 1.4,
+                mt: 0.25,
+                mb: 1.25,
+              }}
+            >
+              Restorable prompt-bundle versions saved at each promotion.
+              Restoring disables any active canary.
+            </Typography>
+            {promptSnapshots.length === 0 ? (
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                No snapshots yet. ArkEvolve saves one at every stable
+                promotion.
+              </Typography>
+            ) : (
+              <Stack spacing={0.75}>
+                {promptSnapshots.map((snapshot, idx) => (
+                  <Stack
+                    key={`prompt-snapshot-${snapshot.version}`}
+                    direction="row"
+                    spacing={1}
+                    sx={{
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      p: 1.1,
+                      border: "1px solid var(--ui-rgba-145-170-205-120)",
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Box sx={{ minWidth: 0 }}>
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{ alignItems: "center", flexWrap: "wrap" }}
+                      >
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            color: "#e8f4ff",
+                            fontWeight: 600,
+                            fontFamily: "var(--font-mono)",
+                            fontSize: "0.78rem",
+                          }}
+                        >
+                          {snapshot.version}
+                        </Typography>
+                        {idx === 0 ? (
+                          <Chip size="small" label="Newest" />
+                        ) : null}
+                      </Stack>
+                      {snapshot.savedAt ? (
+                        <Typography
+                          variant="caption"
+                          sx={{ color: "var(--text-faint)" }}
+                        >
+                          Saved {formatTimestampForHumans(snapshot.savedAt).label}
+                        </Typography>
+                      ) : null}
+                    </Box>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      color="inherit"
+                      sx={{ flexShrink: 0 }}
+                      disabled={runEvolutionActionMutation.isPending}
+                      onClick={() =>
+                        void runEvolutionAction(
+                          {
+                            action: "rollback_prompt_to_version",
+                            candidate_id: "prompt",
+                            proposal_id: snapshot.version,
+                          },
+                          `Prompt bundle restored to ${snapshot.version}.`,
+                          `Restore the prompt bundle to version "${snapshot.version}"? Any active canary is disabled.`,
+                        )
+                      }
+                    >
+                      Restore
+                    </Button>
+                  </Stack>
+                ))}
+              </Stack>
+            )}
+          </Box>
+        </Stack>
+      ) : null}
+      <EvolveCandidateDialog
+        row={dialogCandidate}
+        actionPending={runEvolutionActionMutation.isPending}
+        onClose={closeCandidateDialog}
+        onAction={candidateDialogAction}
+      />
       <Dialog
         open={!!readinessDialog}
         onClose={() => setReadinessDialog(null)}

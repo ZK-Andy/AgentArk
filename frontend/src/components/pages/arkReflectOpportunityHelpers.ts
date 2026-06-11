@@ -18,8 +18,6 @@ export type ReflectOpportunityLike = {
   latest_summary_evidence_supported?: boolean | null;
 };
 
-export type ReflectOpportunitySourceCounts = Record<string, unknown> | null | undefined;
-
 function compactText(value: string, maxChars: number): string {
   const cleaned = value.split(/\s+/).join(" ").trim();
   if (cleaned.length <= maxChars) return cleaned;
@@ -105,21 +103,14 @@ export function isDisplayableOpportunity(item: ReflectOpportunityLike): boolean 
   return true;
 }
 
-export function hasReflectActivity(sourceCounts: ReflectOpportunitySourceCounts): boolean {
-  if (!sourceCounts) return false;
-  return Object.values(sourceCounts).some((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
-}
-
 export function shouldPollForOpportunitySettlement(input: {
-  sourceCounts: ReflectOpportunitySourceCounts;
-  opportunityCount: number;
+  pendingPlanCount: number;
+  planningActive: boolean;
   queuedSourceCheckCount: number;
   refreshRunning: boolean;
 }): boolean {
   if (input.refreshRunning) return false;
-  if (input.queuedSourceCheckCount > 0) return true;
-  if (input.opportunityCount > 0) return false;
-  return hasReflectActivity(input.sourceCounts);
+  return input.pendingPlanCount > 0 || input.planningActive || input.queuedSourceCheckCount > 0;
 }
 
 export function shouldStartOpportunitySettlementPoll(input: {

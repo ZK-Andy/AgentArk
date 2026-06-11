@@ -108,6 +108,8 @@ mod model_runtime;
 mod notifications;
 #[path = "operations/operational.rs"]
 mod operational;
+#[path = "conversation/outcome_judge.rs"]
+mod outcome_judge;
 #[path = "conversation/pending_flows.rs"]
 mod pending_flows;
 #[path = "spine/prompt_builder.rs"]
@@ -1657,6 +1659,7 @@ pub struct RequestExecutionHints {
     pub execution_surface: ActionExecutionSurface,
     pub direct_user_intent: bool,
     pub recorded_user_message_id: Option<String>,
+    pub memory_capture: crate::security::intent_classifier::InboundMemoryCaptureSignal,
     pub attachments_present: bool,
     pub attachments: Vec<ChatAttachmentHint>,
     pub execution_profile: Option<serde_json::Value>,
@@ -1668,7 +1671,9 @@ pub struct RequestExecutionHints {
 }
 
 enum InboundSecurityPrecheck {
-    Continue,
+    Continue {
+        memory_capture: crate::security::intent_classifier::InboundMemoryCaptureSignal,
+    },
     Respond(ProcessedMessage),
 }
 

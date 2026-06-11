@@ -1702,15 +1702,6 @@ export function learningCandidateReviewEvidence(
   };
 }
 
-export type EvolutionPageTab = "what" | "helped" | "tests" | "review";
-
-export const EVOLUTION_PAGE_TABS: Array<{ value: EvolutionPageTab; label: string }> = [
-  { value: "what", label: "Overview" },
-  { value: "helped", label: "Results" },
-  { value: "tests", label: "Live tests" },
-  { value: "review", label: "Review queue" },
-];
-
 export function clampPercent(value: unknown): number {
   const parsed = num(value, 0);
   if (!Number.isFinite(parsed)) return 0;

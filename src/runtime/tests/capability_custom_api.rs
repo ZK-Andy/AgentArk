@@ -82,6 +82,96 @@ fn capability_acquire_graphql_endpoint_without_body_shape_stores_post_json_body_
 
 #[test]
 
+fn custom_api_missing_inputs_repair_contract_describes_every_missing_argument() {
+    let operation = crate::custom_apis::CustomApiOperation {
+        action_name: "api__provider__read-resource".to_string(),
+        draft: crate::custom_apis::CustomApiOperationDraft {
+            id: "read-resource".to_string(),
+            name: "Read resource".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/accounts/{account_id}/resources".to_string(),
+            description: String::new(),
+            read_only: true,
+            enabled: true,
+            default_headers: BTreeMap::new(),
+            default_query: BTreeMap::new(),
+            parameters: vec![
+                crate::custom_apis::CustomApiParameter {
+                    name: "account_id".to_string(),
+                    location: crate::custom_apis::CustomApiParameterLocation::Path,
+                    required: true,
+                    description: Some("Account identifier".to_string()),
+                    schema_type: Some("string".to_string()),
+                },
+                crate::custom_apis::CustomApiParameter {
+                    name: "filter".to_string(),
+                    location: crate::custom_apis::CustomApiParameterLocation::Query,
+                    required: true,
+                    description: Some("Filter expression".to_string()),
+                    schema_type: Some("string".to_string()),
+                },
+                crate::custom_apis::CustomApiParameter {
+                    name: "tenant".to_string(),
+                    location: crate::custom_apis::CustomApiParameterLocation::Header,
+                    required: true,
+                    description: Some("Tenant header".to_string()),
+                    schema_type: Some("string".to_string()),
+                },
+                crate::custom_apis::CustomApiParameter {
+                    name: "body".to_string(),
+                    location: crate::custom_apis::CustomApiParameterLocation::Body,
+                    required: true,
+                    description: Some("Request body".to_string()),
+                    schema_type: Some("object".to_string()),
+                },
+            ],
+            body_required: true,
+            default_body: None,
+        },
+    };
+
+    let contract = ActionRuntime::custom_api_missing_inputs_repair_contract(
+        &operation,
+        &[
+            "account_id".to_string(),
+            "filter".to_string(),
+            "tenant".to_string(),
+            "body".to_string(),
+        ],
+    );
+
+    assert_eq!(
+        contract["required_arguments"],
+        serde_json::json!(["account_id", "filter", "tenant", "body"])
+    );
+    for (name, location) in [
+        ("account_id", "path"),
+        ("filter", "query"),
+        ("tenant", "header"),
+        ("body", "body"),
+    ] {
+        assert_eq!(
+            contract["argument_contracts"][name]["location"],
+            serde_json::json!(location),
+            "missing input `{name}` must have an operation-derived contract"
+        );
+        assert_eq!(
+            contract["argument_contracts"][name]["accepted_argument_paths"][0],
+            serde_json::json!(["arguments", name])
+        );
+    }
+    assert!(
+        contract["request_arguments"]["arguments"]["account_id"].is_object(),
+        "the retry shape must show the generic nested arguments envelope"
+    );
+    assert!(
+        contract["request_arguments"]["arguments"]["filter"].is_object(),
+        "query parameters must not disappear behind a body-only contract"
+    );
+}
+
+#[test]
+
 fn capability_acquire_graphql_operation_preserves_default_read_body() {
     let (_, operation, _) = ActionRuntime::capability_operation_draft(
         &serde_json::json!({
