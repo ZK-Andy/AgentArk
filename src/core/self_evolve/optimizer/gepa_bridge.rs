@@ -169,7 +169,6 @@ pub struct GepaOptimizerRuntime {
     pub max_metric_calls: u32,
     pub per_run_budget_usd: f64,
     pub num_threads: u32,
-    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,7 +690,6 @@ pub async fn gepa_optimizer_runtime(
         max_metric_calls: config.max_metric_calls,
         per_run_budget_usd: config.per_run_budget_usd,
         num_threads: config.num_threads,
-        timeout_seconds: config.timeout_seconds,
     })
 }
 
@@ -2360,7 +2358,6 @@ mod tests {
             max_metric_calls: 8,
             per_run_budget_usd: 0.5,
             num_threads: 2,
-            timeout_seconds: 1800,
         };
         let mut cmd = tokio::process::Command::new("python3");
         apply_gepa_optimizer_env(&mut cmd, &runtime);
