@@ -9833,7 +9833,9 @@ impl Agent {
             None,
             quiet_window_seconds,
             crate::core::self_evolve::gepa_bridge::GepaPromotionSettings::default(),
-            crate::core::self_evolve::gepa_bridge::default_gepa_optimizer_timeout_seconds(),
+            crate::core::self_evolve::gepa_bridge::load_gepa_optimizer_config(&self.storage)
+                .await
+                .timeout_seconds,
             true,
         )
         .await
