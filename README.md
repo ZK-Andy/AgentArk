@@ -2,6 +2,8 @@
   <img src="assets/banner.png" alt="AgentArk" width="700">
 </p>
 
+<h1 align="center">AgentArk</h1>
+
 <p align="center">
   <em>Not an agent. An Ark for agents: build from prompts and tools, deploy as apps, automations, or watchers, distill noisy context, monitor every action, secure every boundary, self-evolve from your usage.</em>
 </p>
