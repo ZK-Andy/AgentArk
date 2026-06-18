@@ -30,7 +30,6 @@ export const SETTINGS_NAV_GROUPS: SettingsNavGroup[] = [
     items: [
       { value: 20, label: "Integrations" },
       { value: 8, label: "MCP Servers" },
-      { value: 26, label: "Companion Devices" },
     ],
   },
   {

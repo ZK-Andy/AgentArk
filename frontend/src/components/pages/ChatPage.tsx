@@ -106,7 +106,6 @@ import {
 } from "../../api/client";
 import AgentLogo from "../../assets/logo.svg";
 import { MetricBarCard } from "../analytics/MetricBarCard";
-import { CompanionDevicesPanel } from "../CompanionDevicesPanel";
 import { IntegrationQuickstartPanel } from "../IntegrationQuickstartPanel";
 import { IntegrationsPanel } from "../IntegrationsPanel";
 import { LiveEventConsole } from "../LiveEventConsole";

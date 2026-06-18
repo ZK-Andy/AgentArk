@@ -114,7 +114,6 @@ import {
 // SettingsPageFull eliminates the inner Suspense roundtrip when switching
 // tabs inside the Settings dialog. Tabs are then driven only by their
 // data queries, which are prefetched in parallel via prefetchSettingsTabData.
-import { CompanionDevicesPanel } from "../CompanionDevicesPanel";
 import { MediaSettingsPanel } from "./MediaSettingsPanel";
 import { ObservabilityPanel } from "../ObservabilityPanel";
 import { PluginSdkPanel } from "../PluginSdkPanel";
@@ -6194,10 +6193,6 @@ export default function SettingsPage({
               <Box className="list-shell">
                 <PluginSdkPanel autoRefresh={autoRefresh} embedded />
               </Box>
-            ) : null}
-
-            {tab === 26 ? (
-              <CompanionDevicesPanel autoRefresh={autoRefresh} />
             ) : null}
 
             {tab === 11 ? (

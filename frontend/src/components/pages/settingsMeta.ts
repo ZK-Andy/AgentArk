@@ -16,6 +16,7 @@ export function normalizeSettingsTab(rawTab?: number | null): number {
   const tab = Math.max(0, Math.trunc(rawTab));
   if (tab === 2 || tab === 10 || tab === 15) return 20;
   if (tab === 21 || tab === 22 || tab === 23) return 20;
+  if (tab === 26) return 20;
   if (tab === 16) return 4;
   if (tab === 9 || tab === 13 || tab === 17) return 0;
   return tab;
@@ -50,10 +51,10 @@ export function settingsTabFromLocation(): number {
     events: 20,
     connectors: 20,
     prebuilt: 20,
-    companion: 26,
-    "companion-devices": 26,
-    companiondevices: 26,
-    devices: 26,
+    companion: 20,
+    "companion-devices": 20,
+    companiondevices: 20,
+    devices: 20,
     advanced: 5,
     lifecycle: 14,
     "data-lifecycle": 14,

@@ -170,7 +170,7 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
   channels: settingsRoute("Loading channels...", 2),
   routing: settingsRoute("Loading routing...", 2),
   webhooks: settingsRoute("Loading webhooks...", 22),
-  devices: settingsRoute("Loading devices...", 26),
+  devices: settingsRoute("Loading integrations...", 20),
   browser: {
     componentKey: "sessions",
     message: "Loading browser...",

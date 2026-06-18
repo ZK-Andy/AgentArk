@@ -52,7 +52,7 @@ export function preloadWorkspaceSurface(
       preloadSettingsTab(settingsTab ?? 22);
       return;
     case "devices":
-      preloadSettingsTab(settingsTab ?? 26);
+      preloadSettingsTab(settingsTab ?? 20);
       return;
     case "search":
       preloadSettingsTab(settingsTab ?? 24);

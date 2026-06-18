@@ -269,7 +269,7 @@ function defaultSettingsTabForView(
     case "browser":
       return 20;
     case "devices":
-      return 26;
+      return 20;
     case "failover":
       return 1;
     case "search":
