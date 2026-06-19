@@ -258,8 +258,13 @@ ENV PIP_NO_CACHE_DIR=1 \
 # Pinned version for reproducible builds - update deliberately after testing.
 ARG CLOUDFLARED_VERSION=2026.2.0
 RUN if [ "${INSTALL_CLOUDFLARED}" = "true" ]; then \
+        arch="$(dpkg --print-architecture)"; \
+        case "${arch}" in \
+            amd64|arm64) cloudflared_arch="${arch}" ;; \
+            *) echo "ERROR: unsupported cloudflared architecture: ${arch}" >&2; exit 1 ;; \
+        esac; \
         curl -fsSL --retry 3 \
-            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${cloudflared_arch}" \
             -o /usr/local/bin/cloudflared && \
         chmod +x /usr/local/bin/cloudflared; \
     fi
@@ -275,13 +280,18 @@ RUN if [ "${INSTALL_CLOUDFLARED}" = "true" ]; then \
 # tables and only removes DWARF info.
 ARG LIGHTPANDA_RELEASE=nightly
 RUN if [ "${INSTALL_LIGHTPANDA}" = "true" ]; then \
+        arch="$(dpkg --print-architecture)"; \
+        case "${arch}" in \
+            amd64) lightpanda_asset="lightpanda-x86_64-linux" ;; \
+            arm64) lightpanda_asset="lightpanda-aarch64-linux" ;; \
+            *) echo "ERROR: unsupported Lightpanda architecture: ${arch}" >&2; exit 1 ;; \
+        esac; \
         curl -fsSL --retry 3 \
-            "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_RELEASE}/lightpanda-x86_64-linux" \
+            "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_RELEASE}/${lightpanda_asset}" \
             -o /usr/local/bin/lightpanda && \
         chmod +x /usr/local/bin/lightpanda && \
-        strip /usr/local/bin/lightpanda && \
-        /usr/local/bin/lightpanda --version >/dev/null 2>&1 || \
-            /usr/local/bin/lightpanda --help >/dev/null 2>&1 || \
+        (strip /usr/local/bin/lightpanda || strip --strip-debug /usr/local/bin/lightpanda || true) && \
+        /usr/local/bin/lightpanda fetch --dump html "data:text/html,<html><body>ok</body></html>" >/dev/null 2>&1 || \
             { echo "ERROR: stripped lightpanda failed to execute" >&2; exit 1; }; \
     fi
 
