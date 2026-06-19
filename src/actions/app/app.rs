@@ -2221,7 +2221,7 @@ fn infer_generated_java_bundle_lifecycle(
     dirs.extend(bundle_candidate_dirs_with_file(files, "build.gradle.kts"));
     dirs.sort_by_key(|dir| (dir.matches('/').count(), dir.len(), dir.clone()));
     dirs.dedup();
-    for relative_dir in dirs {
+    if let Some(relative_dir) = dirs.into_iter().next() {
         let program = if bundle_file_exists(files, &relative_dir, "gradlew") {
             build_relative_file_arg(&relative_dir, "gradlew")
         } else {
@@ -2262,7 +2262,7 @@ fn infer_generated_dotnet_bundle_lifecycle(
         .collect::<Vec<_>>();
     dirs.sort_by_key(|dir| (dir.matches('/').count(), dir.len(), dir.clone()));
     dirs.dedup();
-    for relative_dir in dirs {
+    if let Some(relative_dir) = dirs.into_iter().next() {
         let project = bundle_first_file_with_extension(files, &relative_dir, "csproj")?;
         return Some(GeneratedBundleLifecycleInference {
             install_command: None,
