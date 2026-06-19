@@ -1,7 +1,8 @@
 #!/bin/bash
-# AgentArk Installer
+# AgentArk Docker installer.
 #
-# Usage: curl -sSL https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.sh | bash
+# Usage:
+#   curl -sSL https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.sh | bash
 
 set -euo pipefail
 
@@ -13,96 +14,157 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 INSTALL_DIR="${HOME}/agentark"
-SOURCE_DIR="${INSTALL_DIR}/source"
+RUNTIME_DIR="${INSTALL_DIR}/runtime"
 RELEASE_REPO="${AGENTARK_RELEASE_REPO:-agentark-ai/AgentArk}"
-REPO_URL="https://github.com/${RELEASE_REPO}.git"
 IMAGE_REPOSITORY="${AGENTARK_IMAGE_REPOSITORY:-ghcr.io/agentark-ai/agentark}"
+RUNTIME_REF="${AGENTARK_RUNTIME_REF:-main}"
 
-echo ""
-echo -e "${BOLD}=========================================${NC}"
-echo -e "${BOLD}  AgentArk Installer${NC}"
-echo -e "  Think. Act. Remember. Securely."
-echo -e "${BOLD}=========================================${NC}"
-echo ""
+truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|y|Y|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
-install_docker() {
-    echo -e "${YELLOW}Docker not found. Installing...${NC}"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case "$ID" in
-            ubuntu|debian|pop|linuxmint|elementary)
-                sudo apt-get update -qq
-                sudo apt-get install -y -qq ca-certificates curl gnupg
-                sudo install -m 0755 -d /etc/apt/keyrings
-                curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
-                sudo chmod a+r /etc/apt/keyrings/docker.gpg
-                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
-                    | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-                sudo apt-get update -qq
-                sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
-                ;;
-            fedora)
-                sudo dnf -y install dnf-plugins-core
-                sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
-                sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-                ;;
-            centos|rhel|rocky|almalinux)
-                sudo yum install -y yum-utils
-                sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-                sudo yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-                ;;
-            arch|manjaro)
-                sudo pacman -Sy --noconfirm docker docker-compose
-                ;;
-            *)
-                echo -e "${RED}Unsupported distro: ${ID}${NC}"
-                echo -e "Please install Docker manually: ${CYAN}https://docs.docker.com/engine/install/${NC}"
-                exit 1
-                ;;
-        esac
-    elif [ "$(uname)" = "Darwin" ]; then
-        echo -e "${RED}macOS detected.${NC}"
-        echo -e "Please install Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
-        exit 1
-    else
-        echo -e "${RED}Unsupported OS.${NC}"
-        echo -e "Please install Docker manually: ${CYAN}https://docs.docker.com/engine/install/${NC}"
+confirm() {
+    local prompt="$1"
+    local answer=""
+
+    if truthy "${AGENTARK_ASSUME_YES:-}"; then
+        return 0
+    fi
+
+    read -r -p "${prompt}" answer
+    case "${answer}" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+version_from_tag() {
+    printf '%s' "${1#v}"
+}
+
+latest_release_tag() {
+    curl -fsSL "https://api.github.com/repos/${RELEASE_REPO}/releases/latest" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+}
+
+docker_ready() {
+    command -v docker >/dev/null 2>&1 \
+        && docker info >/dev/null 2>&1 \
+        && docker compose version >/dev/null 2>&1
+}
+
+wait_for_docker() {
+    local attempts=90
+    while [ "${attempts}" -gt 0 ]; do
+        if docker_ready; then
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 2
+    done
+    return 1
+}
+
+install_docker_linux() {
+    if ! confirm "Docker is required. Install Docker now? [y/N] "; then
+        echo -e "${RED}Docker is required.${NC}"
+        echo -e "Install Docker: ${CYAN}https://docs.docker.com/engine/install/${NC}"
         exit 1
     fi
+
+    . /etc/os-release
+    case "${ID}" in
+        ubuntu|debian|pop|linuxmint|elementary)
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ca-certificates curl gnupg
+            sudo install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
+                | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            ;;
+        fedora)
+            sudo dnf -y install dnf-plugins-core
+            sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
+            sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            ;;
+        centos|rhel|rocky|almalinux)
+            sudo yum install -y yum-utils
+            sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+            sudo yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            ;;
+        arch|manjaro)
+            sudo pacman -Sy --noconfirm docker docker-compose
+            ;;
+        *)
+            echo -e "${RED}Unsupported distro: ${ID}${NC}"
+            echo -e "Install Docker manually: ${CYAN}https://docs.docker.com/engine/install/${NC}"
+            exit 1
+            ;;
+    esac
 
     sudo systemctl start docker 2>/dev/null || true
     sudo systemctl enable docker 2>/dev/null || true
 
     if ! groups | grep -q docker; then
-        sudo usermod -aG docker "$USER"
-        echo -e "${YELLOW}Added ${USER} to the docker group. Log out and back in if Docker still needs sudo.${NC}"
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
     fi
 }
 
-docker_git() {
-    docker run --rm -v "${INSTALL_DIR}:/work" -w /work alpine/git "$@"
+install_docker_macos() {
+    if ! confirm "Docker Desktop is required. Install it now? [y/N] "; then
+        echo -e "${RED}Docker Desktop is required.${NC}"
+        echo -e "Install Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
+        exit 1
+    fi
+
+    if command -v brew >/dev/null 2>&1; then
+        brew install --cask docker
+    else
+        echo -e "${RED}Homebrew was not found.${NC}"
+        echo -e "Install Docker Desktop manually: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
+        exit 1
+    fi
 }
 
-latest_release_tag() {
-    docker run --rm alpine/git ls-remote --tags --refs "${REPO_URL}" "v*" 2>/dev/null \
-        | awk '{print $2}' \
-        | sed 's#refs/tags/##' \
-        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-        | awk -F'[v.]' '{printf("%09d.%09d.%09d %s\n", $2, $3, $4, $0)}' \
-        | sort \
-        | tail -n 1 \
-        | awk '{print $2}'
-}
+ensure_docker() {
+    if docker_ready; then
+        return 0
+    fi
 
-release_version_from_tag() {
-    printf '%s' "${1#v}"
-}
+    if ! command -v docker >/dev/null 2>&1; then
+        if [ "$(uname)" = "Darwin" ]; then
+            install_docker_macos
+        elif [ -f /etc/os-release ]; then
+            install_docker_linux
+        else
+            echo -e "${RED}Docker is required.${NC}"
+            echo -e "Install Docker: ${CYAN}https://docs.docker.com/get-docker/${NC}"
+            exit 1
+        fi
+    fi
 
-ensure_clean_checkout() {
-    local tracked_changes
-    tracked_changes="$(docker_git git -C /work/source status --porcelain --untracked-files=no 2>/dev/null || true)"
-    if [ -n "${tracked_changes}" ]; then
-        echo -e "${RED}Tracked local changes were found in ${SOURCE_DIR}. Resolve them before reinstalling.${NC}"
+    if [ "$(uname)" = "Darwin" ]; then
+        echo -e "${CYAN}Starting Docker Desktop...${NC}"
+        open -a Docker >/dev/null 2>&1 || true
+    else
+        sudo systemctl start docker 2>/dev/null || true
+    fi
+
+    if ! wait_for_docker; then
+        if [ "$(uname)" != "Darwin" ] && ! groups | grep -q docker; then
+            echo -e "${YELLOW}Docker was installed, but this shell is not in the docker group yet.${NC}"
+            echo -e "Log out and back in, then rerun this installer."
+            exit 1
+        fi
+        echo -e "${RED}Docker did not become ready.${NC}"
+        echo -e "Open Docker Desktop or start the Docker service, then rerun this installer."
         exit 1
     fi
 }
@@ -124,118 +186,83 @@ warn_if_port_in_use() {
     local port="$1"
     local service="$2"
     if port_in_use "${port}"; then
-        echo -e "${YELLOW}Warning: TCP port ${port} is already in use. ${service} may fail to start unless you stop the existing listener or override the port.${NC}"
+        echo -e "${YELLOW}Warning: TCP port ${port} is already in use. ${service} may fail to start.${NC}"
     fi
 }
 
-verify_lightpanda_runtime() {
-    local attempts=20
-    echo -e "${CYAN}Verifying bundled Lightpanda runtime...${NC}"
-    while [ "${attempts}" -gt 0 ]; do
-        if docker compose exec -T agentark-control sh -lc 'command -v lightpanda >/dev/null 2>&1' >/dev/null 2>&1; then
-            echo -e "${GREEN}Lightpanda is available inside the AgentArk runtime.${NC}"
-            return 0
-        fi
-        attempts=$((attempts - 1))
-        sleep 2
-    done
-    echo -e "${RED}Lightpanda is missing from the bundled AgentArk runtime. Update or rebuild before relying on the free search fallback.${NC}"
-    return 1
+download_runtime_files() {
+    local raw_base="https://raw.githubusercontent.com/${RELEASE_REPO}/${RUNTIME_REF}"
+
+    mkdir -p "${RUNTIME_DIR}/scripts"
+    curl -fsSL "${raw_base}/docker-compose.yml" -o "${RUNTIME_DIR}/docker-compose.yml"
+    curl -fsSL "${raw_base}/scripts/start.sh" -o "${RUNTIME_DIR}/scripts/start.sh"
+    chmod +x "${RUNTIME_DIR}/scripts/start.sh"
 }
 
-verify_gepa_optimizer_runtime() {
-    local attempts=20
-    echo -e "${CYAN}Verifying bundled GEPA optimizer runtime...${NC}"
-    while [ "${attempts}" -gt 0 ]; do
-        if docker compose exec -T agentark-control sh -lc '/opt/agentark-gepa/bin/python -c "import dspy" >/dev/null 2>&1' >/dev/null 2>&1; then
-            echo -e "${GREEN}GEPA optimizer is available inside the AgentArk runtime.${NC}"
-            return 0
-        fi
-        attempts=$((attempts - 1))
-        sleep 2
-    done
-    echo -e "${RED}GEPA optimizer is missing from the bundled AgentArk runtime. Update or rebuild the image before running ArkEvolve GEPA.${NC}"
-    return 1
-}
-
-pull_runtime_images() {
-    ${COMPOSE} pull postgres agentark-control agentark-embeddings agentark-executor agentark-workspace
-}
-
-if command -v docker >/dev/null 2>&1; then
-    echo -e "${GREEN}[1/4] Docker found.${NC}"
-else
-    install_docker
-    echo -e "${GREEN}[1/4] Docker installed.${NC}"
+write_agentark_command() {
+    cat > "${INSTALL_DIR}/agentark" << SCRIPT_EOF
+#!/bin/bash
+set -e
+AGENTARK_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+export AGENTARK_RELEASE_REPO="\${AGENTARK_RELEASE_REPO:-${RELEASE_REPO}}"
+export AGENTARK_RELEASE_TAG="\${AGENTARK_RELEASE_TAG:-${TARGET_RELEASE_TAG}}"
+export AGENTARK_IMAGE="\${AGENTARK_IMAGE:-${IMAGE_REPOSITORY}:$(version_from_tag "${TARGET_RELEASE_TAG}")}"
+if [ "\${1:-start}" = "update" ]; then
+    exec bash -c "curl -sSL https://raw.githubusercontent.com/\${AGENTARK_RELEASE_REPO}/main/scripts/install.sh | AGENTARK_ASSUME_YES=1 bash"
 fi
-
-if docker compose version >/dev/null 2>&1; then
-    COMPOSE="docker compose"
-elif command -v docker-compose >/dev/null 2>&1; then
-    COMPOSE="docker-compose"
-else
-    echo -e "${RED}docker compose not found. Please install Docker Compose v2.${NC}"
-    exit 1
+if [ "\$#" -eq 0 ]; then
+    set -- start
 fi
-echo -e "${GREEN}[2/4] Docker Compose found.${NC}"
+cd "\${AGENTARK_DIR}/runtime"
+exec bash "\${AGENTARK_DIR}/runtime/scripts/start.sh" "\$@"
+SCRIPT_EOF
+    chmod +x "${INSTALL_DIR}/agentark"
+
+    if [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+        ln -sf "${INSTALL_DIR}/agentark" /usr/local/bin/agentark
+        echo -e "${GREEN}Installed 'agentark' command globally.${NC}"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo ln -sf "${INSTALL_DIR}/agentark" /usr/local/bin/agentark
+        echo -e "${GREEN}Installed 'agentark' command globally.${NC}"
+    else
+        echo -e "${YELLOW}Add ${INSTALL_DIR} to PATH to use the 'agentark' command.${NC}"
+    fi
+}
+
+echo ""
+echo -e "${BOLD}=========================================${NC}"
+echo -e "${BOLD}  AgentArk Installer${NC}"
+echo -e "  Docker image install, no source clone."
+echo -e "${BOLD}=========================================${NC}"
+echo ""
+
+ensure_docker
+echo -e "${GREEN}[1/4] Docker is ready.${NC}"
 
 mkdir -p "${INSTALL_DIR}"
 TARGET_RELEASE_TAG="${AGENTARK_RELEASE_TAG:-$(latest_release_tag)}"
 if [ -z "${TARGET_RELEASE_TAG}" ]; then
-    echo -e "${RED}Unable to resolve the latest tagged AgentArk release.${NC}"
+    echo -e "${RED}Unable to resolve the latest AgentArk release.${NC}"
     exit 1
 fi
 
-if [ ! -d "${SOURCE_DIR}/.git" ]; then
-    echo -e "${CYAN}Cloning AgentArk ${TARGET_RELEASE_TAG} into ${SOURCE_DIR}...${NC}"
-    docker_git clone --branch "${TARGET_RELEASE_TAG}" --depth 1 "${REPO_URL}" source
-else
-    echo -e "${GREEN}Existing source checkout found at ${SOURCE_DIR}${NC}"
-    ensure_clean_checkout
-    docker_git git -C /work/source fetch --tags --force origin
-    docker_git git -C /work/source checkout --force "${TARGET_RELEASE_TAG}"
-fi
+download_runtime_files
+write_agentark_command
+echo -e "${GREEN}[2/4] Runtime files ready at ${RUNTIME_DIR}.${NC}"
 
-if [ ! -f "${SOURCE_DIR}/docker-compose.yml" ]; then
-    echo -e "${RED}Missing ${SOURCE_DIR}/docker-compose.yml after checkout.${NC}"
-    exit 1
-fi
+export AGENTARK_IMAGE="${IMAGE_REPOSITORY}:$(version_from_tag "${TARGET_RELEASE_TAG}")"
+export AGENTARK_RELEASE_REPO="${RELEASE_REPO}"
+export AGENTARK_RELEASE_TAG="${TARGET_RELEASE_TAG}"
 
-AGENTARK_IMAGE="${IMAGE_REPOSITORY}:$(release_version_from_tag "${TARGET_RELEASE_TAG}")"
-export AGENTARK_IMAGE AGENTARK_RELEASE_REPO="${RELEASE_REPO}" AGENTARK_RELEASE_TAG="${TARGET_RELEASE_TAG}"
-echo -e "${GREEN}[3/4] Source checkout ready at ${SOURCE_DIR}${NC}"
-
-cat > "${INSTALL_DIR}/agentark" << 'SCRIPT_EOF'
-#!/bin/bash
-set -e
-SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
-AGENTARK_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-exec bash "$AGENTARK_DIR/source/scripts/agentark-release-cli.sh" "$@"
-SCRIPT_EOF
-chmod +x "${INSTALL_DIR}/agentark"
-
-if [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
-    ln -sf "${INSTALL_DIR}/agentark" /usr/local/bin/agentark
-    echo -e "${GREEN}Installed 'agentark' command globally.${NC}"
-elif command -v sudo >/dev/null 2>&1; then
-    sudo ln -sf "${INSTALL_DIR}/agentark" /usr/local/bin/agentark
-    echo -e "${GREEN}Installed 'agentark' command globally.${NC}"
-else
-    echo -e "${YELLOW}Could not install to /usr/local/bin. Add ${INSTALL_DIR} to your PATH:${NC}"
-    echo -e "  export PATH=\"${INSTALL_DIR}:\$PATH\""
-fi
-
-echo -e "${CYAN}Downloading AgentArk container image for ${TARGET_RELEASE_TAG}...${NC}"
-cd "${SOURCE_DIR}"
-POSTGRES_PORT="${AGENTARK_POSTGRES_PORT:-5432}"
-warn_if_port_in_use "${POSTGRES_PORT}" "Postgres"
+cd "${RUNTIME_DIR}"
+warn_if_port_in_use "${AGENTARK_POSTGRES_PORT:-5432}" "Postgres"
 warn_if_port_in_use "8990" "AgentArk Web UI"
 
+echo -e "${CYAN}[3/4] Pulling AgentArk image ${AGENTARK_IMAGE}...${NC}"
+docker compose pull postgres agentark-control agentark-embeddings agentark-executor agentark-workspace
+
 echo -e "${GREEN}[4/4] Starting AgentArk...${NC}"
-pull_runtime_images
-${COMPOSE} up -d
-verify_lightpanda_runtime
-verify_gepa_optimizer_runtime
+docker compose up -d
 
 echo ""
 echo -e "${BOLD}=========================================${NC}"
@@ -243,18 +270,12 @@ echo -e "${GREEN}  AgentArk is running!${NC}"
 echo -e "${BOLD}=========================================${NC}"
 echo ""
 echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
+echo -e "  Image:   ${CYAN}${AGENTARK_IMAGE}${NC}"
 echo ""
-echo -e "  Commands (run from anywhere):"
-echo -e "    ${BOLD}agentark chat${NC}       Interactive CLI chat"
-echo -e "    ${BOLD}agentark pulse${NC}      Run ArkPulse health check"
-echo -e "    ${BOLD}agentark stop${NC}       Stop AgentArk"
-echo -e "    ${BOLD}agentark update${NC}     Install the latest tagged release and restart"
-echo -e "    ${BOLD}agentark logs${NC}       View logs"
-echo -e "    ${BOLD}agentark status${NC}     Show status"
-echo -e "    ${BOLD}agentark backup${NC}     Backup Docker volumes"
+echo -e "  Commands:"
+echo -e "    ${BOLD}agentark logs${NC}"
+echo -e "    ${BOLD}agentark status${NC}"
+echo -e "    ${BOLD}agentark stop${NC}"
+echo -e "    ${BOLD}agentark update${NC}"
 echo ""
-echo -e "${YELLOW}Compose checkout: ${SOURCE_DIR}${NC}"
 echo -e "${YELLOW}App data is stored in Docker volumes and survives updates.${NC}"
-echo -e "${YELLOW}Postgres and install secrets live in Docker volumes; use 'agentark backup' before moving installs.${NC}"
-echo -e "${YELLOW}Use 'docker compose down -v' only for a full reset.${NC}"
-echo ""

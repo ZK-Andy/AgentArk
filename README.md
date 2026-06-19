@@ -128,37 +128,41 @@ Your data stays with you. Your secrets are encrypted. You keep the final say on 
 
 ## Install
 
-### Quick start (Docker Compose)
+### Quick start (Docker image, no source clone)
+
+macOS / Linux:
 
 ```bash
-git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
-./scripts/start.sh
+curl -sSL https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.sh | bash
 ```
 
-On Windows:
-
-```bat
-git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
-scripts\start.bat
-```
-
-Or use the Windows installer:
+Windows:
 
 ```powershell
 irm https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.ps1 | iex
 ```
 
-The Windows installer checks WSL 2 and Docker Desktop, offers to install Docker Desktop with `winget` when it is missing, starts Docker Desktop when it is installed but stopped, and then asks which AgentArk install method to use:
-
-| Choice       | What it does                                                                                       | Best for                                                                                                            |
-| :----------- | :------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------ |
-| Fast install | Downloads the published AgentArk image and starts Docker Compose                                   | Most users                                                                                                          |
-| Source build | Clones the AgentArk release checkout and builds the local `agentark:dev` image with Docker Compose | Users who do not want to pull the AgentArk image from GHCR, or who want to inspect/build the release source locally |
-
-Source build does not pull the published AgentArk runtime image from GHCR. It still downloads Docker build base images and package dependencies needed to compile the local image.
-The installer records the selected method, so later `agentark start` and `agentark update` keep using the same published-image or source-build path.
+The installer asks before installing Docker if Docker is missing, starts Docker Desktop when needed, downloads only the Compose/runtime helper files, pulls the published AgentArk image, and starts the stack. No Git clone is needed for normal use.
 
 Open **http://localhost:8990**, pick your LLM provider in Settings, start chatting.
+
+### Source checkout
+
+Use Git only if you are building or coding AgentArk:
+
+```bash
+git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
+AGENTARK_IMAGE=agentark:dev ./scripts/start.sh build
+```
+
+On Windows source checkouts:
+
+```bat
+git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
+scripts\start.bat build
+```
+
+Source builds do not pull the published AgentArk runtime image from GHCR. They still download Docker build base images and package dependencies needed to compile the local image.
 
 > **Use the Web UI.** AgentArk is designed to run through the Docker Compose stack and Mission Control at `http://localhost:8990`.
 
@@ -240,7 +244,7 @@ Windows:
 irm https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.ps1 | iex
 ```
 
-On Windows, choose **Fast install** for the published image path or **Source build** to clone the release source and build `agentark:dev` locally.
+The installer downloads small runtime helper files into `~/agentark` or `%USERPROFILE%\agentark`, pulls the published Docker image, and starts Docker Compose. It does not clone the source repo.
 
 Review the script before piping to a shell. For the strongest verification story, use Docker Compose or a pinned GHCR image.
 
@@ -268,7 +272,7 @@ git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
 AGENTARK_IMAGE=agentark:dev ./scripts/start.sh build
 ```
 
-On Windows, the installer can do this for you by choosing **Source build**. From an existing checkout:
+On Windows, from an existing checkout:
 
 ```bat
 scripts\start.bat build

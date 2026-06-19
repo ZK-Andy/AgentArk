@@ -26,6 +26,79 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+confirm() {
+    local prompt="$1"
+    local answer=""
+
+    if [ "${AGENTARK_ASSUME_YES:-}" = "1" ] || [ "${AGENTARK_ASSUME_YES:-}" = "true" ]; then
+        return 0
+    fi
+
+    read -r -p "${prompt}" answer
+    case "${answer}" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+docker_ready() {
+    command -v docker >/dev/null 2>&1 \
+        && docker info >/dev/null 2>&1 \
+        && docker compose version >/dev/null 2>&1
+}
+
+wait_for_docker() {
+    local attempts=90
+    while [ "$attempts" -gt 0 ]; do
+        if docker_ready; then
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 2
+    done
+    return 1
+}
+
+ensure_docker_ready() {
+    if docker_ready; then
+        return 0
+    fi
+
+    if [ "$(uname)" = "Darwin" ]; then
+        if ! command -v docker >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then
+                if confirm "Docker Desktop is required. Install it with Homebrew now? [y/N] "; then
+                    brew install --cask docker
+                else
+                    echo -e "${RED}Docker Desktop is required.${NC}"
+                    echo -e "Install it manually: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
+                    exit 1
+                fi
+            else
+                echo -e "${RED}Docker Desktop is required and Homebrew was not found.${NC}"
+                echo -e "Install Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
+                exit 1
+            fi
+        fi
+
+        echo -e "${CYAN}Starting Docker Desktop...${NC}"
+        open -a Docker >/dev/null 2>&1 || true
+        if wait_for_docker; then
+            return 0
+        fi
+
+        echo -e "${RED}Docker Desktop did not become ready.${NC}"
+        echo -e "Open Docker Desktop, finish any setup prompts, then rerun: ${BOLD}./scripts/start.sh${NC}"
+        exit 1
+    fi
+
+    echo -e "${RED}Docker with Compose v2 is required.${NC}"
+    echo -e "Install it manually or run: ${BOLD}curl -sSL https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.sh | bash${NC}"
+    exit 1
+}
+
+ensure_docker_ready
+
 compose() {
     docker compose "$@"
 }
