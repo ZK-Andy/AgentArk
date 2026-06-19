@@ -100,7 +100,7 @@ export function followupHasSourceEvidence(item: ReflectOpportunityLike): boolean
 
 export function isDisplayableOpportunity(item: ReflectOpportunityLike): boolean {
   if (item.kind !== "latest_developments") return false;
-  return true;
+  return followupHasSourceEvidence(item);
 }
 
 export function shouldPollForOpportunitySettlement(input: {
@@ -132,6 +132,9 @@ export function isOpportunitySettlementActive(input: {
 
 export function latestUpdateTitle(item: ReflectOpportunityLike): string {
   const rawTitle = stripInlineMarkup(item.title || "Reflected topic");
+  if (!followupHasSourceEvidence(item)) {
+    return compactText(rawTitle, 110);
+  }
   const sourceTitle = (item.search_results || [])
     .map(readableSourceTitle)
     .find((title) => title && !isNearDuplicateText(title, rawTitle));

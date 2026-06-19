@@ -189,7 +189,7 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     return humanizeMachineLabel(str(row.purpose, ""), "Unknown purpose");
   }
 
-  const [activeRange, setActiveRange] = useState<AnalyticsRange>("24h");
+  const [activeRange, setActiveRange] = useState<AnalyticsRange>("14d");
   const [breakdownView, setBreakdownView] = useState<BreakdownView>("model");
   const [customDialogOpen, setCustomDialogOpen] = useState(false);
   const defaultCustomTo = useMemo(() => toLocalDatetimeInput(new Date()), []);

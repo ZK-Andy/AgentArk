@@ -56,11 +56,11 @@ function followup(overrides = {}) {
   };
 }
 
-test("planned source checks are displayable while evidence is pending", () => {
+test("planned source checks are not displayable while evidence is pending", () => {
   const item = followup();
 
   assert.equal(followupHasSourceEvidence(item), false);
-  assert.equal(isDisplayableOpportunity(item), true);
+  assert.equal(isDisplayableOpportunity(item), false);
 });
 
 test("source-backed opportunity titles come from source documents instead of raw chat text", () => {
@@ -84,12 +84,12 @@ test("source-backed opportunity titles come from source documents instead of raw
   assert.doesNotMatch(latestUpdateTitle(item), /^search india iran news/i);
 });
 
-test("unsupported source checks stay visible as planned opportunities", () => {
+test("unsupported source checks are hidden from opportunities", () => {
   const item = followup({
     status: "ready",
     search_results: [
       {
-        title: "Broad topic reference",
+        title: "Unrelated source title",
         url: "https://example.com/reference",
         snippet: "General background about one entity.",
         source: "Example",
@@ -102,7 +102,8 @@ test("unsupported source checks stay visible as planned opportunities", () => {
   });
 
   assert.equal(followupHasSourceEvidence(item), false);
-  assert.equal(isDisplayableOpportunity(item), true);
+  assert.equal(isDisplayableOpportunity(item), false);
+  assert.notEqual(latestUpdateTitle(item), "Unrelated source title");
 });
 
 test("source summary explains cached sources when synthesis failed", () => {
