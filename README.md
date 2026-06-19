@@ -19,6 +19,7 @@
   <a href="ARCHITECTURE.md#why-rust"><img src="https://img.shields.io/badge/RUST-294K_lines-B7410E?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"></a>
   <a href="#install"><img src="https://img.shields.io/badge/FRONTEND-86K_TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript"></a>
   <a href="https://deepwiki.com/agentark-ai/AgentArk"><img src="https://img.shields.io/badge/DEEPWIKI-Ask_the_codebase-1F6FEB?style=for-the-badge" alt="DeepWiki"></a>
+  <a href="https://discord.gg/v32znQ6W"><img src="https://img.shields.io/badge/DISCORD-Join_community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center">
@@ -41,7 +42,8 @@
   <a href="#security">Security</a> &middot;
   <a href="API.md">API</a> &middot;
   <a href="CONTRIBUTING.md">Contributing</a> &middot;
-  <a href="https://deepwiki.com/agentark-ai/AgentArk">DeepWiki</a>
+  <a href="https://deepwiki.com/agentark-ai/AgentArk">DeepWiki</a> &middot;
+  <a href="https://discord.gg/v32znQ6W">Discord</a>
 </p>
 
 > [!IMPORTANT]
