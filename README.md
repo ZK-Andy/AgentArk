@@ -142,7 +142,7 @@ Windows:
 irm https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.ps1 | iex
 ```
 
-The installer asks before installing Docker if Docker is missing, starts Docker Desktop when needed, downloads only the Compose/runtime helper files, pulls the published AgentArk image, and starts the stack. No Git clone is needed for normal use.
+The installer asks before installing Docker if Docker is missing, starts Docker Desktop when needed, downloads only the Compose/runtime helper files into `~/agentark` or `%USERPROFILE%\agentark`, pulls the published AgentArk image, and starts the stack. No Git clone is needed for normal use. Review the script before piping it to a shell.
 
 Open **http://localhost:8990**, pick your LLM provider in Settings, start chatting.
 
@@ -232,22 +232,6 @@ Provider selection logic:
 
 Paid/API providers are ignored until you save their credentials. Setting a SearXNG base URL is enough to add it to the configured-provider chain. There is currently no up/down control for search provider order in the Settings UI.
 
-### Convenience installer
-
-```bash
-curl -sSL https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.sh | bash
-```
-
-Windows:
-
-```powershell
-irm https://raw.githubusercontent.com/agentark-ai/AgentArk/main/scripts/install.ps1 | iex
-```
-
-The installer downloads small runtime helper files into `~/agentark` or `%USERPROFILE%\agentark`, pulls the published Docker image, and starts Docker Compose. It does not clone the source repo.
-
-Review the script before piping to a shell. For the strongest verification story, use Docker Compose or a pinned GHCR image.
-
 ### Published container image
 
 | Image                                 | Includes                                                                                                                | Size (linux/amd64)                                                                            |
@@ -261,24 +245,7 @@ docker pull ghcr.io/agentark-ai/agentark:1.2.3     # pinned version
 
 For production or first-time installs, prefer a pinned version tag and verify the attestation first. See [VERIFY.md](VERIFY.md).
 
-### Build from source
-
-Source builds are for contributors and runtime-image development. For normal use, run the Docker Compose stack and use the Web UI.
-
-To build the full Docker runtime from source:
-
-```bash
-git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
-AGENTARK_IMAGE=agentark:dev ./scripts/start.sh build
-```
-
-On Windows, from an existing checkout:
-
-```bat
-scripts\start.bat build
-```
-
-This builds the Docker image locally and starts the same Compose stack as the published-image install. It does not require host Rust or Node installs because dependencies are installed inside the Docker build.
+### Native host build
 
 Native host builds are mainly for development and diagnostics:
 
