@@ -494,7 +494,8 @@ mod tests {
             assistant_instruction: None,
             result_state: "failed".to_string(),
         };
-        let metadata = append_contract_events(json!({"existing": true}), &[event.clone()]);
+        let metadata =
+            append_contract_events(json!({"existing": true}), std::slice::from_ref(&event));
         assert_eq!(metadata["existing"], true);
         assert_eq!(contract_events_from_metadata(&metadata), vec![event]);
     }

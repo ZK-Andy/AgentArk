@@ -73,8 +73,14 @@ function Resolve-AgentArkDockerDesktopExe {
 
 function Test-AgentArkDockerEngine {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $false }
-    & docker info *> $null
-    return $LASTEXITCODE -eq 0
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & docker info *> $null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
 }
 
 function Wait-AgentArkDockerEngine {

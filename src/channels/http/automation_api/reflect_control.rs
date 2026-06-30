@@ -7312,7 +7312,7 @@ mod tests {
 
         assert!(remapped.contains_key(&candidate.id));
         assert_eq!(remapped[&candidate.id].id, candidate.id);
-        assert!(remapped.get("item_1").is_none());
+        assert!(!remapped.contains_key("item_1"));
     }
 
     #[test]

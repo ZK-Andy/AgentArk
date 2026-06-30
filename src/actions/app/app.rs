@@ -13133,6 +13133,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn app_deploy_starts_delegated_dynamic_runtime_for_explicit_runtime_bundle() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let config_dir = tempfile::tempdir().expect("config dir");

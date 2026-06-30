@@ -238,8 +238,18 @@ fn trace_message_preview(message: &str) -> String {
     if message == crate::storage::ENCRYPTED_STORAGE_UNAVAILABLE {
         return "Older run details unavailable".to_string();
     }
-    if message.len() > 120 {
-        format!("{}...", &message[..120])
+    trace_message_preview_chars(message, 120)
+}
+
+fn trace_message_preview_chars(message: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut chars = message.chars();
+    let mut preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        preview.push_str("...");
+        preview
     } else {
         message.to_string()
     }
@@ -1806,11 +1816,7 @@ pub(super) async fn get_trace(
     let proofs = if let Some(ref proof_id) = last_trace.proof_id {
         vec![ProofSummary {
             id: proof_id.clone(),
-            message_preview: if last_trace.message.len() > 50 {
-                format!("{}...", &last_trace.message[..50])
-            } else {
-                last_trace.message.clone()
-            },
+            message_preview: trace_message_preview_chars(&last_trace.message, 50),
             time: last_trace
                 .completed_at
                 .map(|t| t.format("%H:%M:%S").to_string())
@@ -1943,6 +1949,15 @@ mod tests {
             complexity: None,
             plan: None,
         }
+    }
+
+    #[test]
+    fn trace_message_preview_truncates_utf8_on_char_boundaries() {
+        let message = format!("x{}", "中".repeat(120));
+        let preview = trace_message_preview(&message);
+
+        assert!(preview.ends_with("..."));
+        assert!(preview.is_char_boundary(preview.len() - 3));
     }
 
     #[test]

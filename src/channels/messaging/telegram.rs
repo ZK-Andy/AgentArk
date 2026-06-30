@@ -471,6 +471,33 @@ async fn register_commands(bot: &Bot) {
     }
 }
 
+fn telegram_api_base_url(config: &crate::core::runtime::config::TelegramConfig) -> Option<String> {
+    std::env::var("AGENTARK_TELEGRAM_API_BASE_URL")
+        .ok()
+        .or_else(|| std::env::var("TELEGRAM_API_BASE_URL").ok())
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.trim_end_matches('/').to_string() + "/")
+        })
+        .or_else(|| {
+            config.api_base_url.as_deref().and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then(|| trimmed.trim_end_matches('/').to_string() + "/")
+            })
+        })
+}
+
+fn telegram_bot(config: &crate::core::runtime::config::TelegramConfig) -> Result<Bot> {
+    let bot = Bot::new(&config.bot_token);
+    if let Some(base_url) = telegram_api_base_url(config) {
+        let url = reqwest::Url::parse(&base_url)
+            .map_err(|error| anyhow!("Invalid Telegram API base URL: {}", error))?;
+        Ok(bot.set_api_url(url))
+    } else {
+        Ok(bot)
+    }
+}
+
 /// Start the Telegram bot
 pub async fn serve(
     agent: SharedAgent,
@@ -496,7 +523,7 @@ pub async fn serve(
         tracing::info!("Telegram: All users allowed (no restriction)");
     }
 
-    let bot = Bot::new(&telegram_config.bot_token);
+    let bot = telegram_bot(&telegram_config)?;
 
     match bot.get_me().await {
         Ok(me) => {
@@ -790,7 +817,7 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
         return Err(anyhow!(message));
     };
 
-    let bot = Bot::new(&config.bot_token);
+    let bot = telegram_bot(config)?;
     for chunk in super::outbound_split::split_for_provider_safe_channel("telegram", text) {
         bot.send_message(ChatId(chat_id), markdown_to_telegram_html(&chunk))
             .parse_mode(ParseMode::Html)
@@ -823,7 +850,7 @@ pub async fn send_photo(agent: &Agent, image_bytes: &[u8], caption: &str) -> Res
         return Ok(());
     };
 
-    let bot = Bot::new(&config.bot_token);
+    let bot = telegram_bot(config)?;
     let input_file =
         teloxide::types::InputFile::memory(image_bytes.to_vec()).file_name("screenshot.png");
     bot.send_photo(ChatId(chat_id), input_file)
@@ -841,7 +868,7 @@ pub async fn send_video(agent: &Agent, video_bytes: &[u8], caption: &str) -> Res
         return Ok(());
     };
 
-    let bot = Bot::new(&config.bot_token);
+    let bot = telegram_bot(config)?;
     let input_file =
         teloxide::types::InputFile::memory(video_bytes.to_vec()).file_name("video.mp4");
     bot.send_video(ChatId(chat_id), input_file)
@@ -1308,6 +1335,45 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static TELEGRAM_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TelegramEnvGuard {
+        _guard: MutexGuard<'static, ()>,
+        old_primary: Option<String>,
+        old_legacy: Option<String>,
+    }
+
+    impl TelegramEnvGuard {
+        fn clean() -> Self {
+            let guard = TELEGRAM_ENV_LOCK.lock().unwrap();
+            let old_primary = std::env::var("AGENTARK_TELEGRAM_API_BASE_URL").ok();
+            let old_legacy = std::env::var("TELEGRAM_API_BASE_URL").ok();
+            std::env::remove_var("AGENTARK_TELEGRAM_API_BASE_URL");
+            std::env::remove_var("TELEGRAM_API_BASE_URL");
+            Self {
+                _guard: guard,
+                old_primary,
+                old_legacy,
+            }
+        }
+    }
+
+    impl Drop for TelegramEnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.old_primary.as_ref() {
+                std::env::set_var("AGENTARK_TELEGRAM_API_BASE_URL", value);
+            } else {
+                std::env::remove_var("AGENTARK_TELEGRAM_API_BASE_URL");
+            }
+            if let Some(value) = self.old_legacy.as_ref() {
+                std::env::set_var("TELEGRAM_API_BASE_URL", value);
+            } else {
+                std::env::remove_var("TELEGRAM_API_BASE_URL");
+            }
+        }
+    }
 
     #[test]
     fn configured_notification_chat_id_requires_exactly_one_allowed_user() {
@@ -1315,6 +1381,7 @@ mod tests {
             bot_token: "token".to_string(),
             allowed_users: vec![12345],
             dm_policy: "pairing".to_string(),
+            api_base_url: None,
         };
         assert_eq!(configured_notification_chat_id(&config), Some(12345));
 
@@ -1323,5 +1390,45 @@ mod tests {
 
         config.allowed_users = vec![12345, 67890];
         assert_eq!(configured_notification_chat_id(&config), None);
+    }
+
+    #[test]
+    fn telegram_bot_uses_configured_api_base_url() {
+        let _env = TelegramEnvGuard::clean();
+        let config = crate::core::runtime::config::TelegramConfig {
+            bot_token: "token".to_string(),
+            allowed_users: vec![],
+            dm_policy: "pairing".to_string(),
+            api_base_url: Some("https://telegram-proxy.example/botapi/".to_string()),
+        };
+
+        let bot = telegram_bot(&config).unwrap();
+
+        assert_eq!(
+            bot.api_url().as_str(),
+            "https://telegram-proxy.example/botapi/"
+        );
+    }
+
+    #[test]
+    fn telegram_bot_uses_env_api_base_url() {
+        let _env = TelegramEnvGuard::clean();
+        std::env::set_var(
+            "AGENTARK_TELEGRAM_API_BASE_URL",
+            "https://telegram-env-proxy.example",
+        );
+        let config = crate::core::runtime::config::TelegramConfig {
+            bot_token: "token".to_string(),
+            allowed_users: vec![],
+            dm_policy: "pairing".to_string(),
+            api_base_url: None,
+        };
+
+        let bot = telegram_bot(&config).unwrap();
+
+        assert_eq!(
+            bot.api_url().as_str(),
+            "https://telegram-env-proxy.example/"
+        );
     }
 }

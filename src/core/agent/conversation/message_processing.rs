@@ -163,13 +163,15 @@ mod tests {
 
     #[test]
     fn measured_metrics_come_from_trace_usage_with_null_when_absent() {
-        let mut trace = ExecutionTrace::default();
-        trace.started_at = Some(chrono::Utc::now() - chrono::Duration::milliseconds(2500));
-        trace.completed_at = Some(chrono::Utc::now());
-        trace.input_tokens = 1200;
-        trace.output_tokens = 340;
-        trace.total_tokens = 1540;
-        trace.cost_usd = 0.0123;
+        let trace = ExecutionTrace {
+            started_at: Some(chrono::Utc::now() - chrono::Duration::milliseconds(2500)),
+            completed_at: Some(chrono::Utc::now()),
+            input_tokens: 1200,
+            output_tokens: 340,
+            total_tokens: 1540,
+            cost_usd: 0.0123,
+            ..Default::default()
+        };
 
         let (tokens_in, tokens_out, wall_ms, cost) = experience_run_measured_metrics(&trace);
         assert_eq!(tokens_in, Some(1200));

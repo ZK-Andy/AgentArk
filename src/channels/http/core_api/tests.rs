@@ -4126,7 +4126,7 @@ fn prompt_optimization_opportunity_profiles_are_bounded_and_outcome_aware() {
         .map(|idx| {
             test_prompt_trace(
                 &format!("trace-profile-{idx}"),
-                1_000 + (idx as i32 * 250),
+                1_000 + (idx * 250),
                 6_000 + (idx * 400),
                 0.004 + (idx as f64 * 0.001),
                 idx % 5 != 0,

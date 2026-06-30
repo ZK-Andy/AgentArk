@@ -499,6 +499,7 @@ You choose the trade-off at runtime. The core stays the same.
 | `AGENTARK_BIND`         | `127.0.0.1:8990`   | HTTP bind address                            |
 | `AGENTARK_DEBUG`        | `false`            | Enable debug logging                         |
 | `AGENTARK_DATABASE_URL` | _(set by Compose)_ | PostgreSQL connection string                 |
+| `AGENTARK_TELEGRAM_API_BASE_URL` | _(empty)_ | Optional Telegram Bot API reverse-proxy base URL |
 | `RUST_LOG`              | `info`             | Log level (`debug`, `info`, `warn`, `error`) |
 
 ### Default stack notes

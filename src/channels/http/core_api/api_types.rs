@@ -497,6 +497,7 @@ pub(super) struct SettingsResponse {
     pub has_telegram_token: bool,
     pub telegram_delivery_ready: bool,
     pub telegram_allowed_users: Vec<i64>,
+    pub telegram_api_base_url: Option<String>,
     // Slack
     pub slack_enabled: bool,
     pub has_slack_bot_token: bool,
@@ -753,6 +754,7 @@ pub(super) struct SettingsUpdate {
     pub telegram_enabled: Option<bool>,
     pub telegram_bot_token: Option<String>,
     pub telegram_allowed_users: Option<Vec<i64>>,
+    pub telegram_api_base_url: Option<String>,
     // Slack
     #[serde(default)]
     pub slack_enabled: Option<bool>,

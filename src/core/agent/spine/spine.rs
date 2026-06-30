@@ -12773,7 +12773,7 @@ mod tests {
             }),
         );
 
-        let message = needs_input_message_from_tool_results(&[result.clone()])
+        let message = needs_input_message_from_tool_results(std::slice::from_ref(&result))
             .expect("any secure credential handoff should stop the spine turn");
 
         assert!(message.contains("secure credential form"));

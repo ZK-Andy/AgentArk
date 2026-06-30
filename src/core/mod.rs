@@ -15,6 +15,7 @@ pub mod self_evolve;
 pub mod swarm;
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod voice_tests {
     use super::runtime::voice::{
         voice_runtime_config_from_env, VoiceSessionPhase, VoiceSessionRegistry,

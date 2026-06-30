@@ -1607,6 +1607,7 @@ async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
             bot_token: token.trim().to_string(),
             allowed_users,
             dm_policy: "pairing".to_string(),
+            api_base_url: None,
         })
     } else {
         None

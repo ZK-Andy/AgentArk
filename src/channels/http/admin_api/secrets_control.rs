@@ -1342,9 +1342,8 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("data dir");
         let manager = crate::crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
 
-        assert_eq!(
-            api_key_master_password_gate_required(&config_dir, &data_dir).expect("no password"),
-            false
+        assert!(
+            !api_key_master_password_gate_required(&config_dir, &data_dir).expect("no password")
         );
         assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_ok());
 
@@ -1354,10 +1353,9 @@ mod tests {
         manager
             .commit_prepared_password(prepared)
             .expect("commit install managed password");
-        assert_eq!(
-            api_key_master_password_gate_required(&config_dir, &data_dir)
-                .expect("install managed password"),
-            false
+        assert!(
+            !api_key_master_password_gate_required(&config_dir, &data_dir)
+                .expect("install managed password")
         );
         assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_ok());
 
@@ -1368,9 +1366,8 @@ mod tests {
             .commit_prepared_password(prepared)
             .expect("commit custom password");
 
-        assert_eq!(
-            api_key_master_password_gate_required(&config_dir, &data_dir).expect("custom password"),
-            true
+        assert!(
+            api_key_master_password_gate_required(&config_dir, &data_dir).expect("custom password")
         );
         assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_err());
         assert!(require_master_password_for_secrets(
@@ -1428,10 +1425,9 @@ mod tests {
         manager
             .commit_password_removal()
             .expect("remove custom password");
-        assert_eq!(
-            api_key_master_password_gate_required(&config_dir, &data_dir)
-                .expect("removed password"),
-            false
+        assert!(
+            !api_key_master_password_gate_required(&config_dir, &data_dir)
+                .expect("removed password")
         );
         assert!(require_api_key_password_gate(&config_dir, &data_dir, None).is_none());
         assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_ok());
@@ -1442,10 +1438,9 @@ mod tests {
         manager
             .commit_prepared_password(install_managed)
             .expect("commit replacement install-managed password");
-        assert_eq!(
-            api_key_master_password_gate_required(&config_dir, &data_dir)
-                .expect("replacement install-managed password"),
-            false
+        assert!(
+            !api_key_master_password_gate_required(&config_dir, &data_dir)
+                .expect("replacement install-managed password")
         );
         assert!(require_api_key_password_gate(&config_dir, &data_dir, None).is_none());
         assert!(require_master_password_for_secrets(&config_dir, &data_dir, None).is_ok());

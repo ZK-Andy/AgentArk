@@ -384,14 +384,16 @@ mod tests {
 
     #[test]
     fn normalizes_operational_memory_retention_fields() {
-        let mut settings = DataLifecycleSettings::default();
-        settings.readiness_retention_days = MAX_RETENTION_DAYS + 1;
-        settings.operational_memory_retention_days = MAX_RETENTION_DAYS + 1;
-        settings.readiness_evaluation_retention_days = MAX_RETENTION_DAYS + 1;
-        settings.memory_capture_event_retention_days = MAX_RETENTION_DAYS + 1;
-        settings.memory_operation_retention_days = MAX_RETENTION_DAYS + 1;
-        settings.memory_evidence_link_retention_days = MAX_RETENTION_DAYS + 1;
-        settings.semantic_work_unit_retention_days = MAX_RETENTION_DAYS + 1;
+        let settings = DataLifecycleSettings {
+            readiness_retention_days: MAX_RETENTION_DAYS + 1,
+            operational_memory_retention_days: MAX_RETENTION_DAYS + 1,
+            readiness_evaluation_retention_days: MAX_RETENTION_DAYS + 1,
+            memory_capture_event_retention_days: MAX_RETENTION_DAYS + 1,
+            memory_operation_retention_days: MAX_RETENTION_DAYS + 1,
+            memory_evidence_link_retention_days: MAX_RETENTION_DAYS + 1,
+            semantic_work_unit_retention_days: MAX_RETENTION_DAYS + 1,
+            ..Default::default()
+        };
 
         let normalized = settings.normalized();
 

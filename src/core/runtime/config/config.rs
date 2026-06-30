@@ -2677,6 +2677,7 @@ impl SecureConfigManager {
                         bot_token: token.clone(),
                         allowed_users: vec![],
                         dm_policy: "pairing".to_string(),
+                        api_base_url: None,
                     });
                 }
             }
@@ -3256,6 +3257,8 @@ pub struct TelegramConfig {
     pub allowed_users: Vec<i64>,
     #[serde(default = "default_dm_policy")]
     pub dm_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
 }
 
 fn default_dm_policy() -> String {

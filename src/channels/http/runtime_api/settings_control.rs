@@ -438,19 +438,25 @@ pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Settings
         ),
     };
 
-    let (telegram_enabled, telegram_users, has_telegram_token, telegram_delivery_ready) =
-        match &config.telegram {
-            Some(tg) => (
-                true,
-                tg.allowed_users.clone(),
-                !tg.bot_token.is_empty() && tg.bot_token != "[ENCRYPTED]",
-                !tg.bot_token.is_empty()
-                    && tg.bot_token != "[ENCRYPTED]"
-                    && tg.allowed_users.len() == 1
-                    && tg.allowed_users.first().copied().unwrap_or_default() != 0,
-            ),
-            None => (false, vec![], false, false),
-        };
+    let (
+        telegram_enabled,
+        telegram_users,
+        telegram_api_base_url,
+        has_telegram_token,
+        telegram_delivery_ready,
+    ) = match &config.telegram {
+        Some(tg) => (
+            true,
+            tg.allowed_users.clone(),
+            tg.api_base_url.clone(),
+            !tg.bot_token.is_empty() && tg.bot_token != "[ENCRYPTED]",
+            !tg.bot_token.is_empty()
+                && tg.bot_token != "[ENCRYPTED]"
+                && tg.allowed_users.len() == 1
+                && tg.allowed_users.first().copied().unwrap_or_default() != 0,
+        ),
+        None => (false, vec![], None, false, false),
+    };
 
     let (
         whatsapp_enabled,
@@ -807,6 +813,7 @@ pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Settings
         has_telegram_token,
         telegram_delivery_ready,
         telegram_allowed_users: telegram_users,
+        telegram_api_base_url,
         slack_enabled,
         has_slack_bot_token,
         has_slack_signing_secret,
@@ -1651,11 +1658,13 @@ pub(super) async fn update_settings(
             };
 
         // Snapshot current Telegram/WhatsApp config for change detection
-        let old_telegram = agent_guard
-            .config
-            .telegram
-            .as_ref()
-            .map(|t| (t.bot_token.clone(), t.allowed_users.clone()));
+        let old_telegram = agent_guard.config.telegram.as_ref().map(|t| {
+            (
+                t.bot_token.clone(),
+                t.allowed_users.clone(),
+                t.api_base_url.clone(),
+            )
+        });
         let old_whatsapp = agent_guard.config.whatsapp.clone();
 
         // Update bot name if provided
@@ -2413,7 +2422,8 @@ pub(super) async fn update_settings(
 
         let telegram_update_requested = settings.telegram_enabled.is_some()
             || settings.telegram_bot_token.is_some()
-            || settings.telegram_allowed_users.is_some();
+            || settings.telegram_allowed_users.is_some()
+            || settings.telegram_api_base_url.is_some();
         let current_telegram = agent_guard.config.telegram.clone();
 
         // Build telegram config only if that section was explicitly touched.
@@ -2438,6 +2448,26 @@ pub(super) async fn update_settings(
                     )
                         .into_response();
                 }
+                let api_base_url = if let Some(value) = settings.telegram_api_base_url.as_deref() {
+                    let normalized = normalize_optional_url(Some(value));
+                    if let Some(url) = normalized.as_deref() {
+                        match reqwest::Url::parse(url) {
+                            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {}
+                            _ => {
+                                let error =
+                                    "Telegram API base URL must be an http:// or https:// URL"
+                                        .to_string();
+                                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                                    .into_response();
+                            }
+                        }
+                    }
+                    normalized
+                } else {
+                    current_telegram
+                        .as_ref()
+                        .and_then(|t| t.api_base_url.clone())
+                };
 
                 Some(TelegramConfig {
                     bot_token: token.unwrap(),
@@ -2451,6 +2481,7 @@ pub(super) async fn update_settings(
                         .as_ref()
                         .map(|t| t.dm_policy.clone())
                         .unwrap_or("pairing".to_string()),
+                    api_base_url,
                 })
             } else {
                 None
@@ -3698,9 +3729,13 @@ pub(super) async fn update_settings(
         agent_guard.config.qq = new_qq.clone();
 
         // Detect if Telegram config changed (needs process restart)
-        let new_tg_snapshot = new_telegram
-            .as_ref()
-            .map(|t| (t.bot_token.clone(), t.allowed_users.clone()));
+        let new_tg_snapshot = new_telegram.as_ref().map(|t| {
+            (
+                t.bot_token.clone(),
+                t.allowed_users.clone(),
+                t.api_base_url.clone(),
+            )
+        });
         if old_telegram != new_tg_snapshot {
             needs_restart = true;
         }
