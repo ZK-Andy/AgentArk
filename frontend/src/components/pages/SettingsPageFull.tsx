@@ -84,6 +84,7 @@ import {
   REFRESH_MS,
   setDeveloperModeEnabled,
 } from "./workspaceCore";
+
 import {
   arkPulseManualFollowupText,
   arkPulseRemediationFootnote,
@@ -166,6 +167,29 @@ import {
   type SettingsPageProps,
 } from "./settingsMeta";
 import { preloadSettingsTab } from "./workspacePreload";
+
+const UI_LANGUAGE_OPTIONS = [
+  { value: "English", label: "English" },
+  { value: "Simplified Chinese", label: "简体中文" },
+] as const;
+
+function normalizeUiLanguage(value: unknown): string {
+  const compact = str(value, "").trim().toLowerCase().replace(/[\s_-]/g, "");
+  if (
+    compact === "simplifiedchinese" ||
+    compact === "chinesesimplified" ||
+    compact === "zh" ||
+    compact === "zhcn" ||
+    compact === "zhhans" ||
+    compact === "chinese" ||
+    compact === "中文" ||
+    compact === "简体" ||
+    compact === "简体中文"
+  ) {
+    return "Simplified Chinese";
+  }
+  return "English";
+}
 
 const RESTART_NOTICE_DURATION_MS = 10_000;
 const UPDATE_NOTICE_DURATION_MS = 120_000;
@@ -1163,7 +1187,7 @@ export default function SettingsPage({
       bot_name: str(settings.bot_name, form.bot_name),
       personality: str(settings.personality, form.personality),
       timezone: str(settings.timezone, ""),
-      language: str(settings.language, form.language),
+      language: normalizeUiLanguage(settings.language),
       tone: str(settings.tone, form.tone),
       email_format: str(settings.email_format, form.email_format),
       daily_brief_enabled: toBool(settings.daily_brief_enabled),
@@ -5621,6 +5645,21 @@ export default function SettingsPage({
                         </Box>
                       ) : null}
                     </Stack>
+                    <TextField
+                      label="Default Language"
+                      select
+                      value={form.language}
+                      onChange={(e) => setField("language", e.target.value)}
+                      fullWidth
+                      size="small"
+                      helperText="Used for chat replies and generated briefs unless a turn asks otherwise."
+                    >
+                      {UI_LANGUAGE_OPTIONS.map((option) => (
+                        <MenuItem key={option.value} value={option.value}>
+                          {option.label}
+                        </MenuItem>
+                      ))}
+                    </TextField>
                     <TextField
                       label="Email Format"
                       select

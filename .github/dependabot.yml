@@ -30,7 +30,6 @@ updates:
       prefix: "chore(deps)"
     labels:
       - dependencies
-      - frontend
     groups:
       frontend-dependencies:
         patterns:

@@ -4419,6 +4419,18 @@ async fn live_browser_sessions_context_system_message(
     ))
 }
 
+fn user_profile_language_context_system_message(profile: &UserProfile) -> Option<String> {
+    let language = profile.language.as_deref()?.trim();
+    let language = match language {
+        "English" | "Simplified Chinese" => language,
+        _ => return None,
+    };
+    Some(format!(
+        "Saved user profile preference: default user-facing response language is {}. Use it unless the current user turn explicitly asks for a different language.",
+        language
+    ))
+}
+
 impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_model_routed_spine_for_chat(
@@ -4448,6 +4460,16 @@ impl Agent {
                     content: saved_user_memory,
                 },
             );
+        }
+        {
+            let profile = self.user_profile.read().await;
+            if let Some(profile_language_context) =
+                user_profile_language_context_system_message(&profile)
+            {
+                spine_messages.push(SpineMessage::System {
+                    content: profile_language_context,
+                });
+            }
         }
         if let Some(browser_profile_context) =
             browser_profiles_context_system_message(&self.storage).await
@@ -11774,6 +11796,19 @@ mod tests {
         assert!(context.contains("recent_actionable_artifacts"));
         assert!(context.contains("app-123"));
         assert!(context.contains("service_manage"));
+    }
+
+    #[test]
+    fn user_profile_language_context_instructs_default_response_language() {
+        let profile = UserProfile {
+            language: Some("Simplified Chinese".to_string()),
+            ..Default::default()
+        };
+        let context = user_profile_language_context_system_message(&profile)
+            .expect("language context should be present");
+
+        assert!(context.contains("Simplified Chinese"));
+        assert!(context.contains("explicitly asks for a different language"));
     }
 
     #[test]

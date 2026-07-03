@@ -303,6 +303,38 @@ function healthSourceTitle(source: JsonRecord): string {
   return "Source message";
 }
 
+function arkmemoryQueueCandidateDetails(item: JsonRecord): {
+  key: string;
+  value: string;
+  evidence: string;
+  memoryKind: string;
+  scope: string;
+  durability: string;
+  operationType: string;
+} {
+  const proposed = asRecord(item.proposed_content);
+  const operationType = str(
+    proposed.operation_type,
+    str(item.candidate_type, ""),
+  ).trim();
+  const key =
+    str(proposed.key, "").trim() ||
+    str(proposed.semantic_key, "").trim() ||
+    str(item.subject_key, "").trim();
+  const value = str(proposed.value, "").trim();
+  const isRetraction =
+    operationType === "retract" || str(item.candidate_type, "") === "memory_retract";
+  return {
+    key,
+    value: value || (isRetraction && key ? `Remove saved memory for ${key}.` : ""),
+    evidence: str(proposed.source_evidence, "").trim(),
+    memoryKind: str(proposed.memory_kind, "").trim(),
+    scope: str(proposed.scope, "").trim(),
+    durability: str(proposed.durability, "").trim(),
+    operationType,
+  };
+}
+
 type MemoryPageProps = {
   autoRefresh: boolean;
   onNavigateToView?: (view: string, replace?: boolean) => void;
@@ -1147,6 +1179,21 @@ export default function MemoryPage({
                     const replayGateReason =
                       str(replayGate.reason, "").trim() ||
                       "Replay gate has not checked this item yet.";
+                    const approvalStatus = str(item.approval_status, "draft")
+                      .trim()
+                      .toLowerCase();
+                    const isApplyingQueueItem = approvalStatus === "applying";
+                    const canApproveQueueItem =
+                      approvalStatus === "draft" && replayGateAllows;
+                    const canRejectQueueItem = approvalStatus === "draft";
+                    const candidateDetails = arkmemoryQueueCandidateDetails(item);
+                    const candidateMeta = [
+                      candidateDetails.memoryKind,
+                      candidateDetails.scope,
+                      candidateDetails.durability,
+                    ]
+                      .map((value) => humanizeMachineLabel(value, ""))
+                      .filter(Boolean);
                     return (
                       <TableRow key={id}>
                         <TableCell sx={{ maxWidth: 560 }}>
@@ -1163,10 +1210,70 @@ export default function MemoryPage({
                                 color={replayGateAllows ? "success" : "warning"}
                                 label={`Replay: ${replayGateLabel(replayGateStatus)}`}
                               />
+                              {isApplyingQueueItem ? (
+                                <Chip
+                                  size="small"
+                                  variant="outlined"
+                                  color="info"
+                                  label="Applying..."
+                                />
+                              ) : null}
                             </Stack>
                             <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
                               {str(item.title, id)}
                             </Typography>
+                            {candidateDetails.key || candidateDetails.value ? (
+                              <Stack spacing={0.25}>
+                                {candidateDetails.key ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "var(--ui-rgba-123-227-161-900)",
+                                      fontFamily:
+                                        "'JetBrains Mono', 'Fira Code', monospace",
+                                      letterSpacing: 0,
+                                      overflowWrap: "anywhere",
+                                    }}
+                                  >
+                                    {candidateDetails.key}
+                                  </Typography>
+                                ) : null}
+                                {candidateDetails.value ? (
+                                  <Typography
+                                    variant="body2"
+                                    sx={{
+                                      color: "text.primary",
+                                      fontWeight: 650,
+                                      overflowWrap: "anywhere",
+                                    }}
+                                  >
+                                    {candidateDetails.value}
+                                  </Typography>
+                                ) : null}
+                                {candidateMeta.length > 0 ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{ color: "text.secondary" }}
+                                  >
+                                    {candidateMeta.join(" / ")}
+                                  </Typography>
+                                ) : null}
+                                {candidateDetails.evidence ? (
+                                  <Typography
+                                    variant="caption"
+                                    sx={{
+                                      color: "text.secondary",
+                                      display: "-webkit-box",
+                                      WebkitBoxOrient: "vertical",
+                                      WebkitLineClamp: 2,
+                                      overflow: "hidden",
+                                    }}
+                                  >
+                                    Evidence: {candidateDetails.evidence}
+                                  </Typography>
+                                ) : null}
+                              </Stack>
+                            ) : null}
                             <Typography
                               variant="body2"
                               sx={{
@@ -1203,16 +1310,22 @@ export default function MemoryPage({
                             <Button
                               size="small"
                               variant="contained"
-                              disabled={busy || !replayGateAllows}
-                              title={replayGateAllows ? "Apply" : replayGateReason}
+                              disabled={busy || !canApproveQueueItem}
+                              title={
+                                isApplyingQueueItem
+                                  ? "Memory is already applying this item."
+                                  : replayGateAllows
+                                    ? "Apply"
+                                    : replayGateReason
+                              }
                               onClick={() => approveQueueMutation.mutate(id)}
                             >
-                              Apply
+                              {isApplyingQueueItem ? "Applying..." : "Apply"}
                             </Button>
                             <Button
                               size="small"
                               color="warning"
-                              disabled={busy}
+                              disabled={busy || !canRejectQueueItem}
                               onClick={() => rejectQueueMutation.mutate(id)}
                             >
                               Reject
