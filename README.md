@@ -5,7 +5,12 @@
 <h1 align="center">AgentArk</h1>
 
 <p align="center">
-  <em>Not an agent. An Ark for agents: build from prompts and tools, deploy as apps, automations, or watchers, distill noisy context, monitor every action, secure every boundary, self-evolve from your usage.</em>
+  <strong>Self-hosted Rust runtime for private, self-learning AI agents.</strong>
+</p>
+
+<p align="center">
+  AgentArk lets you build agents from prompts, tools, and integrations, then run them as apps, automations, watchers, or chat sessions.<br>
+  Unlike stateless chatbot wrappers, AgentArk agents can remember, reflect, and improve from real usage - with approvals, traces, and safety boundaries under your control.
 </p>
 
 <p align="center">
@@ -15,42 +20,29 @@
 <p align="center">
   <a href="#install"><img src="https://img.shields.io/badge/INSTALL-Docker_Compose-2ea44f?style=for-the-badge" alt="Install"></a>
   <a href="#what-is-agentark"><img src="https://img.shields.io/badge/WEB_UI-localhost:8990-7C3AED?style=for-the-badge" alt="Web UI"></a>
+  <a href="ARCHITECTURE.md#why-rust"><img src="https://img.shields.io/badge/RUST-runtime-B7410E?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"></a>
   <a href="#license"><img src="https://img.shields.io/badge/LICENSE-MIT_%2F_Apache--2.0-orange?style=for-the-badge" alt="License"></a>
-  <a href="ARCHITECTURE.md#why-rust"><img src="https://img.shields.io/badge/RUST-294K_lines-B7410E?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"></a>
-  <a href="#install"><img src="https://img.shields.io/badge/FRONTEND-86K_TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript"></a>
   <a href="https://deepwiki.com/agentark-ai/AgentArk"><img src="https://img.shields.io/badge/DEEPWIKI-Ask_the_codebase-1F6FEB?style=for-the-badge" alt="DeepWiki"></a>
   <a href="https://discord.gg/v32znQ6W"><img src="https://img.shields.io/badge/DISCORD-Join_community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center">
-  A self-hosted runtime for the full agent lifecycle.<br>
-  Build agents from structured prompts, tools, and integrations. Deploy them as live apps, scheduled automations, conditional watchers, or chat sessions.<br>
-  Monitor every step through Sentinel with action traces, failure classification, and drift detection. Secure every capability boundary with intent classification, output guards, approval gates, and per-action authorization.<br>
-  Save context with ArkDistill: deterministic tool-output compaction before noisy browser pages, logs, traces, HTML, and integration dumps reach the model, often cutting noisy outputs by 60-90%.<br>
-  Self-evolve prompts, classifiers, routing policies, specialist behavior, and context-saving profiles from your own usage.<br>
-  Review your day, week, or month through Reflect: a local visual panorama of where chat, ArkOrbit, apps, goals, watchers, memory, background agents, usage, and learned workflows clustered.<br>
-  Chat, memory, devices, integrations, and reviewable actions, all in one place, all on your machine, private by default.<br>
-  <code>~3.1GB Docker image &middot; ~500MB idle, ~1GB RAM steady-state under load (5 containers, embeddings loaded) &middot; AES-256-GCM encrypted &middot; model-agnostic</code>
+  <strong>Reviewable self-learning:</strong> AgentArk learns from accepted work, corrections, repeated workflows, and live tool outcomes, then proposes improvements to memory, prompts, routing, classifiers, and context-saving profiles.
 </p>
 
 <p align="center">
   <a href="#install">Install</a> &middot;
   <a href="https://youtu.be/44MZlX2II2E">Demo</a> &middot;
   <a href="#features">Features</a> &middot;
-  <a href="#ark-core-systems">Ark Core</a> &middot;
-  <a href="#configuration">Configuration</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#security">Security</a> &middot;
   <a href="API.md">API</a> &middot;
-  <a href="CONTRIBUTING.md">Contributing</a> &middot;
   <a href="https://deepwiki.com/agentark-ai/AgentArk">DeepWiki</a> &middot;
   <a href="https://discord.gg/v32znQ6W">Discord</a>
 </p>
 
 > [!IMPORTANT]
-> **AgentArk is in beta — not for production.** It can make mistakes and overwrite files inside its workspace. The Docker boundary keeps it off your host filesystem, but anything you mount into the containers is in scope. Keep approvals on, back up data, verify results.
->
-> **Bugs and rough edges are expected.** AgentArk is built and maintained by one person ([@debankadas](https://github.com/debankadas)) in the open, so the surface area is large and fixes ship as they're found. Please [open an issue](https://github.com/agentark-ai/AgentArk/issues) when something breaks — repros, logs, and screenshots help a lot.
+> **AgentArk is beta software.** Keep approvals enabled, back up data, and review actions before trusting results. Do not mount sensitive host directories unless you understand the risks.
 
 ---
 
@@ -86,7 +78,7 @@ It does not stop at a reply. It can **save the preference**, **schedule the foll
 
 **AgentArk is not an agent. It is an Ark for agents.** The Ark is the security layer: the wrapper that contains, observes, and enforces what every agent inside it is allowed to do, and the audit surface where every action becomes reviewable. Agents are the things that run inside the Ark - chat handlers, deployed apps, scheduled automations, conditional watchers, specialist sub-agents dispatched by the router. The Ark is what makes any of them safe to point at your real data.
 
-Inside that boundary AgentArk also builds the agents you ask for, deploys them as apps with public URLs, automations, or watchers, monitors every step, distills noisy tool output before it expands the model context, and self-evolves prompts, policies, and context-saving profiles from your usage. Chat, memory, tasks, integrations, documents, companion devices, and audit trails live together in one private workspace on your machine. It can keep track of your preferences, deliver a daily brief, follow up across channels, schedule routines, monitor things in the background, build apps, and take action safely when you ask.
+Inside that boundary AgentArk also builds the agents you ask for, deploys them as apps with public URLs, automations, or watchers, monitors every step, distills noisy tool output before it expands the model context, and supports reviewable self-learning from your usage. Chat, memory, tasks, integrations, documents, companion devices, and audit trails live together in one private workspace on your machine. It can keep track of your preferences, deliver a daily brief, follow up across channels, schedule routines, monitor things in the background, build apps, and take action safely when you ask.
 
 It is built to evolve with you. Accepted work, user corrections, repeated routines, and live tool outcomes are reflected into local memory, prompts, routing, and strategy so the OS gets more aligned with your workflow instead of acting like every session is day one.
 
