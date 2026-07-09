@@ -57,7 +57,7 @@ __pycache__/
 *.pyc
 
 # Docs
-docs/
+/docs/
 !src/docs/
 !src/docs/**
 
